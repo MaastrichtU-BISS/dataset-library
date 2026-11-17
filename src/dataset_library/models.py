@@ -24,6 +24,10 @@ class LibrarySettings(LibraryBase):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     # {license id: "allow" | "warn" | "hide"}; a license not named keeps its default level.
     license_policy: Mapped[dict] = mapped_column(JSON, default=dict)
+    # The most rows a dataset may have, and the most an import downloads (MB);
+    # None takes the host's default.
+    max_rows: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_download_mb: Mapped[int | None] = mapped_column(Integer, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
 

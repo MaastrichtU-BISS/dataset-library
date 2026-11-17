@@ -22,9 +22,15 @@ init_dataset_library(
     is_admin=lambda: "baigle-admin" in roles(),   # who may change the settings
     audit=lambda event, **fields: log(event, fields),
     enqueue=lambda ref: redis.lpush("library_import_queue", ref),  # no import without it
-    max_rows=lambda: app.config["LEGAL_ML_MAX_ROWS"],             # read once per import
+    max_rows=lambda: 1000,           # the row cap when an admin set none
+    hard_max_rows=5000,              # the most an admin may set (default 5000)
 )
 ```
+
+An admin's row cap is returned by `dataset_library.limits.row_cap(db.session)`
+(`None` when unset). Feed it to the host's own row check so uploads meet the
+same cap, e.g. legal-ml-core's
+`app.config["LEGAL_ML_MAX_ROWS"] = lambda: row_cap(db.session) or 1000`.
 
 The worker that takes refs off that queue installs `dataset-library[import]`
 (pyarrow) and runs each one, inside the host's app context:
@@ -58,11 +64,11 @@ label `dataset_library`).
   `rowCount` (the split's size, when known) and `preview: "ok" | "unavailable"`.
 - `GET /api/library/options` → the task, license and source filters, the
   license table (`level` is this platform's: `allow`, `warn` or `hide`),
-  `importable` and `maxRows`.
+  `importable` and `maxRows` (the admin's cap, else `max_rows()`).
 
 - `POST /api/library/imports` with `{"dataset", "config", "split", "textColumn",
   "labelColumn", "size", "name"?, "taskType"?, "licenseAck"?}` → 202 and the import,
-  `queued`. The size is cut to `max_rows()`. Refused before anything is queued:
+  `queued`. The size is cut to the row cap (the admin's, else `max_rows()`). Refused before anything is queued:
   400 (`bad_id`, `bad_mapping`, `bad_size`, `bad_name`, `bad_task`, `bad_config`), 404, 409
   (`gated`, `not_importable`, `needs_ack` for a license set to warn), and 503
   when the queue is down (the import is stored as failed).
@@ -71,7 +77,11 @@ label `dataset_library`).
   `validating`, `completed`, `failed`), `error`, `rows`, `datasetRef`, and the
   provenance (`externalId`, `revision`, `url`, `license`, `importedAt`).
 - Admins only (`is_admin()`): `GET` / `PUT /api/library/admin/settings` (sources
-  and license levels, saved whole; 400 with `fields` when anything is invalid)
+  and license levels, saved whole; 400 with `fields` when anything is invalid).
+  `limits` is `{"maxRows", "maxDownloadMb"}`, each a whole number from 1 to its
+  hard maximum (`maxRowsHardMax`, `maxDownloadMbHardMax` = 1000) or `null` for
+  the default; a `PUT` without `limits` keeps them. The download cap replaces
+  the `max_bytes` the worker passes to `run_import`
   and `POST /api/library/admin/sources/check` (`{"ref"}` → `{"ok", "error"?}`).
 
 ## Licenses

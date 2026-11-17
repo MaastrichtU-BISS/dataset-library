@@ -1,6 +1,7 @@
 """What a course admin controls: the sources search looks in, and each
 license's level (design review DR14). Saved whole, validated whole: one bad
 field and nothing changes."""
+from . import limits as limits_module
 from .licenses import LEVELS, LICENSES
 from .models import LibrarySettings, LibrarySource
 from .policy import level, overrides
@@ -13,14 +14,23 @@ class Invalid(Exception):
         self.fields = fields
 
 
-def current(db):
+def current(db, host):
     policy = overrides(db)
+    settings = db.session.get(LibrarySettings, 1)
     sources = db.session.query(LibrarySource).filter_by(provider="huggingface").order_by(LibrarySource.ref).all()
     return {
         "sources": [s.to_dict() for s in sources],
         "licenses": [
             {**lic.to_dict(), "default": lic.level, "level": level(lic, policy)} for lic in LICENSES.values()
         ],
+        "limits": {
+            "maxRows": settings.max_rows if settings else None,
+            "maxRowsDefault": host.max_rows(),
+            "maxRowsHardMax": host.hard_max_rows,
+            "maxDownloadMb": settings.max_download_mb if settings else None,
+            "maxDownloadMbDefault": limits_module.DEFAULT_MAX_DOWNLOAD_MB,
+            "maxDownloadMbHardMax": limits_module.HARD_MAX_DOWNLOAD_MB,
+        },
     }
 
 
@@ -34,8 +44,9 @@ def check_source(ref):
     return None
 
 
-def save(db, body):
-    """Replace the sources and the license policy. Returns what changed, for the audit."""
+def save(db, body, hard_max_rows=limits_module.HARD_MAX_ROWS):
+    """Replace the sources, the license policy and (when given) the limits.
+    Returns what changed, for the audit."""
     sources = body.get("sources")
     policy = body.get("license_policy")
     fields = {}
@@ -50,6 +61,10 @@ def save(db, body):
             fields[f"license_policy.{license_id}"] = "Not a license the library knows."
         elif chosen not in LEVELS:
             fields[f"license_policy.{license_id}"] = "Choose Allow, Warn or Hide."
+
+    limits = body.get("limits")
+    if limits is not None:
+        fields.update(limits_module.check(limits, hard_max_rows))
 
     existing = {s.ref: s for s in db.session.query(LibrarySource).filter_by(provider="huggingface")}
     seen = set()
@@ -84,10 +99,17 @@ def save(db, body):
         db.session.add(settings)
     # Keep only levels that differ from the default, so a new default applies.
     settings.license_policy = {lid: lvl for lid, lvl in policy.items() if LICENSES[lid].level != lvl}
+    limits_changed = []
+    if limits is not None:
+        for key, column in (("maxRows", "max_rows"), ("maxDownloadMb", "max_download_mb")):
+            if getattr(settings, column) != limits.get(key):
+                setattr(settings, column, limits.get(key))
+                limits_changed.append(column)
     db.session.commit()
     after = {lic.id: level(lic, settings.license_policy) for lic in LICENSES.values()}
     return {
         "sources_added": len([ref for ref, _ in wanted if ref not in existing]),
         "sources_removed": len([ref for ref in existing if ref not in seen]),
         "licenses_changed": sorted(lid for lid in LICENSES if before[lid] != after[lid]),
+        "limits_changed": sorted(limits_changed),
     }

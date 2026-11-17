@@ -102,7 +102,7 @@ def start(host, owner_id, body):
         raise Refused(409, "needs_ack", "Confirm the license terms to import this dataset.")
 
     session = host.db.session
-    cap = host.max_rows()
+    cap = host.row_cap()
     earlier = session.query(LibraryImport).filter_by(owner_id=owner_id, provider="huggingface", external_id=external_id).count()
     record = LibraryImport(
         owner_id=owner_id, provider="huggingface", external_id=external_id,
@@ -152,10 +152,14 @@ def _log(record, state, **fields):
 def run_import(
     import_ref, *, session, fetch_shards, create_dataset, data_dir, max_bytes=MAX_FETCH_BYTES, seed=None, open_parquet=None
 ):
-    """Drive one queued import to completed or failed. Safe to call twice."""
+    """Drive one queued import to completed or failed. Safe to call twice.
+    ``max_bytes`` is the worker's download cap; an admin's cap replaces it."""
+    from .limits import download_cap_bytes
+
     record = session.get(LibraryImport, import_ref)
     if record is None or record.status != QUEUED:
         return
+    max_bytes = download_cap_bytes(session) or max_bytes
     work = os.path.join(data_dir, "library-imports", record.id)
     try:
         _advance(session, record, FETCHING)
