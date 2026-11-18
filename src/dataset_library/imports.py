@@ -20,10 +20,12 @@ student-readable message for every refusal).
 import csv
 import json
 import logging
+import math
 import os
 import random
 import shutil
 import threading
+from array import array
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -53,6 +55,11 @@ CHANGED = "This dataset changed on Hugging Face after you opened it. Open it aga
 # Shown when a balanced import falls back to a random one (#115).
 LABEL_MISSING = "The label column was missing, so this is a random sample instead of a balanced one."
 LABEL_EMPTY = "The label column was empty, so this is a random sample instead of a balanced one."
+LABEL_LISTS = "The label column holds lists, so this is a random sample instead of a balanced one."
+LABEL_TOO_MANY = "This label column has too many different values to balance, so this is a random sample instead."
+LABEL_ROUGH = "Some labels had too few rows with text, so the sample is only roughly balanced."
+# Only these tasks have one class per row, so only they can be balanced by label.
+BALANCEABLE = {"classification", "document_classification", "judgment_prediction"}
 # How much of a dataset an import may download before it samples.
 MAX_FETCH_BYTES = 200_000_000
 # How often a running import says it is alive, and how long a quiet one, or a
@@ -138,8 +145,9 @@ def start(host, owner_id, body, *, ack_at=None):
     balance = body.get("balance")
     if balance is not None and not isinstance(balance, bool):
         raise Refused(400, "bad_balance", "Say whether to keep the label balance.")
-    # A balance means nothing without a label; with one it is the default.
-    balance = label_column is not None and (balance is None or balance is True)
+    # A balance means nothing without a label, and only these tasks carry one
+    # class per row; anything else stores no balance whatever was sent.
+    balance = label_column is not None and task_type in BALANCEABLE and (balance is None or balance is True)
     if dataset["license"]["level"] == "warn" and body.get("licenseAck") is not True:
         raise Refused(409, "needs_ack", "Confirm the license terms to import this dataset.")
     # Only a license that asks for confirmation records a new time; an allow
@@ -528,9 +536,14 @@ def _sample(record, paths, rng, open_parquet):
     if record.balance and record.label_column:
         rows, note = _sample_balanced(record, files, rng)
         if rows is not None:
-            return rows, "stratified", None
-        return _sample_random(record, files, rng), "random", note
-    return _sample_random(record, files, rng), "random", None
+            rng.shuffle(rows)
+            return rows, "stratified", note
+        rows = _sample_random(record, files, rng)
+        rng.shuffle(rows)
+        return rows, "random", note
+    rows = _sample_random(record, files, rng)
+    rng.shuffle(rows)
+    return rows, "random", None
 
 
 def _sample_random(record, files, rng):
@@ -563,52 +576,110 @@ def _sample_balanced(record, files, rng):
     keep each row's place. Largest remainder gives every label floor or ceil of
     its share, so their total is exactly the sample size. Pass 2 then reads
     only the mapped columns of the row groups holding chosen rows, replacing
-    rows whose text is empty from the same label. Returns ``(None, note)`` when
-    the files cannot be balanced and a random sample should take over."""
+    rows whose text is empty from the same label. When a label runs out of
+    rows with text, the shortfall is topped up from the others' unused rows.
+    Returns ``(None, note)`` when the files cannot be balanced and a random
+    sample should take over."""
+    import pyarrow.types as pat
+
     label = record.label_column
     if any(label not in f.schema_arrow.names for f in files):
         return None, LABEL_MISSING
+    # A list or struct is not a class label; it is not even hashable.
+    if any(pat.is_nested(f.schema_arrow.field(label).type) for f in files):
+        return None, LABEL_LISTS
     groups, _ = _groups(files)
+    names = [_label_names(f, label) for f in files]
     by_label = {}
     for f_index, g, first, _ in groups:
         values = files[f_index].read_row_group(g, columns=[label]).to_pydict()[label]
         for offset, value in enumerate(values):
-            if _empty_label(value):
+            if _empty_label(value, names[f_index]):
                 continue
-            by_label.setdefault(value, []).append(first + offset)
+            by_label.setdefault(value, array("q")).append(first + offset)
     if not by_label:
         return None, LABEL_EMPTY
     want = min(record.sample_size, sum(len(rows) for rows in by_label.values()))
-    allocations = _allocate({value: len(rows) for value, rows in by_label.items()}, want)
-    for rows in by_label.values():
-        rng.shuffle(rows)
-
-    # The first draw per label, then a pointer into the rest for replacements.
-    pending = {value: by_label[value][:allocations[value]] for value in allocations if allocations[value]}
-    next_at = {value: allocations[value] for value in allocations}
+    # A free-text or summary column would otherwise be "balanced" by alphabet.
+    if len(by_label) > want:
+        return None, LABEL_TOO_MANY
+    allocations = _allocate({value: len(rows) for value, rows in by_label.items()}, want, rng)
     columns = [record.text_column, label]
+
+    # The first draw per label; later draws come from a shuffled pointer into
+    # the label's unused rows, so a whole bucket is never shuffled up front.
+    pending = {}
+    attempted = {}
+    spare = {}
+    spare_at = {}
+    for value, rows in by_label.items():
+        picked = rng.sample(range(len(rows)), allocations.get(value, 0))
+        attempted[value] = set(picked)
+        pending[value] = [rows[position] for position in picked]
+
+    def take_spare(value):
+        if value not in spare:
+            spare[value] = array("q", (i for i in range(len(by_label[value])) if i not in attempted[value]))
+            rng.shuffle(spare[value])
+            spare_at[value] = 0
+        positions = spare[value]
+        while spare_at[value] < len(positions):
+            position = positions[spare_at[value]]
+            spare_at[value] += 1
+            if position not in attempted[value]:
+                attempted[value].add(position)
+                return by_label[value][position]
+        return None
+
     chosen = []
-    while pending:
+    while any(pending.values()):
         row_label = {}
         rows = []
         for value, picked in pending.items():
             for row in picked:
                 row_label[row] = value
                 rows.append(row)
-        pending = {}
+        pending = {value: [] for value in pending}
         for row, values, f_index in _read(files, groups, sorted(rows), columns):
             value = row_label[row]
             text = values[0]
             if text is None or not str(text).strip():
-                if next_at[value] < len(by_label[value]):
-                    pending.setdefault(value, []).append(by_label[value][next_at[value]])
-                    next_at[value] += 1
+                replacement = take_spare(value)
+                if replacement is not None:
+                    pending[value].append(replacement)
                 continue
             chosen.append((values, f_index))
     if not chosen:
         raise ImportFailed("no_usable_rows", "None of the rows we read had any text, so there is nothing to import.")
-    names = [_label_names(f, label) for f in files]
-    return [_mapped(values, names[f_index]) for values, f_index in chosen], None
+
+    # Some labels had too few rows with text: fill the exact size from the
+    # labels that still have rows, largest first.
+    topped = False
+    if len(chosen) < want:
+        remaining = {value: len(rows) - len(attempted[value]) for value, rows in by_label.items()}
+        order = sorted(
+            (value for value, left in remaining.items() if left > 0),
+            key=lambda value: (-remaining[value], rng.random()),
+        )
+        for value in order:
+            while len(chosen) < want:
+                batch = []
+                while len(batch) < want - len(chosen):
+                    row = take_spare(value)
+                    if row is None:
+                        break
+                    batch.append(row)
+                if not batch:
+                    break
+                for _, values, f_index in _read(files, groups, sorted(batch), columns):
+                    text = values[0]
+                    if text is None or not str(text).strip():
+                        continue
+                    chosen.append((values, f_index))
+                    topped = True
+            if len(chosen) >= want:
+                break
+    return [_mapped(values, names[f_index]) for values, f_index in chosen], (LABEL_ROUGH if topped else None)
 
 
 def _groups(files):
@@ -624,18 +695,30 @@ def _groups(files):
     return groups, total
 
 
-def _empty_label(value):
-    return value is None or (isinstance(value, str) and not value.strip())
+def _empty_label(value, names=None):
+    """Whether a label value says nothing: null, blank, NaN, or an HF `-1`."""
+    if value is None:
+        return True
+    if isinstance(value, float) and math.isnan(value):
+        return True
+    if isinstance(value, str) and not value.strip():
+        return True
+    # A ClassLabel's -1 means "no label"; it is not a label of its own.
+    return names is not None and isinstance(value, int) and value < 0
 
 
-def _allocate(counts, want):
-    """Largest remainder: each label gets floor or ceil of its share, total `want`."""
+def _allocate(counts, want, rng):
+    """Largest remainder: each label gets floor or ceil of its share, total `want`.
+    Equal remainders are broken at random, never by the label's text."""
     total = sum(counts.values())
-    shares = {value: want * count / total for value, count in counts.items()}
-    allocated = {value: int(share) for value, share in shares.items()}
+    allocated = {}
+    remainders = {}
+    for value, count in counts.items():
+        shared, remainder = divmod(want * count, total)
+        allocated[value] = shared
+        remainders[value] = remainder
     left = want - sum(allocated.values())
-    # Fewer places left than labels, so one pass over the largest fractions is enough.
-    order = sorted(counts, key=lambda value: (-(shares[value] - allocated[value]), -counts[value], str(value)))
+    order = sorted(counts, key=lambda value: (-remainders[value], rng.random()))
     for value in order:
         if left == 0:
             break

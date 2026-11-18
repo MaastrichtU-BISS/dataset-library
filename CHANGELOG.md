@@ -15,11 +15,19 @@ While the version is 0.x, minor releases may contain breaking changes.
 - Keeping the label balance when sampling (BAIGLE #115).
   - `POST /api/library/imports` takes an optional `balance`. With a
     `labelColumn` it defaults to `true`; without one it is always `false`, and
-    a value that is not a boolean is refused with 400 `bad_balance`.
+    a value that is not a boolean is refused with 400 `bad_balance`. Only the
+    single-label classification task types (`classification`,
+    `document_classification`, `judgment_prediction`) keep a balance; any
+    other task type stores `balance` as `false`.
   - A balanced import samples proportionally on the label column (largest
     remainder, so the size is exact), reading only that column first and then
     only the mapped columns of the chosen row groups. An empty or missing
-    label column falls back to a random sample with a note saying so.
+    label column, a list-valued label column, or more distinct labels than
+    rows wanted falls back to a random sample with a note saying why. A label
+    whose rows all have empty text is topped up from the other labels so the
+    size stays exact, with a note that the sample is only roughly balanced.
+    The chosen rows are shuffled, so a label-sorted source does not produce a
+    label-sorted CSV.
   - Imports carry `balance`, `sampleMethod` (`"stratified"` or `"random"`) and
     `sampleNote` (why a balance fell back, else `null`) in `to_dict()` and in
     `GET /api/library/provenance/<dataset_ref>`.

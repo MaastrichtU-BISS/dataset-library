@@ -40,6 +40,19 @@ def write_unlabelled_shard(path, texts, row_group_size=None):
     return path
 
 
+def write_labels_shard(path, texts, labels, label_feature=None, row_group_size=None):
+    """A shard whose label column is whatever the test wants it to be."""
+    features = {
+        "text": {"dtype": "string", "_type": "Value"},
+        "label": label_feature or {"dtype": "string", "_type": "Value"},
+        "extra": {"dtype": "string", "_type": "Value"},
+    }
+    table = pa.table({"text": texts, "label": labels, "extra": ["x"] * len(texts)})
+    table = table.replace_schema_metadata({"huggingface": json.dumps({"info": {"features": features}})})
+    pq.write_table(table, path, row_group_size=row_group_size)
+    return path
+
+
 class FakeCreateDataset:
     def __init__(self, refuse=None, while_saving=None):
         self.calls = []
@@ -363,3 +376,120 @@ def test_an_admins_download_cap_replaces_the_workers_default(run, app, tmp_path)
 
     assert result["status"] == "completed", result
     assert create.fetched_with[3] == 50_000_000
+
+
+def test_list_valued_labels_fall_back_to_a_random_sample_without_crashing(run, tmp_path):
+    texts = [f"Clause {i}" for i in range(8)]
+    labels = [["Terminations", "Notices"] for _ in texts]
+    shard = write_labels_shard(
+        tmp_path / "0000.parquet", texts, labels,
+        label_feature={"feature": {"dtype": "string", "_type": "Value"}, "_type": "Sequence"},
+    )
+
+    result, create = run([shard], size=3, balance=True)
+
+    assert result["status"] == "completed", result
+    assert result["sampleMethod"] == "random"
+    assert result["sampleNote"] == imports.LABEL_LISTS
+    assert len(create.calls[0]["rows"]) == 3
+
+
+def test_a_non_classification_task_type_never_stores_a_balance(app):
+    host = app.extensions["dataset_library"]
+    host.enqueue = lambda ref: None
+
+    with app.app_context():
+        started, _ = imports.start(
+            host, "alice",
+            {
+                "dataset": "coastalcph/lex_glue", "config": "ledgar", "split": "train",
+                "textColumn": "text", "labelColumn": "label", "taskType": "ner",
+                "size": 10, "balance": True,
+            },
+        )
+
+    assert started["balance"] is False
+
+
+def test_more_distinct_labels_than_rows_wanted_falls_back_to_random(run, tmp_path):
+    texts = [f"Clause {i}" for i in range(50)]
+    labels = [f"Topic {i}" for i in range(50)]
+    shard = write_labels_shard(tmp_path / "0000.parquet", texts, labels)
+
+    result, create = run([shard], size=10, balance=True)
+
+    assert result["status"] == "completed", result
+    assert result["sampleMethod"] == "random"
+    assert result["sampleNote"] == imports.LABEL_TOO_MANY
+    assert len(create.calls[0]["rows"]) == 10
+
+
+def test_equal_remainders_are_broken_at_random_for_different_seeds():
+    counts = {f"Label {i}": 1 for i in range(6)}
+
+    first = imports._allocate(counts, 3, random.Random(1))
+    second = imports._allocate(counts, 3, random.Random(4))
+
+    assert first != second
+
+
+def test_class_label_minus_one_rows_are_left_out_and_all_of_them_mean_no_labels(run, tmp_path):
+    texts = [f"Clause {i}" for i in range(20)]
+    labels = [-1] * 4 + [i % 3 for i in range(16)]
+    shard = write_shard(tmp_path / "0000.parquet", texts, labels)
+
+    result, create = run([shard], size=9, balance=True)
+
+    assert result["status"] == "completed", result
+    assert len(create.calls[0]["rows"]) == 9
+    assert "Clause 0" not in {row["text"] for row in create.calls[0]["rows"]}
+
+    all_unlabelled = write_shard(tmp_path / "0001.parquet", [f"Other {i}" for i in range(8)], [-1] * 8)
+
+    empty, _ = run([all_unlabelled], size=3, balance=True)
+
+    assert empty["sampleMethod"] == "random"
+    assert empty["sampleNote"] == imports.LABEL_EMPTY
+
+
+def test_nan_labels_are_left_out_of_a_balanced_sample(run, tmp_path):
+    texts = [f"Clause {i}" for i in range(20)]
+    labels = [float("nan")] * 4 + [float(i % 3) for i in range(16)]
+    shard = write_labels_shard(
+        tmp_path / "0000.parquet", texts, labels,
+        label_feature={"names": LABELS, "_type": "ClassLabel"},
+    )
+
+    result, create = run([shard], size=9, balance=True)
+
+    assert result["status"] == "completed", result
+    assert len(create.calls[0]["rows"]) == 9
+    assert "Clause 0" not in {row["text"] for row in create.calls[0]["rows"]}
+
+
+def test_a_label_with_no_text_is_topped_up_from_the_others_and_says_so(run, tmp_path):
+    texts = ["", "", "", "", ""] + [f"Other {i}" for i in range(20)]
+    labels = [0] * 5 + [1] * 20
+    shard = write_shard(tmp_path / "0000.parquet", texts, labels)
+
+    result, create = run([shard], size=10, balance=True)
+
+    assert result["status"] == "completed", result
+    assert result["sampleMethod"] == "stratified"
+    assert result["sampleNote"] == imports.LABEL_ROUGH
+    rows = create.calls[0]["rows"]
+    assert len(rows) == 10
+    assert all(row["text"].strip() for row in rows)
+
+
+def test_a_label_sorted_source_does_not_produce_a_label_sorted_csv(run, tmp_path):
+    texts = [f"Clause {i}" for i in range(90)]
+    labels = [0] * 30 + [1] * 30 + [2] * 30
+    shard = write_shard(tmp_path / "0000.parquet", texts, labels)
+
+    result, create = run([shard], size=30, balance=True)
+
+    assert result["status"] == "completed", result
+    order = [row["label"] for row in create.calls[0]["rows"]]
+    assert order != sorted(order)
+    assert set(order) == set(LABELS)
