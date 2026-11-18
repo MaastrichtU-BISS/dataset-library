@@ -1,7 +1,20 @@
-"""Turning a Hugging Face NER row into legal-ml-core's text and entities (#117)."""
-from dataset_library.ner import entity_types, tokens_to_text
+"""Turning a Hugging Face NER row into legal-ml-core's text and entity spans (#6)."""
+from dataset_library.ner import spans, tokens_to_text
 
 NAMES = ["O", "B-PER", "I-PER", "B-ORG", "I-ORG"]
+
+
+def check(text, found):
+    """Every span is inside the text, in order, and never overlaps another."""
+    starts = [span["start"] for span in found]
+    assert starts == sorted(starts)
+    previous_end = 0
+    for span in found:
+        assert span["start"] < span["end"]
+        assert span["start"] >= previous_end
+        assert text[span["start"]:span["end"]] == span["text"]
+        assert span["text"] == span["text"].strip()
+        previous_end = span["end"]
 
 
 def test_tokens_are_joined_with_single_spaces():
@@ -22,44 +35,188 @@ def test_an_empty_or_missing_token_list_is_empty_text():
 
 
 def test_numbers_are_read_through_the_class_label_names():
-    assert entity_types([0, 1, 2, 3, 4], NAMES) == "PER, ORG"
+    text, found = spans(["John", "Smith", "works", "at", "ACME"], [1, 2, 0, 0, 3], NAMES)
+
+    assert text == "John Smith works at ACME"
+    assert found == [
+        {"text": "John Smith", "start": 0, "end": 10, "type": "PER"},
+        {"text": "ACME", "start": 20, "end": 24, "type": "ORG"},
+    ]
+    check(text, found)
 
 
-def test_every_position_prefix_is_stripped():
-    assert entity_types(["B-PER", "I-PER", "E-PER", "S-PER", "L-PER", "U-PER"]) == "PER"
+def test_bio_tags_become_spans_in_text_order():
+    text, found = spans(["John", "Smith", "works", "at", "ACME"], ["B-PER", "I-PER", "O", "O", "B-ORG"])
+
+    assert text == "John Smith works at ACME"
+    assert found == [
+        {"text": "John Smith", "start": 0, "end": 10, "type": "PER"},
+        {"text": "ACME", "start": 20, "end": 24, "type": "ORG"},
+    ]
+    check(text, found)
 
 
-def test_underscore_prefixes_are_stripped_too():
-    assert entity_types(["B_ORG", "I_ORG"]) == "ORG"
+def test_an_i_tag_with_no_open_span_starts_one_iob1():
+    text, found = spans(["John", "Smith", "met", "Mary"], ["I-PER", "I-PER", "O", "I-PER"])
+
+    assert found == [
+        {"text": "John Smith", "start": 0, "end": 10, "type": "PER"},
+        {"text": "Mary", "start": 15, "end": 19, "type": "PER"},
+    ]
+    check(text, found)
 
 
-def test_outside_and_empty_tags_are_dropped():
-    assert entity_types(["O", "", "  ", "B-DATE"]) == "DATE"
+def test_a_type_change_mid_run_starts_a_new_span():
+    text, found = spans(["John", "Smith"], ["I-PER", "I-ORG"])
+
+    assert found == [
+        {"text": "John", "start": 0, "end": 4, "type": "PER"},
+        {"text": "Smith", "start": 5, "end": 10, "type": "ORG"},
+    ]
+    check(text, found)
 
 
-def test_types_keep_their_first_seen_order():
-    assert entity_types(["B-ORG", "B-PER", "I-ORG", "B-DATE"]) == "ORG, PER, DATE"
+def test_bioes_tags_decode_to_closed_spans():
+    text, found = spans(
+        ["John", "Smith", "visited", "ACME", "Inc"],
+        ["B-PER", "E-PER", "O", "B-ORG", "E-ORG"],
+    )
+
+    assert found == [
+        {"text": "John Smith", "start": 0, "end": 10, "type": "PER"},
+        {"text": "ACME Inc", "start": 19, "end": 27, "type": "ORG"},
+    ]
+    check(text, found)
 
 
-def test_a_row_with_no_tags_has_no_entities():
-    assert entity_types([]) == ""
-    assert entity_types(None) == ""
+def test_single_and_last_tags_end_their_spans():
+    text, found = spans(["Solo", "and", "Taylor", "Ltd"], ["S-PER", "O", "B-ORG", "L-ORG"])
+
+    assert found == [
+        {"text": "Solo", "start": 0, "end": 4, "type": "PER"},
+        {"text": "Taylor Ltd", "start": 9, "end": 19, "type": "ORG"},
+    ]
+    check(text, found)
 
 
-def test_character_tokens_with_space_tokens_are_joined_as_written():
+def test_tags_without_prefixes_follow_the_io_scheme():
+    text, found = spans(["John", "Smith", "at", "ACME"], ["PER", "PER", "O", "ORG"])
+
+    assert found == [
+        {"text": "John Smith", "start": 0, "end": 10, "type": "PER"},
+        {"text": "ACME", "start": 14, "end": 18, "type": "ORG"},
+    ]
+    check(text, found)
+
+
+def test_an_io_type_change_ends_the_open_span():
+    text, found = spans(["John", "Smith"], ["PER", "ORG"])
+
+    assert found == [
+        {"text": "John", "start": 0, "end": 4, "type": "PER"},
+        {"text": "Smith", "start": 5, "end": 10, "type": "ORG"},
+    ]
+    check(text, found)
+
+
+def test_outside_only_rows_have_no_spans():
+    text, found = spans(["just", "words"], ["O", "O"])
+
+    assert text == "just words"
+    assert found == []
+    check(text, found)
+
+
+def test_adjacent_spans_of_the_same_type_stay_separate():
+    text, found = spans(["John", "Smith"], ["B-PER", "B-PER"])
+
+    assert found == [
+        {"text": "John", "start": 0, "end": 4, "type": "PER"},
+        {"text": "Smith", "start": 5, "end": 10, "type": "PER"},
+    ]
+    check(text, found)
+
+
+def test_underscore_prefixes_are_read_too():
+    text, found = spans(["John", "Smith"], ["B_PER", "I_PER"])
+
+    assert found == [{"text": "John Smith", "start": 0, "end": 10, "type": "PER"}]
+    check(text, found)
+
+
+def test_character_level_rows_include_the_space_inside_a_span():
     # klue/klue's ner: one token per character, spaces included.
-    assert tokens_to_text(["특", "히", " ", "영", "동"]) == "특히 영동"
+    text, found = spans(
+        ["특", "히", " ", "영", "동"],
+        ["B-LOC", "I-LOC", "O", "I-LOC", "E-LOC"],
+    )
+
+    assert text == "특히 영동"
+    assert found == [{"text": "특히 영동", "start": 0, "end": 5, "type": "LOC"}]
+    check(text, found)
 
 
-def test_word_tokens_are_still_joined_by_spaces():
-    assert tokens_to_text(["The", "court", "held"]) == "The court held"
+def test_trailing_space_tokens_are_trimmed_from_a_span():
+    text, found = spans(["서", "울", " "], ["B-LOC", "I-LOC", "O"])
+
+    assert text == "서울 "
+    assert found == [{"text": "서울", "start": 0, "end": 2, "type": "LOC"}]
+    check(text, found)
 
 
-def test_a_stray_space_or_newline_token_keeps_word_spacing():
-    assert tokens_to_text(["The", "court", "\n", "held", "that"]) == "The court \n held that"
-    assert tokens_to_text(["The", " ", "court", "held"]) == "The   court held"
-    assert tokens_to_text(["Smith", "v.", "\xa0", "Jones"]) == "Smith v. \xa0 Jones"
+def test_a_space_token_never_starts_a_span():
+    text, found = spans(["a", " ", "b"], ["O", "B-PER", "O"])
+
+    assert text == "a b"
+    assert found == []
+    check(text, found)
 
 
-def test_a_longer_whitespace_token_is_not_a_character_level_space():
-    assert tokens_to_text(["I", "\n\n", "a"]) == "I \n\n a"
+def test_a_none_token_is_dropped_with_its_tag():
+    text, found = spans(["John", None, "Smith"], ["B-PER", "B-ORG", "I-PER"])
+
+    assert text == "John Smith"
+    assert found == [{"text": "John Smith", "start": 0, "end": 10, "type": "PER"}]
+    check(text, found)
+
+
+def test_a_shorter_tag_list_decodes_only_the_tokens_it_names():
+    text, found = spans(["John", "Smith", "works"], ["B-PER"])
+
+    assert text == "John Smith works"
+    assert found == [{"text": "John", "start": 0, "end": 4, "type": "PER"}]
+    check(text, found)
+
+
+def test_a_longer_tag_list_ignores_the_extra_tags():
+    text, found = spans(["John"], ["B-PER", "B-ORG"])
+
+    assert found == [{"text": "John", "start": 0, "end": 4, "type": "PER"}]
+    check(text, found)
+
+
+def test_unreadable_and_out_of_range_tags_are_outside():
+    text, found = spans(["John", "Smith"], [7, None], NAMES)
+
+    assert found == []
+    check(text, found)
+    for tags in ("", None):
+        text, found = spans(["John"], [tags])
+        assert found == []
+        check(text, found)
+
+
+def test_a_row_with_no_tags_has_no_spans():
+    for text, found in (spans(["a"], None), spans([], []), spans(None, None)):
+        assert found == []
+        check(text, found)
+    assert spans(["a"], None) == ("a", [])
+    assert spans([], []) == ("", [])
+    assert spans(None, None) == ("", [])
+
+
+def test_a_string_row_is_its_own_text_and_has_no_spans():
+    text, found = spans("Already a sentence.", None)
+
+    assert (text, found) == ("Already a sentence.", [])
+    check(text, found)

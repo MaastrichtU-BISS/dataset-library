@@ -8,6 +8,20 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-18
+
+### Changed
+
+- NER imports store each row's entities as JSON spans in `entities`, replacing
+  0.9.0's `"PER, ORG"` type list (BAIGLE #6). A cell holds a JSON list of
+  `{"text", "start", "end", "type"}`, with character offsets into the row's
+  `text`, end exclusive, in text order and never overlapping; a row with no
+  entities gets `[]`. This is the format legal-ml-core's annotation queue
+  stores, so imported NER data can be trained on. BIO, BIOES, IO and the other
+  prefix schemes decode to spans for word-level and character-level rows
+  alike. The conversion lives in `dataset_library.ner.spans`; `tokens_to_text`
+  is unchanged.
+
 ## [0.9.0] - 2026-11-18
 
 ### Added

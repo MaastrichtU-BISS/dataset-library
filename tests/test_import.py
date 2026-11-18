@@ -19,6 +19,17 @@ LABELS = ["Terminations", "Governing Laws", "Notices"]
 NER_NAMES = ["O", "B-PER", "I-PER", "B-ORG", "I-ORG"]
 
 
+def entity_spans(rows):
+    """The rows' entities cells as the span lists they hold, keyed by text."""
+    return {row["text"]: json.loads(row["entities"]) for row in rows}
+
+
+def check_entity_offsets(rows):
+    for row in rows:
+        for span in json.loads(row["entities"]):
+            assert row["text"][span["start"]:span["end"]] == span["text"]
+
+
 def write_shard(path, texts, labels, row_group_size=None):
     """A Parquet shard as Hugging Face writes one: features in the schema metadata."""
     features = {
@@ -564,9 +575,9 @@ def test_a_balanced_sample_short_of_its_size_says_so(run, tmp_path):
     assert result["sampleNote"] == imports.LABEL_ROUGH
 
 
-def test_an_ner_import_writes_joined_text_and_distinct_entity_types(run, tmp_path):
+def test_an_ner_import_writes_joined_text_and_json_entity_spans(run, tmp_path):
     tokens = [["John", "Smith", "works", "at", "ACME"], ["ACME", "sued", "Mary", "Jones"]]
-    tags = [[0, 1, 2, 0, 3], [3, 0, 1, 2]]
+    tags = [[1, 2, 0, 0, 3], [3, 0, 1, 2]]
     shard = write_ner_shard(tmp_path / "0000.parquet", tokens, tags)
 
     result, create = run([shard], size=2, task_type="ner", text_column="tokens", label_column="ner_tags")
@@ -575,10 +586,17 @@ def test_an_ner_import_writes_joined_text_and_distinct_entity_types(run, tmp_pat
     [call] = create.calls
     assert call["task_type"] == "ner"
     assert list(call["rows"][0]) == ["text", "entities"]
-    assert {row["text"]: row["entities"] for row in call["rows"]} == {
-        "John Smith works at ACME": "PER, ORG",
-        "ACME sued Mary Jones": "ORG, PER",
+    assert entity_spans(call["rows"]) == {
+        "John Smith works at ACME": [
+            {"text": "John Smith", "start": 0, "end": 10, "type": "PER"},
+            {"text": "ACME", "start": 20, "end": 24, "type": "ORG"},
+        ],
+        "ACME sued Mary Jones": [
+            {"text": "ACME", "start": 0, "end": 4, "type": "ORG"},
+            {"text": "Mary Jones", "start": 10, "end": 20, "type": "PER"},
+        ],
     }
+    check_entity_offsets(call["rows"])
 
 
 def test_an_ner_import_accepts_string_tags(run, tmp_path):
@@ -592,10 +610,14 @@ def test_an_ner_import_accepts_string_tags(run, tmp_path):
     result, create = run([shard], size=2, task_type="ner", text_column="tokens", label_column="ner_tags")
 
     assert result["status"] == "completed", result
-    assert {row["text"]: row["entities"] for row in create.calls[0]["rows"]} == {
-        "Alice runs ACME": "PER, ORG",
-        "Bob left": "PER",
+    assert entity_spans(create.calls[0]["rows"]) == {
+        "Alice runs ACME": [
+            {"text": "Alice", "start": 0, "end": 5, "type": "PER"},
+            {"text": "ACME", "start": 11, "end": 15, "type": "ORG"},
+        ],
+        "Bob left": [{"text": "Bob", "start": 0, "end": 3, "type": "PER"}],
     }
+    check_entity_offsets(create.calls[0]["rows"])
 
 
 def test_an_ner_row_with_only_outside_tags_keeps_an_empty_entities_cell(run, tmp_path):
@@ -608,23 +630,25 @@ def test_an_ner_row_with_only_outside_tags_keeps_an_empty_entities_cell(run, tmp
     result, create = run([shard], size=2, task_type="ner", text_column="tokens", label_column="ner_tags")
 
     assert result["status"] == "completed", result
-    assert {row["text"]: row["entities"] for row in create.calls[0]["rows"]} == {
-        "just words": "",
-        "John Smith": "PER",
+    assert entity_spans(create.calls[0]["rows"]) == {
+        "just words": [],
+        "John Smith": [{"text": "John Smith", "start": 0, "end": 10, "type": "PER"}],
     }
+    check_entity_offsets(create.calls[0]["rows"])
 
 
 def test_an_empty_token_list_is_empty_text_and_the_sample_stays_exact(run, tmp_path):
     shard = write_ner_shard(
         tmp_path / "0000.parquet",
         [[], ["Kept", "one"], [], ["Kept", "two"]],
-        [[], [1], [], [1]],
+        [[], [0], [], [0]],
     )
 
     result, create = run([shard], size=2, task_type="ner", text_column="tokens", label_column="ner_tags")
 
     assert result["status"] == "completed", result
     assert sorted(row["text"] for row in create.calls[0]["rows"]) == ["Kept one", "Kept two"]
+    assert all(row["entities"] == "[]" for row in create.calls[0]["rows"])
 
 
 def test_numbered_tags_without_names_fail_with_a_plain_reason(run, tmp_path):
@@ -830,19 +854,55 @@ def test_label_names_without_a_feature_map_is_none(tmp_path, features):
     assert imports._label_names(pq.ParquetFile(path), "ner_tags") is None
 
 
+def test_a_conll_style_fixture_imports_spans_legal_ml_core_reads(run, tmp_path):
+    annotation_format = pytest.importorskip("legal_ml_core.annotation_format")
+
+    conll = write_ner_shard(
+        tmp_path / "conll.parquet",
+        [
+            ["EU", "rejects", "German", "call", "to", "boycott", "British", "lamb", "."],
+            ["Peter", "Blackburn"],
+        ],
+        [
+            ["B-ORG", "O", "B-MISC", "O", "O", "O", "B-MISC", "O", "O"],
+            ["B-PER", "I-PER"],
+        ],
+        tag_feature={"feature": {"dtype": "string", "_type": "Value"}, "_type": "Sequence"},
+    )
+
+    result, create = run([conll], size=2, task_type="ner", text_column="tokens", label_column="ner_tags")
+
+    assert result["status"] == "completed", result
+    assert entity_spans(create.calls[0]["rows"]) == {
+        "EU rejects German call to boycott British lamb .": [
+            {"text": "EU", "start": 0, "end": 2, "type": "ORG"},
+            {"text": "German", "start": 11, "end": 17, "type": "MISC"},
+            {"text": "British", "start": 34, "end": 41, "type": "MISC"},
+        ],
+        "Peter Blackburn": [{"text": "Peter Blackburn", "start": 0, "end": 15, "type": "PER"}],
+    }
+    check_entity_offsets(create.calls[0]["rows"])
+    for row in create.calls[0]["rows"]:
+        assert annotation_format._stored_entities(row["entities"]) == json.loads(row["entities"])
+
+
 def test_ner_and_summarization_csvs_pass_legal_ml_cores_validation(run, tmp_path):
     datasets = pytest.importorskip("legal_ml_core.routes.datasets")
+    from legal_ml_core.annotation_format import _stored_entities
 
     ner = write_ner_shard(
         tmp_path / "ner.parquet",
         [["John", "Smith", "works", "at", "ACME"], ["ACME", "sued", "Mary", "Jones"]],
-        [[0, 1, 2, 0, 3], [3, 0, 1, 2]],
+        [[1, 2, 0, 0, 3], [3, 0, 1, 2]],
     )
     result, create = run([ner], size=2, task_type="ner", text_column="tokens", label_column="ner_tags")
 
     assert result["status"] == "completed", result
     _, error = datasets.validate_dataset_file(create.last_path, "ner")
     assert error is None, error
+    check_entity_offsets(create.calls[0]["rows"])
+    for row in create.calls[0]["rows"]:
+        assert _stored_entities(row["entities"]) == json.loads(row["entities"])
 
     summaries = write_summarization_shard(
         tmp_path / "summaries.parquet",
@@ -863,6 +923,7 @@ def test_imported_csvs_become_datasets_through_legal_ml_cores_real_create_datase
     from flask import Flask
     from flask_sqlalchemy import SQLAlchemy
     from legal_ml_core import create_dataset, init_ml_feature
+    from legal_ml_core.annotation_format import _stored_entities
     from legal_ml_core.db import MLBase
 
     app = Flask(__name__)
@@ -880,11 +941,24 @@ def test_imported_csvs_become_datasets_through_legal_ml_cores_real_create_datase
     ner = write_ner_shard(
         tmp_path / "real_ner.parquet",
         [["John", "Smith", "works", "at", "ACME"], ["ACME", "sued", "Mary", "Jones"]],
-        [[0, 1, 2, 0, 3], [3, 0, 1, 2]],
+        [[1, 2, 0, 0, 3], [3, 0, 1, 2]],
     )
     result, create = run([ner], size=2, task_type="ner", text_column="tokens", label_column="ner_tags")
 
     assert result["status"] == "completed", result
+    conll = write_ner_shard(
+        tmp_path / "real_conll.parquet",
+        [["Peter", "Blackburn", "met", "EU"], ["EU", "rejects", "it"]],
+        [["B-PER", "I-PER", "O", "B-ORG"], ["B-ORG", "O", "O"]],
+        tag_feature={"feature": {"dtype": "string", "_type": "Value"}, "_type": "Sequence"},
+    )
+    conll_result, conll_create = run(
+        [conll], size=2, task_type="ner", text_column="tokens", label_column="ner_tags",
+    )
+
+    assert conll_result["status"] == "completed", conll_result
+    for row in conll_create.calls[0]["rows"]:
+        assert _stored_entities(row["entities"]) == json.loads(row["entities"])
     summaries = write_summarization_shard(
         tmp_path / "real_summaries.parquet",
         ["The court held that the clause was void.", "The appeal was dismissed with costs."],
@@ -898,9 +972,11 @@ def test_imported_csvs_become_datasets_through_legal_ml_cores_real_create_datase
     with app.app_context():
         db.create_all()
         ner_dataset = create_dataset("alice", create.last_path, "Imported NER", "A sample", "ner")
+        conll_dataset = create_dataset("alice", conll_create.last_path, "Imported conll NER", "A sample", "ner")
         summary_dataset = create_dataset(
             "alice", summary_create.last_path, "Imported summaries", "A sample", "summarization",
         )
 
         assert (ner_dataset.task_type, ner_dataset.row_count) == ("ner", 2)
+        assert (conll_dataset.task_type, conll_dataset.row_count) == ("ner", 2)
         assert (summary_dataset.task_type, summary_dataset.row_count) == ("summarization", 2)

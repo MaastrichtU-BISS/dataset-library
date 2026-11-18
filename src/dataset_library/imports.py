@@ -37,7 +37,7 @@ from . import policy as policy_module
 from .errors import ProviderError
 from .licenses import LICENSES, UNKNOWN
 from .models import LibraryImport
-from .ner import entity_types, tokens_to_text
+from .ner import spans, tokens_to_text
 
 logger = logging.getLogger("dataset_library")
 
@@ -872,7 +872,7 @@ def _numbered(tags):
 def _mapped(values, names, task_type="classification"):
     """A row as written for the host: text, then the label by name when it has one.
 
-    NER tags become the row's distinct entity types; numbered tags with no
+    NER tags become the row's entity spans as JSON; numbered tags with no
     names cannot, so the import says that rather than writing nonsense."""
     text = _text(task_type, values[0])
     if len(values) == 1:
@@ -881,7 +881,8 @@ def _mapped(values, names, task_type="classification"):
     if task_type in NER_TASKS:
         if _numbered(label) and not names:
             raise ImportFailed("no_entity_names", NO_ENTITY_NAMES)
-        return [text, entity_types(label, names)]
+        text, found = spans(values[0], label, names)
+        return [text, json.dumps(found, ensure_ascii=False)]
     if names and isinstance(label, int) and 0 <= label < len(names):
         label = names[label]
     return [text, "" if label is None else str(label)]
