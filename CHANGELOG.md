@@ -8,6 +8,33 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-18
+
+### Changed
+
+- NER imports store each row's entities as JSON spans in `entities`, replacing
+  0.9.0's `"PER, ORG"` type list (#6, BAIGLE #117). A cell holds a JSON list
+  of `{"text", "start", "end", "type"}`, with character offsets into the
+  row's `text`, end exclusive, in text order and never overlapping; a row
+  whose tags are all outside gets `[]`. This is the format legal-ml-core's
+  annotation queue stores, so imported NER data can be trained on.
+  - BIO, IOB1, BIOES/BILOU, BMES and IO tags decode to spans for word-level
+    and character-level rows alike; `O`, `B-O` and placeholder tags (`X`,
+    `PAD`, `[CLS]`, `[SEP]`) are outside; prefixes and `O` are read in either
+    case. Whitespace never starts or ends a span; an `O` on a
+    whitespace token closes a span, except inside a prefixed entity of a
+    character-level row (klue's `ner` tags those spaces `O`).
+  - Spans are written only for a token list with a tag for every token. A
+    row whose text column is already a string, or whose tags are missing,
+    scalar, shorter than its tokens or partly empty, gets a blank `entities`
+    cell, so it waits to be annotated instead of counting as a row with no
+    entities or a partial annotation. For a string text column, numbered
+    tags without names therefore no longer fail the import. When no sampled
+    row has a tag for every word (sub-word tags, for example), the import
+    completes with a `sampleNote` saying the entities are left to annotate.
+  - The conversion lives in `dataset_library.ner.spans`; `tokens_to_text` is
+    unchanged.
+
 ## [0.9.0] - 2026-11-18
 
 ### Added

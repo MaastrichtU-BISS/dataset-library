@@ -37,7 +37,7 @@ from . import policy as policy_module
 from .errors import ProviderError
 from .licenses import LICENSES, UNKNOWN
 from .models import LibraryImport
-from .ner import entity_types, tokens_to_text
+from .ner import spans, tokens_to_text
 
 logger = logging.getLogger("dataset_library")
 
@@ -59,6 +59,12 @@ LABEL_EMPTY = "The label column was empty, so this is a random sample instead of
 LABEL_LISTS = "The label column holds lists, so this is a random sample instead of a balanced one."
 LABEL_TOO_MANY = "This label column has too many different values to balance, so this is a random sample instead."
 LABEL_ROUGH = "Some labels had too few rows with text, so the sample is only roughly balanced."
+# An NER import whose tags never cover their words (sub-word tags, for example)
+# completes with every row left to annotate; the note says why.
+NER_UNTAGGED = (
+    "None of these rows had a tag for every word, so their entities were not "
+    "imported: mark them in the annotation queue."
+)
 # Only these tasks have one class per row, so only they can be balanced by label.
 BALANCEABLE = {"classification", "document_classification", "judgment_prediction"}
 # These tasks store a list of BIO tags per row, not one label.
@@ -569,7 +575,10 @@ def _refuse_numbered_ner_tags(record, files):
                 raise ImportFailed("nested_columns", NESTED_NER)
         if not record.label_column or record.label_column not in schema.names:
             continue
-        if _integer_list(schema.field(record.label_column).type) and not _label_names(parquet_file, record.label_column):
+        # A text that is already a string gets blank entities (its tags have
+        # no tokens to sit on), so its tags' names do not matter.
+        text_is_tokens = record.text_column in schema.names and _is_list(schema.field(record.text_column).type)
+        if text_is_tokens and _integer_list(schema.field(record.label_column).type) and not _label_names(parquet_file, record.label_column):
             raise ImportFailed("no_entity_names", NO_ENTITY_NAMES)
 
 
@@ -581,16 +590,20 @@ def _not_flat(arrow_type):
 
     if pat.is_struct(arrow_type) or pat.is_map(arrow_type):
         return True
-    lists = pat.is_list(arrow_type) or pat.is_large_list(arrow_type) or pat.is_fixed_size_list(arrow_type)
-    return lists and pat.is_nested(arrow_type.value_type)
+    return _is_list(arrow_type) and pat.is_nested(arrow_type.value_type)
+
+
+def _is_list(arrow_type):
+    import pyarrow.types as pat
+
+    return pat.is_list(arrow_type) or pat.is_large_list(arrow_type) or pat.is_fixed_size_list(arrow_type)
 
 
 def _integer_list(arrow_type):
     """Whether an Arrow type is a list of integers."""
     import pyarrow.types as pat
 
-    lists = pat.is_list(arrow_type) or pat.is_large_list(arrow_type) or pat.is_fixed_size_list(arrow_type)
-    return lists and pat.is_integer(arrow_type.value_type)
+    return _is_list(arrow_type) and pat.is_integer(arrow_type.value_type)
 
 
 def _sample(record, paths, rng, open_parquet):
@@ -598,7 +611,8 @@ def _sample(record, paths, rng, open_parquet):
     on the label column when asked and it has labels.
 
     Returns the rows, the method used (``"stratified"`` or ``"random"``) and a
-    note when a balance was asked for but could not be kept."""
+    note when a balance was asked for but could not be kept, or when no NER
+    row had a tag for every word."""
     if open_parquet is None:
         import pyarrow.parquet as pq
 
@@ -615,7 +629,8 @@ def _sample(record, paths, rng, open_parquet):
         return rows, "random", note
     rows = _sample_random(record, files, rng)
     rng.shuffle(rows)
-    return rows, "random", None
+    untagged = record.task_type in NER_TASKS and record.label_column and all(row[1] == "" for row in rows)
+    return rows, "random", NER_UNTAGGED if untagged else None
 
 
 def _sample_random(record, files, rng):
@@ -869,19 +884,38 @@ def _numbered(tags):
     )
 
 
+def _complete_tags(tokens, tags):
+    """Whether an NER row has a token list and a tag for each of its tokens."""
+    return (
+        isinstance(tokens, (list, tuple))
+        and isinstance(tags, (list, tuple))
+        and len(tags) == len(tokens)
+        and len(tokens) > 0
+        and all(tag is not None for tag in tags)
+    )
+
+
 def _mapped(values, names, task_type="classification"):
     """A row as written for the host: text, then the label by name when it has one.
 
-    NER tags become the row's distinct entity types; numbered tags with no
+    NER tags become the row's entity spans as JSON; numbered tags with no
     names cannot, so the import says that rather than writing nonsense."""
     text = _text(task_type, values[0])
     if len(values) == 1:
         return [text]
     label = values[1]
     if task_type in NER_TASKS:
+        # Only a token list with a tag for every token says where entities
+        # are. Anything less (a text that is already a string, missing,
+        # scalar, short or partly empty tags) leaves the cell blank, so the
+        # row waits to be annotated rather than training as "no entities", as
+        # a partial annotation, or as one entity over the whole text.
+        if not _complete_tags(values[0], label):
+            return [text, ""]
         if _numbered(label) and not names:
             raise ImportFailed("no_entity_names", NO_ENTITY_NAMES)
-        return [text, entity_types(label, names)]
+        text, found = spans(values[0], label, names)
+        return [text, json.dumps(found, ensure_ascii=False)]
     if names and isinstance(label, int) and 0 <= label < len(names):
         label = names[label]
     return [text, "" if label is None else str(label)]
