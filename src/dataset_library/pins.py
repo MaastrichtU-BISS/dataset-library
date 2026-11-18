@@ -50,7 +50,12 @@ def add(host, external_id):
     # The Hub's card may name the same dataset under another id (a rename or a
     # redirect); the pin, its labels and its audit all use that canonical id.
     canonical = body["externalId"]
-    existing = host.db.session.query(LibraryPin).filter_by(provider=PROVIDER, external_id=canonical).first()
+    # A pin made before a rename keeps the old id; either id finds it.
+    existing = (
+        host.db.session.query(LibraryPin)
+        .filter(LibraryPin.provider == PROVIDER, LibraryPin.external_id.in_({canonical, external_id}))
+        .first()
+    )
     if existing is not None:
         return to_dict(existing, policy_module.overrides(host.db)), False
     labelled = labels_module.for_ids(host.cache, [canonical])[canonical]
@@ -77,7 +82,15 @@ def add(host, external_id):
 
 def update(host, pin_ref, body):
     """Feature or unfeature a pin, and set or clear its display title."""
-    pin = host.db.session.get(LibraryPin, pin_ref)
+    # Lock and re-read the pin, so a concurrent change to it is seen before
+    # deciding what changes (and what is audited).
+    pin = (
+        host.db.session.query(LibraryPin)
+        .filter_by(id=pin_ref)
+        .populate_existing()
+        .with_for_update()
+        .first()
+    )
     if pin is None:
         raise NotFound()
     changes = {}
@@ -89,7 +102,7 @@ def update(host, pin_ref, body):
         if featured != pin.featured:
             if featured:
                 # Lock the pins so two requests cannot both see room for a fourth.
-                locked = host.db.session.query(LibraryPin).with_for_update().all()
+                locked = host.db.session.query(LibraryPin).order_by(LibraryPin.id).populate_existing().with_for_update().all()
                 count = sum(1 for other in locked if other.featured and other.id != pin.id)
                 if count >= MAX_FEATURED:
                     raise TooManyFeatured()

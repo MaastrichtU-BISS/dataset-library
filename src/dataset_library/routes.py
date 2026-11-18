@@ -203,11 +203,12 @@ def add_pin():
 def patch_pin(pin_ref):
     """Feature or unfeature a pin, and set or clear its display title."""
     _require_admin()
+    # A change needs a JSON object; `{}` is a valid no-op, null or broken JSON is not.
     body = request.get_json(silent=True)
-    if body is not None and not isinstance(body, dict):
+    if not isinstance(body, dict):
         raise ApiError(400, "Send a JSON object.", "bad_request")
     try:
-        pin = pins_module.update(_host(), pin_ref, body or {})
+        pin = pins_module.update(_host(), pin_ref, body)
     except pins_module.NotFound:
         raise ApiError(404, "No such pin.", "not_found")
     except pins_module.TooManyFeatured:

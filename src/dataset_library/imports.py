@@ -597,6 +597,10 @@ def _sample_balanced(record, files, rng):
             if _empty_label(value, names[f_index]):
                 continue
             by_label.setdefault(value, array("q")).append(first + offset)
+            # A free-text column has a value per row: give up before indexing
+            # all of it, since it can never be balanced into this sample.
+            if len(by_label) > record.sample_size:
+                return None, LABEL_TOO_MANY
     if not by_label:
         return None, LABEL_EMPTY
     want = min(record.sample_size, sum(len(rows) for rows in by_label.values()))
@@ -649,9 +653,6 @@ def _sample_balanced(record, files, rng):
                     pending[value].append(replacement)
                 continue
             chosen.append((values, f_index))
-    if not chosen:
-        raise ImportFailed("no_usable_rows", "None of the rows we read had any text, so there is nothing to import.")
-
     # Some labels had too few rows with text: fill the exact size from the
     # labels that still have rows, largest first.
     topped = False
@@ -679,7 +680,14 @@ def _sample_balanced(record, files, rng):
                     topped = True
             if len(chosen) >= want:
                 break
-    return [_mapped(values, names[f_index]) for values, f_index in chosen], (LABEL_ROUGH if topped else None)
+    # Checked after the top-up: a label with no place of its own may still
+    # hold the only rows with text.
+    if not chosen:
+        raise ImportFailed("no_usable_rows", "None of the rows we read had any text, so there is nothing to import.")
+    # Short of the size, or filled from other labels: either way the
+    # proportions are not the ones asked for, and the note says so.
+    rough = topped or len(chosen) < want
+    return [_mapped(values, names[f_index]) for values, f_index in chosen], (LABEL_ROUGH if rough else None)
 
 
 def _groups(files):

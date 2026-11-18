@@ -493,3 +493,30 @@ def test_a_label_sorted_source_does_not_produce_a_label_sorted_csv(run, tmp_path
     order = [row["label"] for row in create.calls[0]["rows"]]
     assert order != sorted(order)
     assert set(order) == set(LABELS)
+
+
+def test_a_label_with_no_place_of_its_own_still_fills_the_sample(run, tmp_path):
+    # 1000 rows of label 0 have no text; the 2 rows of label 1 get no place in a
+    # 2-row sample by share, but hold the only text. The top-up finds them.
+    texts = [""] * 1000 + ["Clause A", "Clause B"]
+    labels = [0] * 1000 + [1, 1]
+    shard = write_shard(tmp_path / "0000.parquet", texts, labels)
+
+    result, create = run([shard], size=2, balance=True)
+
+    assert result["status"] == "completed", result
+    assert len(create.calls[0]["rows"]) == 2
+    assert result["sampleNote"] == imports.LABEL_ROUGH
+
+
+def test_a_balanced_sample_short_of_its_size_says_so(run, tmp_path):
+    # Only 3 rows have text in all; the sample cannot reach 10 and the note says so.
+    texts = ["One", "", "Two", "", "Three"] + [""] * 20
+    labels = [0, 0, 1, 1, 0] + [1] * 20
+    shard = write_shard(tmp_path / "0000.parquet", texts, labels)
+
+    result, create = run([shard], size=10, balance=True)
+
+    assert result["status"] == "completed", result
+    assert len(create.calls[0]["rows"]) == 3
+    assert result["sampleNote"] == imports.LABEL_ROUGH

@@ -330,3 +330,33 @@ def test_a_patch_body_that_is_not_an_object_is_refused(client):
 
     assert resp.status_code == 400
     assert resp.get_json()["code"] == "bad_request"
+
+
+def test_a_patch_with_null_or_broken_json_is_refused(client):
+    ref = pin(client, "coastalcph/lex_glue")["ref"]
+
+    for data in ("null", "{bad"):
+        resp = client.patch(f"/api/library/pins/{ref}", data=data, content_type="application/json", headers=ADMIN)
+        assert resp.status_code == 400
+        assert resp.get_json()["code"] == "bad_request"
+
+
+def test_a_pin_made_before_a_rename_is_found_by_its_old_id(client, monkeypatch):
+    from dataset_library import pins
+    from dataset_library.models import LibraryPin
+
+    first = pin(client, "coastalcph/lex_glue")
+    real_preview = pins.preview_module.preview
+
+    def renamed(host, external_id, *args, **kwargs):
+        body = real_preview(host, external_id, *args, **kwargs)
+        return {**body, "externalId": "coastalcph/lex_glue_v2", "id": "huggingface:coastalcph/lex_glue_v2"}
+
+    monkeypatch.setattr(pins.preview_module, "preview", renamed)
+
+    again = client.post("/api/library/pins", json={"dataset": "coastalcph/lex_glue"}, headers=ADMIN)
+
+    assert again.status_code == 200
+    assert again.get_json()["ref"] == first["ref"]
+    with client.application.app_context():
+        assert client.application.db.session.query(LibraryPin).count() == 1
