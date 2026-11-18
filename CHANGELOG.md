@@ -13,52 +13,51 @@ While the version is 0.x, minor releases may contain breaking changes.
 ### Added
 
 - NER and summarization dataset imports (BAIGLE #117).
-  - A preview of a card tagged `ner` or `summarization` now carries
-    `proposed: {taskType, textColumn, labelColumn}`, so the import's column
-    step starts on the right columns. A task is proposed only when the
-    selected config holds a distinct text and label pair for it. NER needs a
-    `tokens` or `words` list of strings as the text (it never guesses from
-    other string lists) and a flat tag list holding entity tags: `ner_tags`
-    or `ner` by name; otherwise ClassLabel names, or the tags in the first
-    rows, that are all `O` or BIO (`B-PER`) with at least one BIO tag, or
-    numbered tags without names under `tags`, `labels` or `label` (whose
-    import then fails with `no_entity_names`). Columns named with `chunk` or
-    `pos` never count, so part-of-speech, chunking and parsing configs on a
-    token-classification card get no proposal. Lists of lists are not
-    proposed. BIO tags are taken as entity tags whatever their types say, so a
-    BIO-tagged column under a generic name that marks something else (acronym
-    forms, semantic roles) is still proposed; Step 1 shows the tags before
-    the import. Summarization proposes the first of `document`, `article`,
-    `text`, `dialogue`, `source`, `input` and of `summary`, `highlights`,
-    `abstract` (generic `target` or `output` never), falling back to the longest
-    sampled text column that is not an id (`id`, `*_id`). All three are
-    `null` when no pair fits the selected config (a `ner`-tagged
-    classification or dependency-parsing config, for example) or the preview
-    is unavailable.
+  - A preview of a card tagged `ner` or `summarization` now carries `proposed:
+    {taskType, textColumn, labelColumn}`, so the import's column step starts
+    on the right columns. A task is proposed only when the selected config
+    holds a distinct text and label pair for it. NER needs a `tokens` or
+    `words` list of strings as the text (it never guesses from other string
+    lists) and a flat tag list holding entity tags: `ner_tags` or `ner` by
+    name; otherwise ClassLabel names, or the tags in the first rows, that are
+    all `O` or BIO (`B-PER`) with at least one BIO tag, or numbered tags
+    without names under `tags`, `labels` or `label` (whose import then fails
+    with `no_entity_names`). Columns named with `chunk` or `pos` never count,
+    so part-of-speech, chunking and parsing configs on a token-classification
+    card get no proposal. Lists of lists are not proposed. BIO tags are taken
+    as entity tags whatever their types say, so a BIO-tagged column under a
+    generic name that marks something else (acronym forms, semantic roles) is
+    still proposed; Step 1 shows the tags before the import. Summarization
+    proposes the first of `document`, `article`, `text`, `dialogue`, `source`,
+    `input` and of `summary`, `highlights`, `abstract` (never a generic
+    `target` or `output`), falling back to the longest sampled text column
+    that is not an id (`id`, `*_id`). All three are `null` when no pair fits
+    the selected config (a `ner`-tagged classification or dependency-parsing
+    config, for example) or the preview is unavailable.
   - NER imports join a row's tokens into `text` and write the row's distinct
     entity types into `entities` (BIO position stripped, `O` dropped, first
     seen first, missing tokens skipped; character-level tokens that keep
-    spaces as tokens, as in klue/klue's `ner`, are joined as written). Numbered tags are read through the
-    ClassLabel names in the Parquet's `huggingface` metadata, including a
-    ClassLabel inside a Sequence and its older list form. A tag column that is
-    a list of numbers with no names, or an empty name list, fails the import
-    with `no_entity_names` before any row is sampled, with a per-row check as
-    a backstop. NER columns that hold lists of lists or of records (span
-    annotations) fail with `nested_columns` before any row is read.
+    spaces as tokens, as in klue/klue's `ner`, are joined as written).
+    Numbered tags are read through the ClassLabel names in the Parquet's
+    `huggingface` metadata, including a ClassLabel inside a Sequence and its
+    older list form. A tag column that is a list of numbers with no names, or
+    an empty name list, fails the import with `no_entity_names` before any row
+    is sampled, with a per-row check as a backstop. NER columns that hold
+    lists of lists or of records (span annotations) fail with `nested_columns`
+    before any row is read.
   - Summarization imports write the source document as `text` and its target
     as `summary`. A row whose summary is missing or blank is skipped and
     replaced like a row with empty text, and when no row has both a text and a
     summary the import fails with `no_usable_rows`.
   - `POST /api/library/imports` refuses a request whose `labelColumn` is the
-    same as its `textColumn` with 400 `bad_mapping`
-    ("Pick different columns for the text and the label."), for every task
-    type.
+    same as its `textColumn` with 400 `bad_mapping` ("Pick different columns
+    for the text and the label."), for every task type.
   - A dataset whose summary column is `highlights` (cnn_dailymail, for
     example) now counts as labelled.
-  - The import CSV's second header follows the task type: `entities` for
-    `ner` and `named_entity_recognition`, `summary` for `summarization`, and
-    `label` for classification-like tasks (unchanged). A dataset with no label
-    column still writes `text` alone.
+  - The import CSV's second header follows the task type: `entities` for `ner`
+    and `named_entity_recognition`, `summary` for `summarization`, and `label`
+    for classification-like tasks (unchanged). A dataset with no label column
+    still writes `text` alone.
   - The conversion lives in `dataset_library.ner` as `tokens_to_text` and
     `entity_types`.
   - Tests cover NER with numbered and string tags, rows with no entities,
