@@ -66,7 +66,7 @@ NER_TASKS = {"ner", "named_entity_recognition"}
 # The host's training columns for the label side of each task (#117).
 LABEL_HEADERS = {"ner": "entities", "named_entity_recognition": "entities", "summarization": "summary"}
 NESTED_NER = (
-    "These columns hold records or lists of lists, so they can't be read as "
+    "These columns hold records, maps or lists of lists, so they can't be read as "
     "words and their entity tags. Pick a column of words and a column of tags."
 )
 NO_ENTITY_NAMES = (
@@ -558,7 +558,8 @@ def _class_label_names(feature):
 
 def _refuse_numbered_ner_tags(record, files):
     """Fail before any row is read when NER columns cannot become words and
-    entity types: lists of lists, or numbered tags the files do not name."""
+    entity types: records, maps, lists of those or of lists, or numbered tags
+    the files do not name."""
     if record.task_type not in NER_TASKS:
         return
     for parquet_file in files:

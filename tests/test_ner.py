@@ -59,3 +59,7 @@ def test_a_stray_space_or_newline_token_keeps_word_spacing():
     assert tokens_to_text(["The", "court", "\n", "held", "that"]) == "The court \n held that"
     assert tokens_to_text(["The", " ", "court", "held"]) == "The   court held"
     assert tokens_to_text(["Smith", "v.", "\xa0", "Jones"]) == "Smith v. \xa0 Jones"
+
+
+def test_a_longer_whitespace_token_is_not_a_character_level_space():
+    assert tokens_to_text(["I", "\n\n", "a"]) == "I \n\n a"

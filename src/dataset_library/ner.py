@@ -32,7 +32,7 @@ def _character_level(words):
     row with a stray newline or space token is not one."""
     spaces = [word for word in words if word and not word.strip()]
     letters = [word for word in words if word.strip()]
-    return bool(spaces) and bool(letters) and all(len(word) == 1 for word in letters)
+    return bool(spaces) and bool(letters) and all(len(word) == 1 for word in spaces + letters)
 
 
 def entity_types(tags, names=None):
