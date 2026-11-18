@@ -132,9 +132,7 @@ def dataset(dataset_ref):
                 _host(), dataset_ref, request.args.get("config") or None, request.args.get("split") or None
             )
         )
-    except preview_module.NotInLibrary:
-        raise ApiError(404, "That dataset is not in the library.", "not_found")
-    except PrivateDataset:
+    except (preview_module.NotInLibrary, PrivateDataset):
         raise ApiError(404, "That dataset is not in the library.", "not_found")
     except preview_module.UnknownConfig:
         raise ApiError(400, "That dataset has no such configuration or split.", "bad_config")

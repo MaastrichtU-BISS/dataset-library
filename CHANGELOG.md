@@ -16,8 +16,9 @@ While the version is 0.x, minor releases may contain breaking changes.
   - `GET /api/library/provenance/<dataset_ref>` returns the signed-in owner's
     most recent completed import of that Dataset: `provider`, `externalId`,
     `config`, `split`, `revision`, `url`, `importedAt`, `licenseAckAt` and the
-    stored `license` from the license table; 404 when there is none. It reads
-    the database only, so it works without an import queue.
+    stored `license` from the license table, with its current platform level
+    (an admin may have changed it since the import); 404 when there is none. It
+    reads the database only, so it works without an import queue.
   - `LibraryImport.to_dict()` carries `licenseAckAt`.
 
 ### Changed
@@ -25,7 +26,8 @@ While the version is 0.x, minor releases may contain breaking changes.
 - Importing a dataset whose license an admin set to `hide` is refused with
   403 `license_hidden`; the preview route still answers 404.
 - Importing a dataset its owner keeps private on Hugging Face is refused with
-  409 `private`.
+  409 `private` when the Hub's answer says it is private; an anonymous
+  401/404 is treated as `not_found`.
 
 ## [0.6.0] - 2026-11-18
 

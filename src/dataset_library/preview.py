@@ -25,6 +25,14 @@ class UnknownConfig(Exception):
 
 
 def preview(host, external_id, config=None, split=None):
+    """One dataset's preview. The library's own rules come first: a dataset
+    outside the enabled sources never reaches the Hub or the cache, so its
+    cards and viewer answers are not fetched and no refusal reveals it."""
+    from .search import enabled_sources
+
+    sources = {source.ref for source in enabled_sources(host.db)}
+    if sources and external_id.split("/", 1)[0] not in sources:
+        raise NotInLibrary()
     key = f"library:preview:{external_id}:{config or ''}:{split or ''}"
     body = host.cache.get(key)
     if body is None:
@@ -52,6 +60,11 @@ def _build(host, external_id, config, split):
     card = huggingface.dataset(external_id, host.task_types)
     if card is None:
         raise NotInLibrary()
+    # Before asking the viewer or checking configs: a hidden license must not
+    # leak that the dataset exists through a "bad config" answer.
+    policy = policy_module.overrides(host.db)
+    if policy_module.level(LICENSES.get(card["license"], UNKNOWN), policy) == "hide":
+        raise LicenseHidden()
     body = {**card, "preview": "unavailable", "configs": [], "config": None, "split": None, "columns": [], "rows": [], "rowCount": None}
     body["labels"] = labels_module.for_ids(host.cache, [external_id])[external_id]
     try:

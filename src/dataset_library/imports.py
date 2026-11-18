@@ -31,6 +31,7 @@ import sqlalchemy as sa
 from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.orm.exc import ObjectDeletedError
 
+from . import policy as policy_module
 from .errors import ProviderError
 from .licenses import LICENSES, UNKNOWN
 from .models import LibraryImport
@@ -85,14 +86,16 @@ class Refused(Exception):
         self.status, self.code, self.message = status, code, message
 
 
-def start(host, owner_id, body):
+def start(host, owner_id, body, *, ack_at=None):
     """Check the request against the dataset as previewed, store the import as
     queued, then hand it to the host's queue. Returns the import as JSON, and
     whether it is new: the same import (dataset, revision, mapping and size),
     still queued or running, is returned as it is (a double click, a second tab).
 
     ``body.revision``, when given, is the revision the student saw; an import
-    of anything newer is refused."""
+    of anything newer is refused. ``ack_at`` is the confirmation time a retry
+    carries from the import it repeats, so a retry keeps when the student
+    actually agreed rather than claiming they agreed again now."""
     from . import preview as preview_module
     from .providers.huggingface import DATASET_ID_PATTERN, PrivateDataset
 
@@ -131,6 +134,10 @@ def start(host, owner_id, body):
         raise Refused(400, "bad_mapping", "Pick a label column from this dataset, or none.")
     if dataset["license"]["level"] == "warn" and body.get("licenseAck") is not True:
         raise Refused(409, "needs_ack", "Confirm the license terms to import this dataset.")
+    # Only a license that asks for confirmation records a time; an allow license
+    # stores none even when the client sent `licenseAck: true`.
+    confirmed = dataset["license"]["level"] == "warn" and body.get("licenseAck") is True
+    license_ack_at = (ack_at or _now()) if confirmed else None
     seen_revision = body.get("revision")
     if seen_revision and dataset.get("revision") and seen_revision != dataset["revision"]:
         raise Refused(409, "changed", CHANGED)
@@ -162,7 +169,7 @@ def start(host, owner_id, body):
     record = LibraryImport(
         owner_id=owner_id, provider="huggingface", external_id=external_id,
         config=dataset["config"], split=dataset["split"], revision=dataset.get("revision"), url=dataset["url"],
-        license=dataset["license"]["id"], license_ack_at=_now() if body.get("licenseAck") is True else None,
+        license=dataset["license"]["id"], license_ack_at=license_ack_at,
         text_column=text_column, label_column=label_column, task_type=task_type,
         sample_size=min(size, cap), max_rows=cap,
         name=name or (dataset["title"] if not earlier else f"{dataset['title']} ({earlier + 1})"),
@@ -199,8 +206,10 @@ def for_owner(host, owner_id):
 def provenance(host, owner_id, dataset_ref):
     """The most recent completed import that made this Dataset, as its
     provenance: where it came from, under which license, and when the student
-    confirmed that license. None when this owner has no such import. Reads the
-    database only, so it works without an import queue."""
+    confirmed that license. The license's ``level`` is the platform's level
+    now, which an admin can have changed since the import. None when this
+    owner has no such import. Reads the database only, so it works without an
+    import queue."""
     record = (
         host.db.session.query(LibraryImport)
         .filter_by(owner_id=owner_id, dataset_ref=dataset_ref, status=COMPLETED)
@@ -209,6 +218,8 @@ def provenance(host, owner_id, dataset_ref):
     )
     if record is None:
         return None
+    license = LICENSES.get(record.license, UNKNOWN)
+    level = policy_module.level(license, policy_module.overrides(host.db))
     return {
         "provider": record.provider,
         "externalId": record.external_id,
@@ -218,7 +229,7 @@ def provenance(host, owner_id, dataset_ref):
         "url": record.url,
         "importedAt": _iso(record.imported_at),
         "licenseAckAt": _iso(record.license_ack_at),
-        "license": LICENSES.get(record.license, UNKNOWN).to_dict(),
+        "license": {**license.to_dict(), "level": level},
     }
 
 
@@ -302,7 +313,7 @@ def retry(host, owner_id, import_ref):
         "name": record.name,
         "licenseAck": record.license_ack_at is not None,
     }
-    started, _ = start(host, owner_id, body)
+    started, _ = start(host, owner_id, body, ack_at=record.license_ack_at)
     if record.dismissed_at is None:
         record.dismissed_at = _now()
         host.db.session.commit()
