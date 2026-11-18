@@ -20,10 +20,12 @@ student-readable message for every refusal).
 import csv
 import json
 import logging
+import math
 import os
 import random
 import shutil
 import threading
+from array import array
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -50,6 +52,14 @@ BUSY = "Hugging Face is busy. Try again in a few minutes."
 NOT_STARTED = "Import could not start. Try again."
 STOPPED = "Import stopped. Try again."
 CHANGED = "This dataset changed on Hugging Face after you opened it. Open it again to import the new version."
+# Shown when a balanced import falls back to a random one (#115).
+LABEL_MISSING = "The label column was missing, so this is a random sample instead of a balanced one."
+LABEL_EMPTY = "The label column was empty, so this is a random sample instead of a balanced one."
+LABEL_LISTS = "The label column holds lists, so this is a random sample instead of a balanced one."
+LABEL_TOO_MANY = "This label column has too many different values to balance, so this is a random sample instead."
+LABEL_ROUGH = "Some labels had too few rows with text, so the sample is only roughly balanced."
+# Only these tasks have one class per row, so only they can be balanced by label.
+BALANCEABLE = {"classification", "document_classification", "judgment_prediction"}
 # How much of a dataset an import may download before it samples.
 MAX_FETCH_BYTES = 200_000_000
 # How often a running import says it is alive, and how long a quiet one, or a
@@ -132,6 +142,12 @@ def start(host, owner_id, body, *, ack_at=None):
         raise Refused(400, "bad_mapping", "Pick the column that holds the text.")
     if label_column is not None and label_column not in columns:
         raise Refused(400, "bad_mapping", "Pick a label column from this dataset, or none.")
+    balance = body.get("balance")
+    if balance is not None and not isinstance(balance, bool):
+        raise Refused(400, "bad_balance", "Say whether to keep the label balance.")
+    # A balance means nothing without a label, and only these tasks carry one
+    # class per row; anything else stores no balance whatever was sent.
+    balance = label_column is not None and task_type in BALANCEABLE and (balance is None or balance is True)
     if dataset["license"]["level"] == "warn" and body.get("licenseAck") is not True:
         raise Refused(409, "needs_ack", "Confirm the license terms to import this dataset.")
     # Only a license that asks for confirmation records a new time; an allow
@@ -159,6 +175,7 @@ def start(host, owner_id, body, *, ack_at=None):
             LibraryImport.label_column.is_(None) if label_column is None else LibraryImport.label_column == label_column,
             LibraryImport.task_type == task_type,
             LibraryImport.sample_size == min(size, cap),
+            LibraryImport.balance == balance,
             LibraryImport.status.in_(RUNNING),
         )
         .order_by(LibraryImport.created_at.desc())
@@ -173,7 +190,7 @@ def start(host, owner_id, body, *, ack_at=None):
         config=dataset["config"], split=dataset["split"], revision=dataset.get("revision"), url=dataset["url"],
         license=dataset["license"]["id"], license_ack_at=license_ack_at,
         text_column=text_column, label_column=label_column, task_type=task_type,
-        sample_size=min(size, cap), max_rows=cap,
+        sample_size=min(size, cap), max_rows=cap, balance=balance,
         name=name or (dataset["title"] if not earlier else f"{dataset['title']} ({earlier + 1})"),
         status=QUEUED,
     )
@@ -232,6 +249,9 @@ def provenance(host, owner_id, dataset_ref):
         "importedAt": _iso(record.imported_at),
         "licenseAckAt": _iso(record.license_ack_at),
         "license": license.at_level(level),
+        "balance": record.balance,
+        "sampleMethod": record.sample_method,
+        "sampleNote": record.sample_note,
     }
 
 
@@ -312,6 +332,7 @@ def retry(host, owner_id, import_ref):
         "labelColumn": record.label_column,
         "taskType": record.task_type,
         "size": record.sample_size,
+        "balance": record.balance,
         "name": record.name,
         "licenseAck": record.license_ack_at is not None,
     }
@@ -438,8 +459,8 @@ def run_import(
         if record.revision and fetched.revision and fetched.revision != record.revision:
             raise ImportFailed("changed", CHANGED)
         _advance(session, record, SAMPLING, {"revision": fetched.revision})
-        rows = _sample(record, fetched.paths, random.Random(seed), open_parquet)
-        _advance(session, record, VALIDATING)
+        rows, method, note = _sample(record, fetched.paths, random.Random(seed), open_parquet)
+        _advance(session, record, VALIDATING, {"sample_method": method, "sample_note": note})
         _write_csv(path, record, rows)
         # The last check before the Dataset is written: a cancel before this wins.
         _advance(session, record, SAVING)
@@ -502,23 +523,35 @@ def _label_names(parquet_file, column):
 
 
 def _sample(record, paths, rng, open_parquet):
-    """Pick `sample_size` rows with text, uniformly at random, reading as little as possible.
+    """Pick `sample_size` rows with text, reading as little as possible; balanced
+    on the label column when asked and it has labels.
 
-    Pass 1 reads only each row group's row count; pass 2 reads only the mapped
-    columns of the row groups that hold a chosen row."""
+    Returns the rows, the method used (``"stratified"`` or ``"random"``) and a
+    note when a balance was asked for but could not be kept."""
     if open_parquet is None:
         import pyarrow.parquet as pq
 
         open_parquet = pq.ParquetFile
     files = [open_parquet(path) for path in paths]
-    groups = []  # (file index, row group, first row, row count)
-    total = 0
-    for f_index, parquet_file in enumerate(files):
-        metadata = parquet_file.metadata
-        for g in range(metadata.num_row_groups):
-            count = metadata.row_group(g).num_rows
-            groups.append((f_index, g, total, count))
-            total += count
+    if record.balance and record.label_column:
+        rows, note = _sample_balanced(record, files, rng)
+        if rows is not None:
+            rng.shuffle(rows)
+            return rows, "stratified", note
+        rows = _sample_random(record, files, rng)
+        rng.shuffle(rows)
+        return rows, "random", note
+    rows = _sample_random(record, files, rng)
+    rng.shuffle(rows)
+    return rows, "random", None
+
+
+def _sample_random(record, files, rng):
+    """Pick rows uniformly at random.
+
+    Pass 1 reads only each row group's row count; pass 2 reads only the mapped
+    columns of the row groups that hold a chosen row."""
+    groups, total = _groups(files)
     columns = [record.text_column] + ([record.label_column] if record.label_column else [])
     names = [_label_names(f, record.label_column) if record.label_column else None for f in files]
 
@@ -526,7 +559,7 @@ def _sample(record, paths, rng, open_parquet):
     kept, seen = [], set()
     while len(kept) < want and len(seen) < total:
         batch = _draw(rng, total, seen, want - len(kept))
-        for values, f_index in _read(files, groups, batch, columns):
+        for _, values, f_index in _read(files, groups, batch, columns):
             text = values[0]
             if text is None or not str(text).strip():
                 continue
@@ -534,6 +567,173 @@ def _sample(record, paths, rng, open_parquet):
     if not kept:
         raise ImportFailed("no_usable_rows", "None of the rows we read had any text, so there is nothing to import.")
     return [_mapped(values, names[f_index]) for values, f_index in kept[:want]]
+
+
+def _sample_balanced(record, files, rng):
+    """Pick rows so each label keeps its share of the whole dataset.
+
+    Pass 1 reads only the label column of every row group to count labels and
+    keep each row's place. Largest remainder gives every label floor or ceil of
+    its share, so their total is exactly the sample size. Pass 2 then reads
+    only the mapped columns of the row groups holding chosen rows, replacing
+    rows whose text is empty from the same label. When a label runs out of
+    rows with text, the shortfall is topped up from the others' unused rows.
+    Returns ``(None, note)`` when the files cannot be balanced and a random
+    sample should take over."""
+    import pyarrow.types as pat
+
+    label = record.label_column
+    if any(label not in f.schema_arrow.names for f in files):
+        return None, LABEL_MISSING
+    # A list or struct is not a class label; it is not even hashable.
+    if any(pat.is_nested(f.schema_arrow.field(label).type) for f in files):
+        return None, LABEL_LISTS
+    groups, _ = _groups(files)
+    names = [_label_names(f, label) for f in files]
+    by_label = {}
+    for f_index, g, first, _ in groups:
+        values = files[f_index].read_row_group(g, columns=[label]).to_pydict()[label]
+        for offset, value in enumerate(values):
+            if _empty_label(value, names[f_index]):
+                continue
+            by_label.setdefault(value, array("q")).append(first + offset)
+            # A free-text column has a value per row: give up before indexing
+            # all of it, since it can never be balanced into this sample.
+            if len(by_label) > record.sample_size:
+                return None, LABEL_TOO_MANY
+    if not by_label:
+        return None, LABEL_EMPTY
+    want = min(record.sample_size, sum(len(rows) for rows in by_label.values()))
+    # A free-text or summary column would otherwise be "balanced" by alphabet.
+    if len(by_label) > want:
+        return None, LABEL_TOO_MANY
+    allocations = _allocate({value: len(rows) for value, rows in by_label.items()}, want, rng)
+    columns = [record.text_column, label]
+
+    # The first draw per label; later draws come from a shuffled pointer into
+    # the label's unused rows, so a whole bucket is never shuffled up front.
+    pending = {}
+    attempted = {}
+    spare = {}
+    spare_at = {}
+    for value, rows in by_label.items():
+        picked = rng.sample(range(len(rows)), allocations.get(value, 0))
+        attempted[value] = set(picked)
+        pending[value] = [rows[position] for position in picked]
+
+    def take_spare(value):
+        if value not in spare:
+            spare[value] = array("q", (i for i in range(len(by_label[value])) if i not in attempted[value]))
+            rng.shuffle(spare[value])
+            spare_at[value] = 0
+        positions = spare[value]
+        while spare_at[value] < len(positions):
+            position = positions[spare_at[value]]
+            spare_at[value] += 1
+            if position not in attempted[value]:
+                attempted[value].add(position)
+                return by_label[value][position]
+        return None
+
+    chosen = []
+    while any(pending.values()):
+        row_label = {}
+        rows = []
+        for value, picked in pending.items():
+            for row in picked:
+                row_label[row] = value
+                rows.append(row)
+        pending = {value: [] for value in pending}
+        for row, values, f_index in _read(files, groups, sorted(rows), columns):
+            value = row_label[row]
+            text = values[0]
+            if text is None or not str(text).strip():
+                replacement = take_spare(value)
+                if replacement is not None:
+                    pending[value].append(replacement)
+                continue
+            chosen.append((values, f_index))
+    # Some labels had too few rows with text: fill the exact size from the
+    # labels that still have rows, largest first.
+    topped = False
+    if len(chosen) < want:
+        remaining = {value: len(rows) - len(attempted[value]) for value, rows in by_label.items()}
+        order = sorted(
+            (value for value, left in remaining.items() if left > 0),
+            key=lambda value: (-remaining[value], rng.random()),
+        )
+        for value in order:
+            while len(chosen) < want:
+                batch = []
+                while len(batch) < want - len(chosen):
+                    row = take_spare(value)
+                    if row is None:
+                        break
+                    batch.append(row)
+                if not batch:
+                    break
+                for _, values, f_index in _read(files, groups, sorted(batch), columns):
+                    text = values[0]
+                    if text is None or not str(text).strip():
+                        continue
+                    chosen.append((values, f_index))
+                    topped = True
+            if len(chosen) >= want:
+                break
+    # Checked after the top-up: a label with no place of its own may still
+    # hold the only rows with text.
+    if not chosen:
+        raise ImportFailed("no_usable_rows", "None of the rows we read had any text, so there is nothing to import.")
+    # Short of the size, or filled from other labels: either way the
+    # proportions are not the ones asked for, and the note says so.
+    rough = topped or len(chosen) < want
+    return [_mapped(values, names[f_index]) for values, f_index in chosen], (LABEL_ROUGH if rough else None)
+
+
+def _groups(files):
+    """Every row group as (file index, group, first row number, row count)."""
+    groups = []
+    total = 0
+    for f_index, parquet_file in enumerate(files):
+        metadata = parquet_file.metadata
+        for g in range(metadata.num_row_groups):
+            count = metadata.row_group(g).num_rows
+            groups.append((f_index, g, total, count))
+            total += count
+    return groups, total
+
+
+def _empty_label(value, names=None):
+    """Whether a label value says nothing: null, blank, NaN, or an HF `-1`."""
+    if value is None:
+        return True
+    if isinstance(value, float) and math.isnan(value):
+        return True
+    if isinstance(value, str) and not value.strip():
+        return True
+    # A ClassLabel's -1 means "no label"; it is not a label of its own.
+    return names is not None and isinstance(value, int) and value < 0
+
+
+def _allocate(counts, want, rng):
+    """Largest remainder: each label gets floor or ceil of its share, total `want`.
+    Equal remainders are broken at random, never by the label's text."""
+    total = sum(counts.values())
+    allocated = {}
+    remainders = {}
+    for value, count in counts.items():
+        shared, remainder = divmod(want * count, total)
+        allocated[value] = shared
+        remainders[value] = remainder
+    left = want - sum(allocated.values())
+    order = sorted(counts, key=lambda value: (-remainders[value], rng.random()))
+    for value in order:
+        if left == 0:
+            break
+        if allocated[value] < counts[value]:
+            allocated[value] += 1
+            left -= 1
+    return allocated
 
 
 def _draw(rng, total, seen, k):
@@ -554,8 +754,8 @@ def _draw(rng, total, seen, k):
 
 
 def _read(files, groups, rows, columns):
-    """The chosen rows' mapped columns, one row group read at a time, with the
-    row's file so its label names can be found."""
+    """The chosen rows' mapped columns, one row group read at a time, with each
+    row's number and file so its label can be placed and named."""
     out = []
     g_index = 0
     by_group = {}
@@ -564,10 +764,13 @@ def _read(files, groups, rows, columns):
             g_index += 1
         by_group.setdefault(g_index, []).append(row - groups[g_index][2])
     for g_index, offsets in by_group.items():
-        f_index, g, _, _ = groups[g_index]
-        table = files[f_index].read_row_group(g, columns=columns).to_pydict()
+        f_index, g, first, _ = groups[g_index]
+        # A file may lack a mapped column (a fallback random sample); read what
+        # it has and give the rest an empty value, so the CSV keeps its columns.
+        available = [c for c in columns if c in files[f_index].schema_arrow.names]
+        table = files[f_index].read_row_group(g, columns=available).to_pydict()
         for offset in offsets:
-            out.append(([table[c][offset] for c in columns], f_index))
+            out.append((first + offset, [table[c][offset] if c in table else None for c in columns], f_index))
     return out
 
 
@@ -593,4 +796,6 @@ def _write_csv(path, record, rows):
 
 def _description(record):
     where = f"{record.config}/{record.split}" if record.config else record.split or ""
+    if record.sample_method == "stratified":
+        return f"A sample that keeps the label balance, from Hugging Face: {record.external_id} {where}".strip()
     return f"A random sample from Hugging Face: {record.external_id} {where}".strip()

@@ -229,6 +229,7 @@ def test_a_hub_401_for_a_dataset_is_reported_as_not_found(client, queue, hub):
         ({"labelColumn": "nope"}, 400, "bad_mapping"),
         ({"size": 0}, 400, "bad_size"),
         ({"size": "lots"}, 400, "bad_size"),
+        ({"balance": "yes"}, 400, "bad_balance"),
         ({"taskType": "astrology"}, 400, "bad_task"),
         ({"dataset": "free-law/Caselaw_Access_Project", "config": None, "split": None}, 409, "gated"),
         ({"dataset": "jfrenz/legalglue", "config": None, "split": None}, 409, "not_importable"),
@@ -292,6 +293,44 @@ def test_starting_the_same_import_again_while_it_runs_returns_it(client, queue):
     # A different size, or another student, is another import.
     assert start(client, size=20)["id"] != first["id"]
     assert start(client, headers=BOB)["id"] != first["id"]
+
+
+def test_a_balance_that_is_not_a_boolean_is_refused_with_its_reason(client, queue):
+    refused = start(client, status=400, balance="yes")
+
+    assert refused["code"] == "bad_balance"
+    assert refused["error"] == "Say whether to keep the label balance."
+    assert queue.refs == []
+
+
+def test_a_label_column_balances_the_import_by_default_and_can_turn_it_off(client, queue):
+    balanced = start(client)
+
+    assert balanced["balance"] is True
+    assert balanced["sampleMethod"] is None
+    assert balanced["sampleNote"] is None
+    turned_off = start(client, balance=False)
+    assert turned_off["id"] != balanced["id"]
+    assert turned_off["balance"] is False
+    assert queue.refs == [balanced["id"], turned_off["id"]]
+
+
+def test_without_a_label_column_the_import_is_never_balanced(client, queue):
+    started = start(client, labelColumn=None, balance=True)
+
+    assert started["balance"] is False
+    assert started["sampleMethod"] is None
+
+
+@pytest.mark.parametrize("balance", [True, False])
+def test_a_retry_keeps_whether_to_keep_the_balance(client, balance):
+    started = start(client, balance=balance)
+    set_import(client, started["id"], status="failed")
+
+    retried = client.post(f"/api/library/imports/{started['id']}/retry", headers=ALICE)
+
+    assert retried.status_code == 202, retried.get_json()
+    assert retried.get_json()["balance"] is balance
 
 
 def test_the_student_cancels_their_own_running_import(client):

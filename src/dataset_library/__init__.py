@@ -5,7 +5,7 @@ from typing import Callable, Protocol
 from .licenses import License, resolve_license
 from .limits import HARD_MAX_ROWS
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 __all__ = ["Cache", "License", "init_dataset_library", "resolve_license"]
 

@@ -3,7 +3,7 @@ from the package's migrations."""
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Boolean, DateTime, Integer, String, UniqueConstraint
+from sqlalchemy import JSON, Boolean, DateTime, Integer, String, UniqueConstraint, false
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -48,6 +48,31 @@ class LibrarySource(LibraryBase):
         return {"id": self.id, "provider": self.provider, "kind": self.kind, "ref": self.ref, "enabled": self.enabled}
 
 
+class LibraryPin(LibraryBase):
+    """A dataset a course admin pinned as a starting point, with the card as it
+    was pinned and whether it has labels (#119).
+
+    Pins are course data, not personal data. `pinned_by` only says who pinned
+    it; when a host erases a user's data it should keep this column or set it
+    to null, not delete the pin with its owner.
+    """
+
+    __tablename__ = "library_pins"
+    __table_args__ = (UniqueConstraint("provider", "external_id", name="uq_library_pins_dataset"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    provider: Mapped[str] = mapped_column(String(40))
+    external_id: Mapped[str] = mapped_column(String(200))
+    # The admin's display title, or null to use the card's.
+    title: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    featured: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    labelled: Mapped[str] = mapped_column(String(10), default="unclear", server_default="unclear")
+    # The search card as it was pinned; the license level is re-derived on read.
+    card: Mapped[dict] = mapped_column(JSON)
+    pinned_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    pinned_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
 class LibraryImport(LibraryBase):
     """One import of a sample, from queued to completed, failed or cancelled. The
     database, not the queue, says where it is; a completed import is the
@@ -69,6 +94,11 @@ class LibraryImport(LibraryBase):
     label_column: Mapped[str | None] = mapped_column(String(200), nullable=True)
     task_type: Mapped[str] = mapped_column(String(40))
     sample_size: Mapped[int] = mapped_column(Integer)
+    # Keep the label balance of the whole dataset (#115); needs a label column.
+    balance: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    # "stratified" or "random", and why a asked-for balance was not kept.
+    sample_method: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    sample_note: Mapped[str | None] = mapped_column(String(300), nullable=True)
     # The row cap when the import was queued; a later change does not touch it.
     max_rows: Mapped[int] = mapped_column(Integer)
     name: Mapped[str] = mapped_column(String(255))
@@ -104,6 +134,9 @@ class LibraryImport(LibraryBase):
             "textColumn": self.text_column,
             "labelColumn": self.label_column,
             "size": self.sample_size,
+            "balance": self.balance,
+            "sampleMethod": self.sample_method,
+            "sampleNote": self.sample_note,
             "rows": self.rows,
             "datasetRef": self.dataset_ref,
             "createdAt": self.created_at.isoformat() + "Z" if self.created_at else None,
