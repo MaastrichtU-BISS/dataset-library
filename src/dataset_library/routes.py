@@ -190,22 +190,32 @@ def _importing():
 def start_import():
     """Queue an import of a random sample; the worker does the rest."""
     _importing()
+    record, created = _starting(imports_module.start, request.get_json(silent=True) or {})
+    # The same import already queued or running comes back as it is.
+    return jsonify(record), 202 if created else 200
+
+
+def _starting(action, *args):
+    """Run an action that starts an import, turning its refusals into answers."""
     try:
-        record = imports_module.start(_host(), _host().current_owner(), request.get_json(silent=True) or {})
+        return action(_host(), _host().current_owner(), *args)
     except imports_module.Refused as refused:
         raise ApiError(refused.status, refused.message, refused.code)
     except ProviderRateLimited:
         raise ApiError(503, "Hugging Face is limiting requests. Try again in a few minutes.", "provider_rate_limited")
     except ProviderUnavailable:
         raise ApiError(503, "Hugging Face could not be reached. Try again in a few minutes.", "provider_unavailable")
-    return jsonify(record), 202
 
 
 @library_bp.route("/imports", methods=["GET"])
 def list_imports():
-    """The signed-in user's imports, newest first."""
+    """The signed-in user's imports, newest first; with `?current=true`, only
+    those still running and those failed in the last day and not put away."""
     _importing()
-    return jsonify({"imports": imports_module.for_owner(_host(), _host().current_owner())})
+    owner = _host().current_owner()
+    if request.args.get("current") == "true":
+        return jsonify({"imports": imports_module.current(_host(), owner)})
+    return jsonify({"imports": imports_module.for_owner(_host(), owner)})
 
 
 # Not `<import_id>`: hosts may treat `*_id` URL parameters as their own database ids.
@@ -216,3 +226,33 @@ def follow_import(import_ref):
     if record is None:
         raise ApiError(404, "No such import.", "not_found")
     return jsonify(record)
+
+
+def _found(record):
+    if record is None:
+        raise ApiError(404, "No such import.", "not_found")
+    return jsonify(record)
+
+
+@library_bp.route("/imports/<import_ref>/cancel", methods=["POST"])
+def cancel_import(import_ref):
+    """Cancel an import before it saves the dataset (409 `too_late` after)."""
+    _importing()
+    return _found(_starting(imports_module.cancel, import_ref))
+
+
+@library_bp.route("/imports/<import_ref>/retry", methods=["POST"])
+def retry_import(import_ref):
+    """Start a failed or cancelled import again with the same settings."""
+    _importing()
+    record = _starting(imports_module.retry, import_ref)
+    if record is None:
+        raise ApiError(404, "No such import.", "not_found")
+    return jsonify(record), 202
+
+
+@library_bp.route("/imports/<import_ref>/dismiss", methods=["POST"])
+def dismiss_import(import_ref):
+    """Put away a failed or cancelled import (409 `running` while it runs)."""
+    _importing()
+    return _found(_starting(imports_module.dismiss, import_ref))

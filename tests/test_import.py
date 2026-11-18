@@ -30,11 +30,14 @@ def write_shard(path, texts, labels, row_group_size=None):
 
 
 class FakeCreateDataset:
-    def __init__(self, refuse=None):
+    def __init__(self, refuse=None, while_saving=None):
         self.calls = []
         self.refuse = refuse
+        self.while_saving = while_saving
 
     def __call__(self, owner_id, file_path, name, description, task_type):
+        if self.while_saving:
+            self.while_saving()
         with open(file_path, newline="") as f:
             rows = list(csv.DictReader(f))
         self.calls.append({"owner": owner_id, "name": name, "description": description, "task_type": task_type, "rows": rows})
@@ -47,8 +50,9 @@ class FakeCreateDataset:
 def run(app, tmp_path):
     """Queue an import directly and run it, as the host's worker would."""
 
-    def go(shards, *, size=4, fail_fetch=None, refuse=None, open_parquet=None, while_fetching=None, **fields):
-        create = FakeCreateDataset(refuse)
+    def go(shards, *, size=4, fail_fetch=None, refuse=None, open_parquet=None, while_fetching=None,
+           while_saving=None, heartbeat_seconds=None, **fields):
+        create = FakeCreateDataset(refuse, while_saving and (lambda: while_saving(app)))
 
         def fetch_shards(external_id, config, split, max_bytes, dest_dir):
             create.fetched_with = (external_id, config, split, max_bytes)
@@ -73,6 +77,7 @@ def run(app, tmp_path):
             imports.run_import(
                 ref, session=session, fetch_shards=fetch_shards,
                 create_dataset=create, data_dir=str(tmp_path / "data"), seed=7, open_parquet=open_parquet,
+                heartbeat_seconds=heartbeat_seconds,
             )
             session.expunge_all()
             found = session.get(LibraryImport, ref)

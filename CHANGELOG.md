@@ -8,6 +8,31 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-18
+
+### Added
+
+- Imports you can leave, cancel and retry (BAIGLE #114).
+  - `POST /api/library/imports/<ref>/cancel`, `/retry` and `/dismiss`, and
+    `GET /api/library/imports?current=true` (running, plus failures from the
+    last day not put away).
+  - A heartbeat: `run_import(heartbeat_seconds=15)` refreshes
+    `library_imports.heartbeat_at`; `imports.sweep(session)` fails imports
+    quiet for two minutes and queued ones not picked up in 30.
+  - Starting the same import (dataset, revision, mapping, size) while one is
+    queued or running returns that one, with 200.
+  - `POST /imports` takes `revision`: an import of a newer one is refused (`changed`).
+  - Imports carry `textColumn` and `labelColumn`.
+  - Migration `dl_0004_import_lifecycle` adds `heartbeat_at` and `dismissed_at`.
+
+### Changed
+
+- A new `saving` status between `validating` and `completed`, claimed before
+  the Dataset is written. Every status change is a conditional update, so a
+  cancel and the worker finishing never both win: a cancel before `saving`
+  wins and no Dataset is made; one after is refused.
+- `imports.start` returns `(import, created)`.
+
 ## [0.5.0] - 2026-11-17
 
 ### Added
