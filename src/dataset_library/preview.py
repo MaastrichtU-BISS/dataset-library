@@ -19,7 +19,12 @@ NER_NAMED_COLUMNS = ("ner_tags", "ner")
 GENERIC_TAG_COLUMNS = ("tags", "labels", "label")
 # Tag columns that are BIO but not entities: chunks, parts of speech.
 NOT_ENTITY_WORDS = ("chunk", "pos")
-SUMMARY_TEXT_COLUMNS = ("document", "article", "text", "dialogue", "source", "input")
+# Source columns by name only: guessing by length once took metadata (a
+# `split` column, a title) as the document.
+SUMMARY_TEXT_COLUMNS = (
+    "document", "article", "text", "dialogue", "source", "input",
+    "report", "description", "content", "body",
+)
 # Only names that say "summary": generic `target`/`output` also hold code,
 # answers and translations.
 SUMMARY_LABEL_COLUMNS = ("summary", "highlights", "abstract")
@@ -143,8 +148,6 @@ def _propose(tasks, features, rows):
     if "summarization" in tasks:
         label = _first_text(named, SUMMARY_LABEL_COLUMNS)
         text = _first_text(named, SUMMARY_TEXT_COLUMNS, exclude=label)
-        if text is None:
-            text = _longest_text(named, rows, exclude=label)
         if text is not None and label is not None and text != label:
             return {"taskType": "summarization", "textColumn": text, "labelColumn": label}
     return _no_proposal()
@@ -205,25 +208,6 @@ def _first_text(named, preferred, exclude=None):
         if name != exclude and not _is_list(type_) and _is_text(type_):
             return name
     return None
-
-
-def _longest_text(named, rows, exclude=None):
-    """The plain text column whose sample rows read longest."""
-    best, best_length = None, -1.0
-    for name, type_ in named:
-        if name == exclude or _is_list(type_) or not _is_text(type_) or _is_id(name):
-            continue
-        lengths = [len(value) for row in rows if isinstance((value := (row.get("row") or {}).get(name)), str)]
-        length = sum(lengths) / len(lengths) if lengths else 0
-        if length > best_length:
-            best, best_length = name, length
-    return best
-
-
-def _is_id(name):
-    """An identifier column: `id`, `doc_id`, `article-id` and the like."""
-    lowered = name.lower()
-    return lowered == "id" or lowered.endswith(("_id", "-id"))
 
 
 def _is_list(feature):

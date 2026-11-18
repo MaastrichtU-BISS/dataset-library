@@ -66,7 +66,7 @@ NER_TASKS = {"ner", "named_entity_recognition"}
 # The host's training columns for the label side of each task (#117).
 LABEL_HEADERS = {"ner": "entities", "named_entity_recognition": "entities", "summarization": "summary"}
 NESTED_NER = (
-    "These columns hold lists of lists or of records, so they can't be read as "
+    "These columns hold records or lists of lists, so they can't be read as "
     "words and their entity tags. Pick a column of words and a column of tags."
 )
 NO_ENTITY_NAMES = (
@@ -564,7 +564,7 @@ def _refuse_numbered_ner_tags(record, files):
     for parquet_file in files:
         schema = parquet_file.schema_arrow
         for column in (record.text_column, record.label_column):
-            if column and column in schema.names and _nested_list(schema.field(column).type):
+            if column and column in schema.names and _not_flat(schema.field(column).type):
                 raise ImportFailed("nested_columns", NESTED_NER)
         if not record.label_column or record.label_column not in schema.names:
             continue
@@ -572,11 +572,14 @@ def _refuse_numbered_ner_tags(record, files):
             raise ImportFailed("no_entity_names", NO_ENTITY_NAMES)
 
 
-def _nested_list(arrow_type):
-    """Whether an Arrow type is a list whose items are lists, structs or maps
-    (span annotations, for example) rather than words or tags."""
+def _not_flat(arrow_type):
+    """Whether an NER column is something other than a string or a flat list
+    of words or tags: a record (Hugging Face stores a sequence of span dicts
+    as a record of lists), a map, or a list of lists, records or maps."""
     import pyarrow.types as pat
 
+    if pat.is_struct(arrow_type) or pat.is_map(arrow_type):
+        return True
     lists = pat.is_list(arrow_type) or pat.is_large_list(arrow_type) or pat.is_fixed_size_list(arrow_type)
     return lists and pat.is_nested(arrow_type.value_type)
 

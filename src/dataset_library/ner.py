@@ -21,10 +21,18 @@ def tokens_to_text(tokens):
         return ""
     if isinstance(tokens, (list, tuple)):
         words = [str(token) for token in tokens if token is not None]
-        if any(word and not word.strip() for word in words):
+        if _character_level(words):
             return "".join(words)
         return " ".join(words)
     return str(tokens)
+
+
+def _character_level(words):
+    """A row of single characters that keeps its spaces as tokens: a word-level
+    row with a stray newline or space token is not one."""
+    spaces = [word for word in words if word and not word.strip()]
+    letters = [word for word in words if word.strip()]
+    return bool(spaces) and bool(letters) and all(len(word) == 1 for word in letters)
 
 
 def entity_types(tags, names=None):

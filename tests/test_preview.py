@@ -389,24 +389,38 @@ def test_a_feature_without_a_name_is_ignored():
     assert _propose(["ner"], features, []) == {"taskType": "ner", "textColumn": "tokens", "labelColumn": "ner_tags"}
 
 
-def test_summarization_falls_back_to_the_longest_text_column_for_the_source():
-    features = [
-        {"name": "id", "type": {"dtype": "int64", "_type": "Value"}},
-        {"name": "body", "type": _string()},
-        {"name": "notes", "type": _string()},
+def test_summarization_never_guesses_the_source_from_other_text_columns():
+    # ai-sage/TimeGround-1M's `sum` config once gave `split` as the source,
+    # and arxiv-abstracts-2021 its `title`.
+    split = [
+        {"name": "split", "type": _string()},
         {"name": "summary", "type": _string()},
     ]
-    rows = [
-        {"row": {"body": "short", "notes": "a much longer note", "summary": "one"}},
-        {"row": {"body": "tiny", "notes": "another long note here", "summary": "two"}},
+    title = [
+        {"name": "id", "type": _string()},
+        {"name": "title", "type": _string()},
+        {"name": "abstract", "type": _string()},
     ]
+    rows = [{"row": {"split": "train", "title": "A long title about many things", "summary": "s"}}]
 
-    assert _propose(["summarization"], features, rows) == {
-        "taskType": "summarization", "textColumn": "notes", "labelColumn": "summary",
+    assert _propose(["summarization"], split, rows) == NOTHING
+    assert _propose(["summarization"], title, rows) == NOTHING
+
+
+def test_summarization_reads_report_and_description_sources():
+    # govreport-style and big_patent-style columns.
+    report = [{"name": "report", "type": _string()}, {"name": "summary", "type": _string()}]
+    patent = [{"name": "description", "type": _string()}, {"name": "abstract", "type": _string()}]
+
+    assert _propose(["summarization"], report, []) == {
+        "taskType": "summarization", "textColumn": "report", "labelColumn": "summary",
+    }
+    assert _propose(["summarization"], patent, []) == {
+        "taskType": "summarization", "textColumn": "description", "labelColumn": "abstract",
     }
 
 
-def test_summarization_uses_the_usual_names_before_the_length_fallback():
+def test_summarization_uses_the_usual_names_in_order():
     features = [
         {"name": "source", "type": _string()},
         {"name": "article", "type": _string()},

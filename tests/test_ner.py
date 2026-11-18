@@ -53,3 +53,9 @@ def test_character_tokens_with_space_tokens_are_joined_as_written():
 
 def test_word_tokens_are_still_joined_by_spaces():
     assert tokens_to_text(["The", "court", "held"]) == "The court held"
+
+
+def test_a_stray_space_or_newline_token_keeps_word_spacing():
+    assert tokens_to_text(["The", "court", "\n", "held", "that"]) == "The court \n held that"
+    assert tokens_to_text(["The", " ", "court", "held"]) == "The   court held"
+    assert tokens_to_text(["Smith", "v.", "\xa0", "Jones"]) == "Smith v. \xa0 Jones"

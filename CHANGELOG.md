@@ -29,22 +29,23 @@ While the version is 0.x, minor releases may contain breaking changes.
     generic name that marks something else (acronym forms, semantic roles) is
     still proposed; Step 1 shows the tags before the import. Summarization
     proposes the first of `document`, `article`, `text`, `dialogue`, `source`,
-    `input` and of `summary`, `highlights`, `abstract` (never a generic
-    `target` or `output`), falling back to the longest sampled text column
-    that is not an id (`id`, `*_id`). All three are `null` when no pair fits
+    `input`, `report`, `description`, `content`, `body` and of `summary`,
+    `highlights`, `abstract` (never a generic `target` or `output`), with no
+    guessing from other columns. All three are `null` when no pair fits
     the selected config (a `ner`-tagged classification or dependency-parsing
     config, for example) or the preview is unavailable.
   - NER imports join a row's tokens into `text` and write the row's distinct
     entity types into `entities` (BIO position stripped, `O` dropped, first
-    seen first, missing tokens skipped; character-level tokens that keep
-    spaces as tokens, as in klue/klue's `ner`, are joined as written).
+    seen first, missing tokens skipped; a row of single characters that keeps
+    its spaces as tokens, as in klue/klue's `ner`, is joined as written).
     Numbered tags are read through the ClassLabel names in the Parquet's
     `huggingface` metadata, including a ClassLabel inside a Sequence and its
     older list form. A tag column that is a list of numbers with no names, or
     an empty name list, fails the import with `no_entity_names` before any row
-    is sampled, with a per-row check as a backstop. NER columns that hold
-    lists of lists or of records (span annotations) fail with `nested_columns`
-    before any row is read.
+    is sampled, with a per-row check as a backstop. NER columns that are
+    records, maps or lists of lists, records or maps (span annotations, in
+    either of Hugging Face's forms) fail with `nested_columns` before any row
+    is read.
   - Summarization imports write the source document as `text` and its target
     as `summary`. A row whose summary is missing or blank is skipped and
     replaced like a row with empty text, and when no row has both a text and a
