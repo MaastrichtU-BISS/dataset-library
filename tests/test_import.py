@@ -641,7 +641,7 @@ def test_an_empty_token_list_is_empty_text_and_the_sample_stays_exact(run, tmp_p
     shard = write_ner_shard(
         tmp_path / "0000.parquet",
         [[], ["Kept", "one"], [], ["Kept", "two"]],
-        [[], [0], [], [0]],
+        [[], [0, 0], [], [0, 0]],
     )
 
     result, create = run([shard], size=2, task_type="ner", text_column="tokens", label_column="ner_tags")
@@ -775,6 +775,15 @@ def test_a_missing_tag_value_or_a_string_text_leaves_the_entities_blank():
     assert _mapped(["John Smith works", ["B-PER", "I-PER", "O"]], None, "ner") == ["John Smith works", ""]
     assert _mapped(["John Smith works", "PER, ORG"], None, "ner") == ["John Smith works", ""]
     assert _mapped([["John", "works"], ["O", "O"]], None, "ner") == ["John works", "[]"]
+    # Tags that do not cover every token say nothing about the rest of the row.
+    for tags in ([], [None, None], ["O"], ["B-PER"], "O B-PER", ["B-PER", None]):
+        assert _mapped([["John", "works"], tags], None, "ner") == ["John works", ""], tags
+
+
+def test_a_string_text_with_numbered_unnamed_tags_imports_blank_rather_than_failing():
+    from dataset_library.imports import _mapped
+
+    assert _mapped(["John works", [1, 0]], None, "ner") == ["John works", ""]
 
 
 def test_a_summarization_import_writes_text_and_summary(run, tmp_path):

@@ -569,7 +569,10 @@ def _refuse_numbered_ner_tags(record, files):
                 raise ImportFailed("nested_columns", NESTED_NER)
         if not record.label_column or record.label_column not in schema.names:
             continue
-        if _integer_list(schema.field(record.label_column).type) and not _label_names(parquet_file, record.label_column):
+        # A text that is already a string gets blank entities (its tags have
+        # no tokens to sit on), so its tags' names do not matter.
+        text_is_tokens = record.text_column in schema.names and _is_list(schema.field(record.text_column).type)
+        if text_is_tokens and _integer_list(schema.field(record.label_column).type) and not _label_names(parquet_file, record.label_column):
             raise ImportFailed("no_entity_names", NO_ENTITY_NAMES)
 
 
@@ -583,6 +586,12 @@ def _not_flat(arrow_type):
         return True
     lists = pat.is_list(arrow_type) or pat.is_large_list(arrow_type) or pat.is_fixed_size_list(arrow_type)
     return lists and pat.is_nested(arrow_type.value_type)
+
+
+def _is_list(arrow_type):
+    import pyarrow.types as pat
+
+    return pat.is_list(arrow_type) or pat.is_large_list(arrow_type) or pat.is_fixed_size_list(arrow_type)
 
 
 def _integer_list(arrow_type):
@@ -869,6 +878,17 @@ def _numbered(tags):
     )
 
 
+def _complete_tags(tokens, tags):
+    """Whether an NER row has a token list and a tag for each of its tokens."""
+    return (
+        isinstance(tokens, (list, tuple))
+        and isinstance(tags, (list, tuple))
+        and len(tags) == len(tokens)
+        and len(tokens) > 0
+        and all(tag is not None for tag in tags)
+    )
+
+
 def _mapped(values, names, task_type="classification"):
     """A row as written for the host: text, then the label by name when it has one.
 
@@ -879,14 +899,15 @@ def _mapped(values, names, task_type="classification"):
         return [text]
     label = values[1]
     if task_type in NER_TASKS:
+        # Only a token list with a tag for every token says where entities
+        # are. Anything less (a text that is already a string, missing,
+        # scalar, short or partly empty tags) leaves the cell blank, so the
+        # row waits to be annotated rather than training as "no entities", as
+        # a partial annotation, or as one entity over the whole text.
+        if not _complete_tags(values[0], label):
+            return [text, ""]
         if _numbered(label) and not names:
             raise ImportFailed("no_entity_names", NO_ENTITY_NAMES)
-        # Only a token list with its tags says where entities are. A missing
-        # tag value, or a text that is already a string, leaves the cell blank
-        # so the row waits to be annotated rather than training as "no
-        # entities" or as one entity over the whole text.
-        if label is None or not isinstance(values[0], (list, tuple)):
-            return [text, ""]
         text, found = spans(values[0], label, names)
         return [text, json.dumps(found, ensure_ascii=False)]
     if names and isinstance(label, int) and 0 <= label < len(names):

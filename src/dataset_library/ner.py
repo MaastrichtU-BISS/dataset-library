@@ -14,7 +14,7 @@ PREFIX_SEPARATORS = ("-", "_")
 # Positions that carry an open span on; the others start or end one.
 CONTINUES = frozenset("IM")
 # Tags some preprocessed sets put on sub-word or padding positions: not types.
-PLACEHOLDERS = frozenset({"x", "pad", "[pad]", "<pad>"})
+PLACEHOLDERS = frozenset({"x", "pad", "[pad]", "<pad>", "[cls]", "[sep]"})
 
 
 def tokens_to_text(tokens):
@@ -75,8 +75,10 @@ def spans(tokens, tags, names=None):
     ``O`` on it closes the open span. In a character-level row (klue's ``ner``
     tags the spaces inside a multi-word entity ``O``) it leaves a prefixed span
     open for a following ``I-`` of the same type; an unprefixed (IO) span has
-    no other separator, so ``O`` closes it there too. Whitespace at a token's
-    edges is never part of a span."""
+    no other separator, so ``O`` closes it there too (a character-level IOB1
+    row therefore joins ``I-PER``, space, ``I-PER`` into one entity). Prefixes
+    and ``O`` are read in either case. Whitespace at a token's edges is never
+    part of a span."""
     text, offsets = _joined(tokens)
     tag_list = _as_list(tags)
     if isinstance(tokens, (list, tuple)):
@@ -105,7 +107,8 @@ def spans(tokens, tags, names=None):
                     close()
             else:
                 position, type_ = parsed
-                if position not in CONTINUES and position is not None or type_ != open_type:
+                starts_or_ends = position is not None and position not in CONTINUES
+                if starts_or_ends or type_ != open_type:
                     close()
             continue
         # Trim whitespace at the token's own edges.
@@ -149,8 +152,8 @@ def _parse(tag, names):
         return None
     tag = tag.strip()
     position = None
-    if len(tag) >= 2 and tag[0] in POSITIONS and tag[1] in PREFIX_SEPARATORS:
-        position, tag = tag[0], tag[2:].strip()
-    if not tag or tag == "O" or tag.lower() in PLACEHOLDERS:
+    if len(tag) >= 2 and tag[0].upper() in POSITIONS and tag[1] in PREFIX_SEPARATORS:
+        position, tag = tag[0].upper(), tag[2:].strip()
+    if not tag or tag.upper() == "O" or tag.lower() in PLACEHOLDERS:
         return None
     return position, tag

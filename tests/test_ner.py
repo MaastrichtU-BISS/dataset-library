@@ -271,3 +271,14 @@ def test_outside_and_placeholder_tags_are_never_types():
 
 def test_a_space_after_the_prefix_is_not_part_of_the_type():
     assert _types(spans(["a", "b"], ["B- PER", "I-PER"])[1]) == [("a b", "PER")]
+
+
+def test_lowercase_prefixes_and_outside_tags_are_read():
+    text, found = spans(["John", "Smith", "works"], ["b-per", "i-per", "o"])
+    check(text, found)
+    assert _types(found) == [("John Smith", "per")]
+
+
+def test_bert_special_tokens_are_not_types():
+    for tag in ("[CLS]", "[SEP]"):
+        assert spans(["a"], [tag])[1] == []

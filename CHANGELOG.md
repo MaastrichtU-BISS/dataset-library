@@ -20,12 +20,16 @@ While the version is 0.x, minor releases may contain breaking changes.
   annotation queue stores, so imported NER data can be trained on.
   - BIO, IOB1, BIOES/BILOU, BMES and IO tags decode to spans for word-level
     and character-level rows alike; `O`, `B-O` and placeholder tags (`X`,
-    `PAD`) are outside. Whitespace never starts or ends a span; an `O` on a
+    `PAD`, `[CLS]`, `[SEP]`) are outside; prefixes and `O` are read in either
+    case. Whitespace never starts or ends a span; an `O` on a
     whitespace token closes a span, except inside a prefixed entity of a
     character-level row (klue's `ner` tags those spaces `O`).
-  - A row whose tag value is missing, or whose text column is already a
-    string, gets a blank `entities` cell, so it waits to be annotated instead
-    of counting as a row with no entities.
+  - Spans are written only for a token list with a tag for every token. A
+    row whose text column is already a string, or whose tags are missing,
+    scalar, shorter than its tokens or partly empty, gets a blank `entities`
+    cell, so it waits to be annotated instead of counting as a row with no
+    entities or a partial annotation. For a string text column, numbered
+    tags without names therefore no longer fail the import.
   - The conversion lives in `dataset_library.ner.spans`; `tokens_to_text` is
     unchanged.
 
