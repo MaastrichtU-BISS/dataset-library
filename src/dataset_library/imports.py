@@ -151,6 +151,8 @@ def start(host, owner_id, body, *, ack_at=None):
         raise Refused(400, "bad_mapping", "Pick the column that holds the text.")
     if label_column is not None and label_column not in columns:
         raise Refused(400, "bad_mapping", "Pick a label column from this dataset, or none.")
+    if label_column is not None and label_column == text_column:
+        raise Refused(400, "bad_mapping", "Pick different columns for the text and the label.")
     balance = body.get("balance")
     if balance is not None and not isinstance(balance, bool):
         raise Refused(400, "bad_balance", "Say whether to keep the label balance.")
@@ -526,7 +528,9 @@ def _label_names(parquet_file, column):
     metadata = parquet_file.schema_arrow.metadata or {}
     try:
         features = json.loads(metadata[b"huggingface"])["info"]["features"]
-    except (KeyError, ValueError, TypeError):
+    except (KeyError, ValueError, TypeError, AttributeError):
+        return None
+    if not isinstance(features, dict):
         return None
     return _class_label_names(features.get(column) or {})
 
@@ -548,6 +552,27 @@ def _class_label_names(feature):
     return None
 
 
+def _refuse_numbered_ner_tags(record, files):
+    """Fail before any row is read when an NER label column holds numbers the
+    files do not name: there are no entity types to write."""
+    if record.task_type not in NER_TASKS or not record.label_column:
+        return
+    for parquet_file in files:
+        schema = parquet_file.schema_arrow
+        if record.label_column not in schema.names:
+            continue
+        if _integer_list(schema.field(record.label_column).type) and _label_names(parquet_file, record.label_column) is None:
+            raise ImportFailed("no_entity_names", NO_ENTITY_NAMES)
+
+
+def _integer_list(arrow_type):
+    """Whether an Arrow type is a list of integers."""
+    import pyarrow.types as pat
+
+    lists = pat.is_list(arrow_type) or pat.is_large_list(arrow_type) or pat.is_fixed_size_list(arrow_type)
+    return lists and pat.is_integer(arrow_type.value_type)
+
+
 def _sample(record, paths, rng, open_parquet):
     """Pick `sample_size` rows with text, reading as little as possible; balanced
     on the label column when asked and it has labels.
@@ -559,6 +584,7 @@ def _sample(record, paths, rng, open_parquet):
 
         open_parquet = pq.ParquetFile
     files = [open_parquet(path) for path in paths]
+    _refuse_numbered_ner_tags(record, files)
     if record.balance and record.label_column:
         rows, note = _sample_balanced(record, files, rng)
         if rows is not None:
@@ -576,10 +602,13 @@ def _sample_random(record, files, rng):
     """Pick rows uniformly at random.
 
     Pass 1 reads only each row group's row count; pass 2 reads only the mapped
-    columns of the row groups that hold a chosen row."""
+    columns of the row groups that hold a chosen row. A summarization row needs
+    both a text and a summary, so one with a missing summary is replaced like
+    one with empty text."""
     groups, total = _groups(files)
     columns = [record.text_column] + ([record.label_column] if record.label_column else [])
     names = [_label_names(f, record.label_column) if record.label_column else None for f in files]
+    needs_summary = record.task_type == "summarization" and record.label_column is not None
 
     want = min(record.sample_size, total)
     kept, seen = [], set()
@@ -588,8 +617,15 @@ def _sample_random(record, files, rng):
         for _, values, f_index in _read(files, groups, batch, columns):
             if not _text(record.task_type, values[0]).strip():
                 continue
+            if needs_summary and _empty_label(values[1]):
+                continue
             kept.append((values, f_index))
     if not kept:
+        if needs_summary:
+            raise ImportFailed(
+                "no_usable_rows",
+                "None of the rows we read had both a text and a summary, so there is nothing to import.",
+            )
         raise ImportFailed("no_usable_rows", "None of the rows we read had any text, so there is nothing to import.")
     return [_mapped(values, names[f_index], record.task_type) for values, f_index in kept[:want]]
 

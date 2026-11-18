@@ -16,7 +16,7 @@ def tokens_to_text(tokens):
     if tokens is None:
         return ""
     if isinstance(tokens, (list, tuple)):
-        return " ".join(str(token) for token in tokens)
+        return " ".join(str(token) for token in tokens if token is not None)
     return str(tokens)
 
 

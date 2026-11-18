@@ -11,10 +11,11 @@ ROWS = 8
 CELL_CHARACTERS = 400
 # Names that say which column is which, before falling back to the types.
 NER_TEXT_COLUMNS = ("tokens", "words")
-NER_LABEL_COLUMNS = ("ner_tags", "tags")
+NER_LABEL_COLUMNS = ("ner_tags", "tags", "ner", "labels", "label")
 SUMMARY_TEXT_COLUMNS = ("document", "article", "text", "dialogue", "source", "input")
 SUMMARY_LABEL_COLUMNS = ("summary", "highlights", "abstract", "target", "output")
 LIST_TYPES = ("Sequence", "List", "LargeList")
+INTEGER_DTYPES = ("int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64")
 
 
 class NotInLibrary(Exception):
@@ -122,34 +123,49 @@ def _no_proposal():
 
 def _propose(tasks, features, rows):
     """What the import's column step starts with: the task's usual columns
-    when the viewer shows them, and nothing when it cannot tell."""
-    if "ner" in tasks:
-        task = "ner"
-    elif "summarization" in tasks:
-        task = "summarization"
-    else:
-        return _no_proposal()
+    when the viewer shows a pair that fits, and nothing when it cannot tell."""
     named = [(f.get("name"), f.get("type")) for f in features if isinstance(f, dict)]
-    if task == "ner":
-        text = _pick(
-            [name for name, type_ in named if _is_list(type_) and _is_text(_list_inner(type_))],
-            NER_TEXT_COLUMNS,
-        )
-        label = _pick(
-            [name for name, type_ in named if _is_list(type_) and (
-                _is_text(_list_inner(type_)) or labels_module.is_class_label(_list_inner(type_))
-            )],
-            NER_LABEL_COLUMNS, suffix="tags",
-        )
-    else:
+    if "ner" in tasks:
+        text, label = _ner_columns(named)
+        if text is not None and label is not None:
+            return {"taskType": "ner", "textColumn": text, "labelColumn": label}
+    if "summarization" in tasks:
         label = _first_text(named, SUMMARY_LABEL_COLUMNS)
         text = _first_text(named, SUMMARY_TEXT_COLUMNS, exclude=label)
         if text is None:
             text = _longest_text(named, rows, exclude=label)
-    return {"taskType": task, "textColumn": text, "labelColumn": label}
+        if text is not None and label is not None and text != label:
+            return {"taskType": "summarization", "textColumn": text, "labelColumn": label}
+    return _no_proposal()
 
 
-def _pick(candidates, preferred, suffix=None):
+def _ner_columns(named):
+    """The distinct text and tag columns of an NER dataset, or (None, None).
+
+    The label is chosen first by its usual name, then the text avoids it; with
+    no usual name, the first tag column that is not the text becomes the label,
+    preferring named or numbered tags over plain strings."""
+    texts = [name for name, type_ in named if _is_list(type_) and _is_text(_list_inner(type_))]
+    tags = [(name, type_) for name, type_ in named if _is_list(type_) and _is_tag(_list_inner(type_))]
+    label = _pick_named([name for name, _ in tags], NER_LABEL_COLUMNS, suffix="tags")
+    text = _pick([name for name in texts if name != label], NER_TEXT_COLUMNS)
+    if label is None:
+        named_first = [name for name, type_ in tags if name != text and _is_named_tag(_list_inner(type_))]
+        rest = [name for name, _ in tags if name != text and name not in named_first]
+        label = (named_first or rest or [None])[0]
+    if text is None or label is None or text == label:
+        return None, None
+    return text, label
+
+
+def _pick(candidates, preferred):
+    for name in preferred:
+        if name in candidates:
+            return name
+    return candidates[0] if candidates else None
+
+
+def _pick_named(candidates, preferred, suffix=None):
     for name in preferred:
         if name in candidates:
             return name
@@ -157,7 +173,7 @@ def _pick(candidates, preferred, suffix=None):
         for name in candidates:
             if name.endswith(suffix):
                 return name
-    return candidates[0] if candidates else None
+    return None
 
 
 def _first_text(named, preferred, exclude=None):
@@ -188,10 +204,17 @@ def _is_list(feature):
 
 
 def _list_inner(feature):
-    """The element type of a list feature; a bare list is a list of one."""
+    """The element type of a list feature; a bare list is a list of one, and an
+    older Sequence whose ``feature`` is a one-element list is unwrapped too."""
     if isinstance(feature, list):
-        return feature[0] if feature else None
-    return feature.get("feature") if isinstance(feature, dict) else None
+        inner = feature[0] if feature else None
+    elif isinstance(feature, dict):
+        inner = feature.get("feature")
+    else:
+        inner = None
+    if isinstance(inner, list):
+        return inner[0] if inner else None
+    return inner
 
 
 def _is_text(feature):
@@ -202,6 +225,24 @@ def _is_text(feature):
         and feature.get("_type") == "Value"
         and feature.get("dtype") in ("string", "large_string")
     )
+
+
+def _is_integer(feature):
+    return (
+        isinstance(feature, dict)
+        and feature.get("_type") == "Value"
+        and feature.get("dtype") in INTEGER_DTYPES
+    )
+
+
+def _is_tag(feature):
+    """A tag: a ClassLabel, a plain tag string, or a numbered tag."""
+    return _is_text(feature) or _is_integer(feature) or labels_module.is_class_label(feature)
+
+
+def _is_named_tag(feature):
+    """A tag that carries names or numbers, not just plain strings."""
+    return _is_integer(feature) or labels_module.is_class_label(feature)
 
 
 def _row_count(external_id, config, split):

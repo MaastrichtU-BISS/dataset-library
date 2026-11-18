@@ -1,4 +1,4 @@
-from dataset_library.preview import _propose
+from dataset_library.preview import _list_inner, _propose
 from tests.conftest import ALICE
 
 NOTHING = {"taskType": None, "textColumn": None, "labelColumn": None}
@@ -137,6 +137,10 @@ def _string():
     return {"dtype": "string", "_type": "Value"}
 
 
+def _integer(dtype="int64"):
+    return {"dtype": dtype, "_type": "Value"}
+
+
 def _sequence(feature):
     return {"_type": "Sequence", "feature": feature}
 
@@ -175,10 +179,79 @@ def test_ner_covers_the_viewers_bare_list_type():
     assert _propose(["ner"], features, []) == {"taskType": "ner", "textColumn": "tokens", "labelColumn": "ner_tags"}
 
 
-def test_ner_without_the_expected_columns_still_names_the_task():
+def test_ner_reads_numbered_tags_and_keeps_the_text_column_distinct():
+    features = [
+        {"name": "tokens", "type": _sequence(_string())},
+        {"name": "tags", "type": _sequence(_integer())},
+    ]
+
+    assert _propose(["ner"], features, []) == {"taskType": "ner", "textColumn": "tokens", "labelColumn": "tags"}
+
+
+def test_ner_reads_a_class_label_sequence_next_to_the_text():
+    features = [
+        {"name": "tokens", "type": _sequence(_string())},
+        {"name": "labels", "type": _sequence(_class_label(["O", "B-PER"]))},
+    ]
+
+    assert _propose(["ner"], features, []) == {"taskType": "ner", "textColumn": "tokens", "labelColumn": "labels"}
+
+
+def test_ner_prefers_words_when_the_tag_column_is_called_ner():
+    features = [
+        {"name": "words", "type": _sequence(_string())},
+        {"name": "ner", "type": _sequence(_string())},
+    ]
+
+    assert _propose(["ner"], features, []) == {"taskType": "ner", "textColumn": "words", "labelColumn": "ner"}
+
+
+def test_ner_keeps_a_string_tag_column_from_being_its_own_text():
+    features = [
+        {"name": "ner_tags", "type": _sequence(_string())},
+        {"name": "sentences", "type": _sequence(_string())},
+    ]
+
+    assert _propose(["ner"], features, []) == {"taskType": "ner", "textColumn": "sentences", "labelColumn": "ner_tags"}
+
+
+def test_ner_with_only_a_text_like_column_proposes_nothing():
+    features = [{"name": "tokens", "type": _sequence(_string())}]
+
+    assert _propose(["ner"], features, []) == NOTHING
+
+
+def test_ner_without_the_expected_columns_proposes_nothing():
     features = [{"name": "text", "type": _string()}]
 
-    assert _propose(["ner"], features, []) == {"taskType": "ner", "textColumn": None, "labelColumn": None}
+    assert _propose(["ner"], features, []) == NOTHING
+
+
+def test_ner_with_a_scalar_text_and_label_proposes_nothing():
+    # klue/klue's ynat config is tagged ner but has one text and one label.
+    features = [
+        {"name": "text", "type": _string()},
+        {"name": "label", "type": _class_label(["yes", "no"])},
+    ]
+
+    assert _propose(["ner"], features, []) == NOTHING
+
+
+def test_a_card_tagged_both_tasks_falls_back_when_ner_has_no_pair():
+    features = [
+        {"name": "article", "type": _string()},
+        {"name": "summary", "type": _string()},
+    ]
+
+    assert _propose(["ner", "summarization"], features, []) == {
+        "taskType": "summarization", "textColumn": "article", "labelColumn": "summary",
+    }
+
+
+def test_list_inner_unwraps_a_sequence_whose_feature_is_a_one_element_list():
+    feature = {"_type": "Sequence", "feature": [{"_type": "Value", "dtype": "string"}]}
+
+    assert _list_inner(feature) == {"_type": "Value", "dtype": "string"}
 
 
 def test_summarization_falls_back_to_the_longest_text_column_for_the_source():

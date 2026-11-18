@@ -12,6 +12,10 @@ def test_a_string_is_kept_as_it_is():
     assert tokens_to_text("Already a sentence.") == "Already a sentence."
 
 
+def test_missing_tokens_are_skipped_not_written_as_none():
+    assert tokens_to_text([None, "Smith"]) == "Smith"
+
+
 def test_an_empty_or_missing_token_list_is_empty_text():
     assert tokens_to_text([]) == ""
     assert tokens_to_text(None) == ""

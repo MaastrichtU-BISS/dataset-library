@@ -66,6 +66,18 @@ def write_ner_shard(path, tokens, tags, tag_feature=None, row_group_size=None):
     return path
 
 
+def write_tner_shard(path, tokens, tags, row_group_size=None):
+    """A shard as tner/conll2003 writes one: tokens and numbered tags with no names."""
+    features = {
+        "tokens": {"feature": {"dtype": "string", "_type": "Value"}, "_type": "Sequence"},
+        "tags": {"feature": {"dtype": "int64", "_type": "Value"}, "_type": "Sequence"},
+    }
+    table = pa.table({"tokens": tokens, "tags": tags})
+    table = table.replace_schema_metadata({"huggingface": json.dumps({"info": {"features": features}})})
+    pq.write_table(table, path, row_group_size=row_group_size)
+    return path
+
+
 def write_summarization_shard(path, documents, summaries, row_group_size=None):
     """A shard as Hugging Face writes a summarization dataset: document, summary."""
     features = {
@@ -632,6 +644,23 @@ def test_numbered_tags_without_names_fail_with_a_plain_reason(run, tmp_path):
     assert not list((tmp_path / "data").glob("library-*.csv"))
 
 
+def test_tags_without_names_fail_before_any_row_is_read(run, tmp_path):
+    """The tner shape, mapped as a preview proposes it: no names, no rows read."""
+    shard = write_tner_shard(tmp_path / "0000.parquet", [["John", "Smith"], ["ACME"]], [[0, 1], [2]])
+    SpyParquet.reads = []
+
+    result, create = run(
+        [shard], size=2, task_type="ner", text_column="tokens", label_column="tags",
+        open_parquet=SpyParquet,
+    )
+
+    assert result["status"] == "failed"
+    assert result["code"] == "no_entity_names"
+    assert create.calls == []
+    assert SpyParquet.reads == []
+    assert not list((tmp_path / "data").glob("library-*.csv"))
+
+
 def test_a_summarization_import_writes_text_and_summary(run, tmp_path):
     shard = write_summarization_shard(
         tmp_path / "0000.parquet",
@@ -651,6 +680,41 @@ def test_a_summarization_import_writes_text_and_summary(run, tmp_path):
         "The court held that the clause was void.": "The clause was void.",
         "The appeal was dismissed with costs.": "Appeal dismissed.",
     }
+
+
+def test_summarization_rows_without_a_summary_are_replaced_and_the_sample_stays_exact(run, tmp_path):
+    shard = write_summarization_shard(
+        tmp_path / "0000.parquet",
+        [f"Doc {i}" for i in range(6)],
+        ["Summary one", "", None, "Summary four", "   ", "Summary six"],
+    )
+
+    result, create = run(
+        [shard], size=3, task_type="summarization", text_column="document", label_column="summary",
+    )
+
+    assert result["status"] == "completed", result
+    assert sorted(row["summary"] for row in create.calls[0]["rows"]) == [
+        "Summary four", "Summary one", "Summary six",
+    ]
+
+
+def test_summarization_with_no_summary_at_all_fails_and_no_dataset_is_made(run, tmp_path):
+    shard = write_summarization_shard(
+        tmp_path / "0000.parquet",
+        ["Doc one", "Doc two", "Doc three"],
+        ["", "  ", None],
+    )
+
+    result, create = run(
+        [shard], size=2, task_type="summarization", text_column="document", label_column="summary",
+    )
+
+    assert result["status"] == "failed"
+    assert result["code"] == "no_usable_rows"
+    assert "both a text and a summary" in result["error"]
+    assert create.calls == []
+    assert not list((tmp_path / "data").glob("library-*.csv"))
 
 
 def test_the_label_header_follows_the_task_type(run, tmp_path):
@@ -673,6 +737,16 @@ def test_class_label_names_are_read_from_a_sequence_and_the_older_list_form(tmp_
 
     assert imports._label_names(pq.ParquetFile(sequence), "ner_tags") == NER_NAMES
     assert imports._label_names(pq.ParquetFile(older), "ner_tags") == NER_NAMES
+
+
+@pytest.mark.parametrize("features", [None, ["not", "a", "dict"]])
+def test_label_names_without_a_feature_map_is_none(tmp_path, features):
+    path = tmp_path / "0000.parquet"
+    table = pa.table({"tokens": [["a"]], "ner_tags": [[1]]})
+    table = table.replace_schema_metadata({"huggingface": json.dumps({"info": {"features": features}})})
+    pq.write_table(table, path)
+
+    assert imports._label_names(pq.ParquetFile(path), "ner_tags") is None
 
 
 def test_ner_and_summarization_csvs_pass_legal_ml_cores_validation(run, tmp_path):
@@ -701,3 +775,51 @@ def test_ner_and_summarization_csvs_pass_legal_ml_cores_validation(run, tmp_path
     assert result["status"] == "completed", result
     _, error = datasets.validate_dataset_file(create.last_path, "summarization")
     assert error is None, error
+
+
+def test_imported_csvs_become_datasets_through_legal_ml_cores_real_create_dataset(run, tmp_path):
+    pytest.importorskip("legal_ml_core")
+    from flask import Flask
+    from flask_sqlalchemy import SQLAlchemy
+    from legal_ml_core import create_dataset, init_ml_feature
+    from legal_ml_core.db import MLBase
+
+    app = Flask(__name__)
+    app.config.update(
+        TESTING=True,
+        SQLALCHEMY_DATABASE_URI="sqlite:///:memory:",
+        SQLALCHEMY_TRACK_MODIFICATIONS=False,
+        UPLOAD_FOLDER=str(tmp_path / "uploads"),
+        MODEL_FOLDER=str(tmp_path / "models"),
+    )
+    db = SQLAlchemy(model_class=MLBase)
+    db.init_app(app)
+    init_ml_feature(app, None, app.config["MODEL_FOLDER"], db=db)
+
+    ner = write_ner_shard(
+        tmp_path / "real_ner.parquet",
+        [["John", "Smith", "works", "at", "ACME"], ["ACME", "sued", "Mary", "Jones"]],
+        [[0, 1, 2, 0, 3], [3, 0, 1, 2]],
+    )
+    result, create = run([ner], size=2, task_type="ner", text_column="tokens", label_column="ner_tags")
+
+    assert result["status"] == "completed", result
+    summaries = write_summarization_shard(
+        tmp_path / "real_summaries.parquet",
+        ["The court held that the clause was void.", "The appeal was dismissed with costs."],
+        ["The clause was void.", "Appeal dismissed."],
+    )
+    summary_result, summary_create = run(
+        [summaries], size=2, task_type="summarization", text_column="document", label_column="summary",
+    )
+
+    assert summary_result["status"] == "completed", summary_result
+    with app.app_context():
+        db.create_all()
+        ner_dataset = create_dataset("alice", create.last_path, "Imported NER", "A sample", "ner")
+        summary_dataset = create_dataset(
+            "alice", summary_create.last_path, "Imported summaries", "A sample", "summarization",
+        )
+
+        assert (ner_dataset.task_type, ner_dataset.row_count) == ("ner", 2)
+        assert (summary_dataset.task_type, summary_dataset.row_count) == ("summarization", 2)

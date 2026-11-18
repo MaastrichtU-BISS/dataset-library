@@ -322,6 +322,23 @@ def test_without_a_label_column_the_import_is_never_balanced(client, queue):
     assert started["sampleMethod"] is None
 
 
+@pytest.mark.parametrize("task_type", ["ner", "summarization"])
+def test_a_task_type_with_a_label_is_stored_and_never_balanced(client, queue, task_type):
+    started = start(client, taskType=task_type)
+
+    assert started["taskType"] == task_type
+    assert started["balance"] is False
+    assert queue.refs == [started["id"]]
+
+
+def test_the_text_and_the_label_cannot_be_the_same_column(client, queue):
+    refused = start(client, status=400, labelColumn="text")
+
+    assert refused["code"] == "bad_mapping"
+    assert refused["error"] == "Pick different columns for the text and the label."
+    assert queue.refs == []
+
+
 @pytest.mark.parametrize("balance", [True, False])
 def test_a_retry_keeps_whether_to_keep_the_balance(client, balance):
     started = start(client, balance=balance)
