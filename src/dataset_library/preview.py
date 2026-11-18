@@ -12,7 +12,13 @@ ROWS = 8
 CELL_CHARACTERS = 400
 # Names that say which column is which, before falling back to the types.
 NER_TEXT_COLUMNS = ("tokens", "words")
-NER_LABEL_COLUMNS = ("ner_tags", "tags", "ner", "labels", "label")
+# Tag columns in the order a label is chosen. The first two say NER by name;
+# the generic ones must show it (see `_entity_tags`).
+NER_LABEL_COLUMNS = ("ner_tags", "ner", "tags", "labels", "label")
+NER_NAMED_COLUMNS = ("ner_tags", "ner")
+GENERIC_TAG_COLUMNS = ("tags", "labels", "label")
+# Tag columns that are BIO but not entities: chunks, parts of speech.
+NOT_ENTITY_WORDS = ("chunk", "pos")
 SUMMARY_TEXT_COLUMNS = ("document", "article", "text", "dialogue", "source", "input")
 SUMMARY_LABEL_COLUMNS = ("summary", "highlights", "abstract", "target", "output")
 LIST_TYPES = ("Sequence", "List", "LargeList")
@@ -108,7 +114,7 @@ def _build(host, external_id, config, split):
         rows = viewer.get("first-rows", dataset=external_id, config=chosen["name"], split=split)
     except viewer.ViewerUnavailable:
         return body
-    features = rows.get("features") or []
+    features = [f for f in rows.get("features") or [] if isinstance(f, dict) and isinstance(f.get("name"), str)]
     body["columns"] = [{"name": f["name"], "type": _type(f.get("type"))} for f in features]
     body["rows"] = [
         [_cell(r.get("row", {}).get(f["name"]), f.get("type")) for f in features]
@@ -143,39 +149,50 @@ def _propose(tasks, features, rows):
 
 
 def _ner_columns(named, rows):
-    """The distinct text and tag columns of an NER dataset, or (None, None).
+    """The `tokens`/`words` column and an entity tag column, or (None, None).
 
-    A tag column under a usual name is taken as it is. Any other tag column
-    must show BIO tags (``B-PER``), in its class names or its first rows:
-    Hugging Face tags part-of-speech and parsing configs as token
-    classification too, and their tags are not entity types."""
-    texts = [name for name, type_ in named if _is_list(type_) and _is_text(_list_inner(type_))]
-    tags = [(name, type_) for name, type_ in named if _is_list(type_) and _is_tag(_list_inner(type_))]
-    tag_names = [name for name, _ in tags]
-    label = next((name for name in NER_LABEL_COLUMNS if name in tag_names), None)
-    bio = [name for name, type_ in tags if name != label and _looks_bio(name, _list_inner(type_), rows)]
-    if label is None:
-        label = next((name for name in bio if name.endswith("tags")), None)
-    text = _pick([name for name in texts if name != label and name not in bio], NER_TEXT_COLUMNS)
-    if label is None:
-        label = next((name for name in bio if name != text), None)
-    if text is None or label is None or text == label:
+    Hugging Face tags part-of-speech, chunking and parsing configs as token
+    classification too, so a tag column has to show it holds entities (see
+    `_entity_tags`), and the text is only ever a token column: guessing from
+    other string lists picked annotations as the text."""
+    lists = {name: _list_inner(type_) for name, type_ in named if _is_list(type_)}
+    text = next((name for name in NER_TEXT_COLUMNS if _is_text(lists.get(name))), None)
+    if text is None:
         return None, None
-    return text, label
+    tags = [
+        name for name, inner in lists.items()
+        if name not in NER_TEXT_COLUMNS and _is_tag(inner) and _entity_tags(name, inner, rows)
+    ]
+    order = [name for name in NER_LABEL_COLUMNS if name in tags]
+    order += [name for name in tags if name.endswith("tags") and name not in order]
+    order += [name for name in tags if name not in order]
+    return (text, order[0]) if order else (None, None)
 
 
-def _looks_bio(name, feature, rows):
-    """Whether a tag column's class names, or else its first rows, hold BIO tags."""
-    if isinstance(feature, dict) and feature.get("_type") == "ClassLabel":
-        values = feature.get("names") or []
-    else:
-        values = [
-            tag
-            for row in rows
-            if isinstance((cell := (row.get("row") or {}).get(name)), list)
-            for tag in cell
-        ]
-    return any(isinstance(value, str) and _BIO.match(value) for value in values)
+def _entity_tags(name, feature, rows):
+    """Whether a flat tag column holds entity tags.
+
+    `ner_tags` and `ner` say so by name. Otherwise class names, or the tags in
+    the first rows, must all be `O` or BIO with at least one BIO tag; numbered
+    tags without names (tner) count only under a generic name, so their import
+    can say it cannot read the entity names. Chunk and part-of-speech columns
+    never count."""
+    lowered = name.lower()
+    if any(word in lowered for word in NOT_ENTITY_WORDS):
+        return False
+    if name in NER_NAMED_COLUMNS:
+        return True
+    if _is_class_label(feature):
+        return _all_bio(feature.get("names") or [])
+    if _is_integer(feature):
+        return name in GENERIC_TAG_COLUMNS
+    values = [tag for row in rows if isinstance((cell := (row.get("row") or {}).get(name)), list) for tag in cell]
+    return _all_bio(values)
+
+
+def _all_bio(values):
+    tags = [value for value in values if isinstance(value, str) and value.strip()]
+    return any(_BIO.match(tag) for tag in tags) and all(tag == "O" or _BIO.match(tag) for tag in tags)
 
 
 def _pick(candidates, preferred):
@@ -245,8 +262,13 @@ def _is_integer(feature):
 
 
 def _is_tag(feature):
-    """A tag: a ClassLabel, a plain tag string, or a numbered tag."""
-    return _is_text(feature) or _is_integer(feature) or labels_module.is_class_label(feature)
+    """A flat tag: a ClassLabel, a plain tag string, or a numbered tag."""
+    return _is_text(feature) or _is_integer(feature) or _is_class_label(feature)
+
+
+def _is_class_label(feature):
+    """A ClassLabel itself, not one nested in further lists."""
+    return isinstance(feature, dict) and feature.get("_type") == "ClassLabel"
 
 
 def _row_count(external_id, config, split):

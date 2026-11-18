@@ -207,13 +207,73 @@ def test_ner_prefers_words_when_the_tag_column_is_called_ner():
     assert _propose(["ner"], features, []) == {"taskType": "ner", "textColumn": "words", "labelColumn": "ner"}
 
 
-def test_ner_keeps_a_string_tag_column_from_being_its_own_text():
-    features = [
+def test_ner_never_guesses_the_text_from_other_string_lists():
+    # Without a tokens or words column the student picks; a guess once took a
+    # part-of-speech list (DFKI-SLT/wikitext_linked's tok_upos) as the text.
+    sentences = [
         {"name": "ner_tags", "type": _sequence(_string())},
         {"name": "sentences", "type": _sequence(_string())},
     ]
+    wikitext = [
+        {"name": "text", "type": _string()},
+        {"name": "tok_upos", "type": _sequence(_string())},
+        {"name": "tok_ner", "type": _sequence(_string())},
+    ]
 
-    assert _propose(["ner"], features, []) == {"taskType": "ner", "textColumn": "sentences", "labelColumn": "ner_tags"}
+    assert _propose(["ner"], sentences, []) == NOTHING
+    assert _propose(["ner"], wikitext, []) == NOTHING
+
+
+def test_a_hyphenated_word_does_not_make_the_tokens_look_like_tags():
+    features = [
+        {"name": "tokens", "type": _sequence(_string())},
+        {"name": "ner_tags", "type": _sequence(_class_label(["O", "B-PER", "I-PER"]))},
+    ]
+    rows = [{"row": {"tokens": ["Send", "an", "E-mail", "about", "B-cell", "research"], "ner_tags": [0, 0, 0, 0, 0, 0]}}]
+
+    assert _propose(["ner"], features, rows) == {"taskType": "ner", "textColumn": "tokens", "labelColumn": "ner_tags"}
+
+
+def test_a_generic_tag_column_must_hold_entity_tags():
+    # batterydata/pos_tagging: words and part-of-speech tags called labels.
+    pos_strings = [
+        {"name": "words", "type": _sequence(_string())},
+        {"name": "labels", "type": _sequence(_string())},
+    ]
+    pos_rows = [{"row": {"words": ["It", "runs"], "labels": ["PRP", "VBZ"]}}]
+    pos_names = [
+        {"name": "tokens", "type": _sequence(_string())},
+        {"name": "labels", "type": _sequence(_class_label(["NN", "VB"]))},
+    ]
+    stray = [
+        {"name": "tokens", "type": _sequence(_string())},
+        {"name": "tags", "type": _sequence(_string())},
+    ]
+    stray_rows = [{"row": {"tokens": ["a", "b"], "tags": ["B-PER", "NN"]}}]
+
+    assert _propose(["ner"], pos_strings, pos_rows) == NOTHING
+    assert _propose(["ner"], pos_names, []) == NOTHING
+    assert _propose(["ner"], stray, stray_rows) == NOTHING
+
+
+def test_chunk_tags_are_bio_but_not_entities():
+    # conll2000: tokens, pos_tags and B-NP/I-VP chunk tags.
+    features = [
+        {"name": "tokens", "type": _sequence(_string())},
+        {"name": "pos_tags", "type": _sequence(_class_label(["NN", "VB"]))},
+        {"name": "chunk_tags", "type": _sequence(_class_label(["O", "B-NP", "I-NP", "B-VP"]))},
+    ]
+
+    assert _propose(["ner"], features, []) == NOTHING
+
+
+def test_a_nested_tag_column_next_to_flat_tokens_is_not_proposed():
+    features = [
+        {"name": "tokens", "type": _sequence(_string())},
+        {"name": "ner_tags", "type": _sequence([_class_label(["O", "B-PER"])])},
+    ]
+
+    assert _propose(["ner"], features, []) == NOTHING
 
 
 def test_ner_with_only_a_text_like_column_proposes_nothing():

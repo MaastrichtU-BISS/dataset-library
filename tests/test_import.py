@@ -679,6 +679,22 @@ def test_tags_with_an_empty_name_list_also_fail_before_any_row_is_read(run, tmp_
     assert SpyParquet.reads == []
 
 
+def test_nested_ner_columns_fail_before_any_row_is_read(run, tmp_path):
+    path = tmp_path / "0000.parquet"
+    pq.write_table(pa.table({"tokens": [[["John"]]], "ner_tags": [[["B-PER"]]]}), path)
+    SpyParquet.reads = []
+
+    result, create = run(
+        [path], size=1, task_type="ner", text_column="tokens", label_column="ner_tags",
+        open_parquet=SpyParquet,
+    )
+
+    assert result["status"] == "failed"
+    assert result["code"] == "nested_columns"
+    assert create.calls == []
+    assert SpyParquet.reads == []
+
+
 def test_a_summarization_import_writes_text_and_summary(run, tmp_path):
     shard = write_summarization_shard(
         tmp_path / "0000.parquet",

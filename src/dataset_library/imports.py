@@ -65,6 +65,10 @@ BALANCEABLE = {"classification", "document_classification", "judgment_prediction
 NER_TASKS = {"ner", "named_entity_recognition"}
 # The host's training columns for the label side of each task (#117).
 LABEL_HEADERS = {"ner": "entities", "named_entity_recognition": "entities", "summarization": "summary"}
+NESTED_NER = (
+    "These columns hold lists of lists, so they can't be read as words and their "
+    "entity tags. Pick a column of words and a column of tags."
+)
 NO_ENTITY_NAMES = (
     "We can't read entity names: this dataset's tags are numbers without names, "
     "so they can't become entity types."
@@ -553,16 +557,29 @@ def _class_label_names(feature):
 
 
 def _refuse_numbered_ner_tags(record, files):
-    """Fail before any row is read when an NER label column holds numbers the
-    files do not name: there are no entity types to write."""
-    if record.task_type not in NER_TASKS or not record.label_column:
+    """Fail before any row is read when NER columns cannot become words and
+    entity types: lists of lists, or numbered tags the files do not name."""
+    if record.task_type not in NER_TASKS:
         return
     for parquet_file in files:
         schema = parquet_file.schema_arrow
-        if record.label_column not in schema.names:
+        for column in (record.text_column, record.label_column):
+            if column and column in schema.names and _nested_list(schema.field(column).type):
+                raise ImportFailed("nested_columns", NESTED_NER)
+        if not record.label_column or record.label_column not in schema.names:
             continue
         if _integer_list(schema.field(record.label_column).type) and not _label_names(parquet_file, record.label_column):
             raise ImportFailed("no_entity_names", NO_ENTITY_NAMES)
+
+
+def _nested_list(arrow_type):
+    """Whether an Arrow type is a list whose items are lists too."""
+    import pyarrow.types as pat
+
+    def is_list(t):
+        return pat.is_list(t) or pat.is_large_list(t) or pat.is_fixed_size_list(t)
+
+    return is_list(arrow_type) and is_list(arrow_type.value_type)
 
 
 def _integer_list(arrow_type):
