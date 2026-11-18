@@ -426,3 +426,14 @@ def test_ner_wins_when_the_card_lists_both_tasks():
     ]
 
     assert _propose(["ner", "summarization"], features, [])["taskType"] == "ner"
+
+
+def test_a_generic_target_or_output_is_not_a_summary():
+    # flytech/python-codes-25k: an instruction, its input and code as output.
+    features = [
+        {"name": "instruction", "type": _string()},
+        {"name": "text", "type": _string()},
+        {"name": "output", "type": _string()},
+    ]
+
+    assert _propose(["summarization"], features, []) == NOTHING

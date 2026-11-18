@@ -695,6 +695,36 @@ def test_nested_ner_columns_fail_before_any_row_is_read(run, tmp_path):
     assert SpyParquet.reads == []
 
 
+def test_a_nested_tag_column_next_to_flat_tokens_fails_before_any_row_is_read(run, tmp_path):
+    path = tmp_path / "0000.parquet"
+    pq.write_table(pa.table({"tokens": [["John", "Smith"]], "ner_tags": [[["B-PER"], ["I-PER"]]]}), path)
+    SpyParquet.reads = []
+
+    result, create = run(
+        [path], size=1, task_type="ner", text_column="tokens", label_column="ner_tags",
+        open_parquet=SpyParquet,
+    )
+
+    assert result["code"] == "nested_columns"
+    assert SpyParquet.reads == []
+
+
+def test_span_records_as_the_tag_column_fail_before_any_row_is_read(run, tmp_path):
+    path = tmp_path / "0000.parquet"
+    spans = [[{"start": 0, "end": 10, "type": "PER"}]]
+    pq.write_table(pa.table({"tokens": [["John", "Smith"]], "entities": spans}), path)
+    SpyParquet.reads = []
+
+    result, create = run(
+        [path], size=1, task_type="ner", text_column="tokens", label_column="entities",
+        open_parquet=SpyParquet,
+    )
+
+    assert result["code"] == "nested_columns"
+    assert create.calls == []
+    assert SpyParquet.reads == []
+
+
 def test_a_summarization_import_writes_text_and_summary(run, tmp_path):
     shard = write_summarization_shard(
         tmp_path / "0000.parquet",

@@ -12,11 +12,18 @@ PREFIX_SEPARATORS = ("-", "_")
 
 
 def tokens_to_text(tokens):
-    """A row's text: tokens joined by single spaces, a string kept as it is."""
+    """A row's text: tokens joined by single spaces, a string kept as it is.
+
+    Character-level datasets (klue/klue's ner) keep their spaces as tokens of
+    their own; those are joined with nothing between them, so the text reads
+    as it was written."""
     if tokens is None:
         return ""
     if isinstance(tokens, (list, tuple)):
-        return " ".join(str(token) for token in tokens if token is not None)
+        words = [str(token) for token in tokens if token is not None]
+        if any(word and not word.strip() for word in words):
+            return "".join(words)
+        return " ".join(words)
     return str(tokens)
 
 

@@ -44,3 +44,12 @@ def test_types_keep_their_first_seen_order():
 def test_a_row_with_no_tags_has_no_entities():
     assert entity_types([]) == ""
     assert entity_types(None) == ""
+
+
+def test_character_tokens_with_space_tokens_are_joined_as_written():
+    # klue/klue's ner: one token per character, spaces included.
+    assert tokens_to_text(["특", "히", " ", "영", "동"]) == "특히 영동"
+
+
+def test_word_tokens_are_still_joined_by_spaces():
+    assert tokens_to_text(["The", "court", "held"]) == "The court held"

@@ -66,8 +66,8 @@ NER_TASKS = {"ner", "named_entity_recognition"}
 # The host's training columns for the label side of each task (#117).
 LABEL_HEADERS = {"ner": "entities", "named_entity_recognition": "entities", "summarization": "summary"}
 NESTED_NER = (
-    "These columns hold lists of lists, so they can't be read as words and their "
-    "entity tags. Pick a column of words and a column of tags."
+    "These columns hold lists of lists or of records, so they can't be read as "
+    "words and their entity tags. Pick a column of words and a column of tags."
 )
 NO_ENTITY_NAMES = (
     "We can't read entity names: this dataset's tags are numbers without names, "
@@ -573,13 +573,12 @@ def _refuse_numbered_ner_tags(record, files):
 
 
 def _nested_list(arrow_type):
-    """Whether an Arrow type is a list whose items are lists too."""
+    """Whether an Arrow type is a list whose items are lists, structs or maps
+    (span annotations, for example) rather than words or tags."""
     import pyarrow.types as pat
 
-    def is_list(t):
-        return pat.is_list(t) or pat.is_large_list(t) or pat.is_fixed_size_list(t)
-
-    return is_list(arrow_type) and is_list(arrow_type.value_type)
+    lists = pat.is_list(arrow_type) or pat.is_large_list(arrow_type) or pat.is_fixed_size_list(arrow_type)
+    return lists and pat.is_nested(arrow_type.value_type)
 
 
 def _integer_list(arrow_type):

@@ -20,7 +20,9 @@ GENERIC_TAG_COLUMNS = ("tags", "labels", "label")
 # Tag columns that are BIO but not entities: chunks, parts of speech.
 NOT_ENTITY_WORDS = ("chunk", "pos")
 SUMMARY_TEXT_COLUMNS = ("document", "article", "text", "dialogue", "source", "input")
-SUMMARY_LABEL_COLUMNS = ("summary", "highlights", "abstract", "target", "output")
+# Only names that say "summary": generic `target`/`output` also hold code,
+# answers and translations.
+SUMMARY_LABEL_COLUMNS = ("summary", "highlights", "abstract")
 LIST_TYPES = ("Sequence", "List", "LargeList")
 # A BIO-style tag: a position letter, a separator, then the entity type.
 _BIO = re.compile(r"^[BIESLU][-_].")
@@ -117,7 +119,7 @@ def _build(host, external_id, config, split):
     features = [f for f in rows.get("features") or [] if isinstance(f, dict) and isinstance(f.get("name"), str)]
     body["columns"] = [{"name": f["name"], "type": _type(f.get("type"))} for f in features]
     body["rows"] = [
-        [_cell(r.get("row", {}).get(f["name"]), f.get("type")) for f in features]
+        [_cell((r.get("row") or {}).get(f["name"]), f.get("type")) for f in features]
         for r in (rows.get("rows") or [])[:ROWS]
     ]
     body["preview"] = "ok" if body["rows"] else "unavailable"
@@ -193,13 +195,6 @@ def _entity_tags(name, feature, rows):
 def _all_bio(values):
     tags = [value for value in values if isinstance(value, str) and value.strip()]
     return any(_BIO.match(tag) for tag in tags) and all(tag == "O" or _BIO.match(tag) for tag in tags)
-
-
-def _pick(candidates, preferred):
-    for name in preferred:
-        if name in candidates:
-            return name
-    return candidates[0] if candidates else None
 
 
 def _first_text(named, preferred, exclude=None):
