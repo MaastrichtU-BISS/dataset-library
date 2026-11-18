@@ -49,8 +49,9 @@ class LibrarySource(LibraryBase):
 
 
 class LibraryImport(LibraryBase):
-    """One import of a sample, from queued to completed or failed. The database,
-    not the queue, says where it is; a completed import is the dataset's provenance."""
+    """One import of a sample, from queued to completed, failed or cancelled. The
+    database, not the queue, says where it is; a completed import is the
+    dataset's provenance."""
 
     __tablename__ = "library_imports"
 
@@ -79,6 +80,10 @@ class LibraryImport(LibraryBase):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
     imported_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # When the worker running it last said it was alive; a stale one is swept (#114).
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # When the student put away a failed or cancelled import (or tried it again).
+    dismissed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     def to_dict(self):
         return {
@@ -95,6 +100,8 @@ class LibraryImport(LibraryBase):
             "license": self.license,
             "name": self.name,
             "taskType": self.task_type,
+            "textColumn": self.text_column,
+            "labelColumn": self.label_column,
             "size": self.sample_size,
             "rows": self.rows,
             "datasetRef": self.dataset_ref,

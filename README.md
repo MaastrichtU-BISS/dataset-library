@@ -47,6 +47,13 @@ run_import(ref, session=db.session, fetch_shards=fetch_shards,
 dataset's id, or raises `ValueError` with a message a student can read
 (legal-ml-core's `DatasetInvalid` is one).
 
+While it runs, `run_import` refreshes the import's `heartbeat_at` every
+`heartbeat_seconds` (15) from a thread on its own connection. The worker also
+calls `dataset_library.imports.sweep(db.session)` now and then (once a minute
+will do; any number of workers may): it fails running imports quiet for two
+minutes ("Import stopped. Try again.") and queued ones nothing picked up in 30
+minutes ("Import could not start. Try again.").
+
 Create the tables from `dataset_library.models.LibraryBase.metadata`, or add
 `dataset_library/migrations/versions` to Alembic's `version_locations` (branch
 label `dataset_library`).
@@ -67,15 +74,30 @@ label `dataset_library`).
   `importable` and `maxRows` (the admin's cap, else `max_rows()`).
 
 - `POST /api/library/imports` with `{"dataset", "config", "split", "textColumn",
-  "labelColumn", "size", "name"?, "taskType"?, "licenseAck"?}` → 202 and the import,
-  `queued`. The size is cut to the row cap (the admin's, else `max_rows()`). Refused before anything is queued:
+  "labelColumn", "size", "name"?, "taskType"?, "licenseAck"?, "revision"?}` → 202 and the import,
+  `queued`. The size is cut to the row cap (the admin's, else `max_rows()`). The
+  same import (dataset, revision, mapping, size) while one is queued or running
+  → 200 and that one, queued once. Refused before anything is queued:
   400 (`bad_id`, `bad_mapping`, `bad_size`, `bad_name`, `bad_task`, `bad_config`), 404, 409
-  (`gated`, `not_importable`, `needs_ack` for a license set to warn), and 503
+  (`gated`, `not_importable`, `needs_ack` for a license set to warn, `changed`
+  when `revision` is not the dataset's now), and 503
   when the queue is down (the import is stored as failed).
 - `GET /api/library/imports` and `GET /api/library/imports/<ref>` → the
   signed-in user's imports: `status` (`queued`, `fetching`, `sampling`,
-  `validating`, `completed`, `failed`), `error`, `rows`, `datasetRef`, and the
+  `validating`, `saving`, `completed`, `failed`, `cancelled`), `error`, `code`, `rows`, `datasetRef`,
+  the mapping (`textColumn`, `labelColumn`, `taskType`, `size`) and the
   provenance (`externalId`, `revision`, `url`, `license`, `importedAt`).
+  `?current=true` → only those queued or running, and those failed in the last
+  day and not put away.
+- `POST /api/library/imports/<ref>/cancel` → the import, `cancelled`; once it is
+  `saving` or `completed`, 409 `too_late` (cancel and finishing never both win).
+  A failed or cancelled import comes back as it is.
+- `POST /api/library/imports/<ref>/retry` → 202 and a new import with the same
+  settings at the revision first imported (409 `changed` if the dataset moved
+  on); the old one is put away. Only for `failed` or `cancelled` (else 409
+  `not_retryable`).
+- `POST /api/library/imports/<ref>/dismiss` → puts a finished import away;
+  409 `running` while it runs.
 - Admins only (`is_admin()`): `GET` / `PUT /api/library/admin/settings` (sources
   and license levels, saved whole; 400 with `fields` when anything is invalid).
   `limits` is `{"maxRows", "maxDownloadMb"}`, each a whole number from 1 to its

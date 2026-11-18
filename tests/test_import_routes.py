@@ -54,9 +54,21 @@ def test_the_sample_is_cut_to_the_row_cap_read_when_queued(client):
     assert start(client, size=50)["size"] == 50
 
 
+def finish_all(client):
+    """The worker finished every import so far."""
+    from dataset_library.models import LibraryImport
+
+    with client.application.app_context():
+        session = client.application.db.session
+        session.query(LibraryImport).update({"status": "completed"})
+        session.commit()
+
+
 def test_importing_the_same_dataset_again_is_named_with_its_number(client):
     start(client)
+    finish_all(client)
     assert start(client)["name"] == "LexGLUE (2)"
+    finish_all(client)
     assert start(client)["name"] == "LexGLUE (3)"
     assert start(client, headers=BOB)["name"] == "LexGLUE"
 
@@ -114,6 +126,7 @@ def test_without_a_queue_the_host_offers_no_import(make_app):
 
 def test_the_student_may_name_the_dataset(client):
     assert start(client, name="  Contract clauses  ")["name"] == "Contract clauses"
+    finish_all(client)
     assert start(client, name="")["name"] == "LexGLUE (2)"
     assert start(client, status=400, name="x" * 256)["code"] == "bad_name"
 
@@ -126,3 +139,114 @@ def test_an_admins_row_cap_bounds_the_sample(client):
     assert saved.status_code == 200, saved.get_json()
 
     assert start(client, size=500)["size"] == 40
+
+
+def set_import(client, ref, **fields):
+    from dataset_library.models import LibraryImport
+
+    with client.application.app_context():
+        session = client.application.db.session
+        session.query(LibraryImport).filter_by(id=ref).update(fields)
+        session.commit()
+
+
+def test_starting_the_same_import_again_while_it_runs_returns_it(client, queue):
+    first = start(client)
+    again = start(client, status=200)
+
+    assert again["id"] == first["id"]
+    assert queue.refs == [first["id"]]
+    # A different size, or another student, is another import.
+    assert start(client, size=20)["id"] != first["id"]
+    assert start(client, headers=BOB)["id"] != first["id"]
+
+
+def test_the_student_cancels_their_own_running_import(client):
+    started = start(client)
+    path = f"/api/library/imports/{started['id']}/cancel"
+
+    assert client.post(path, headers=BOB).status_code == 404
+    cancelled = client.post(path, headers=ALICE)
+    assert cancelled.status_code == 200
+    assert cancelled.get_json()["status"] == "cancelled"
+
+
+def test_a_finished_import_cannot_be_cancelled(client):
+    started = start(client)
+    set_import(client, started["id"], status="completed")
+
+    refused = client.post(f"/api/library/imports/{started['id']}/cancel", headers=ALICE)
+
+    assert refused.status_code == 409
+    assert refused.get_json()["code"] == "too_late"
+
+
+def test_try_again_starts_a_fresh_import_with_the_same_settings(client, queue):
+    started = start(client, size=50, name="Clauses", labelColumn=None)
+    set_import(client, started["id"], status="failed", error_code="provider_busy")
+
+    retried = client.post(f"/api/library/imports/{started['id']}/retry", headers=ALICE)
+
+    assert retried.status_code == 202, retried.get_json()
+    again = retried.get_json()
+    assert again["id"] != started["id"]
+    assert again["status"] == "queued"
+    for key in ("externalId", "config", "split", "revision", "textColumn", "labelColumn", "taskType", "size", "name"):
+        assert again[key] == started[key], key
+    assert queue.refs == [started["id"], again["id"]]
+    current = client.get("/api/library/imports?current=true", headers=ALICE).get_json()["imports"]
+    assert [i["id"] for i in current] == [again["id"]]
+
+
+def test_only_a_failed_or_cancelled_import_can_be_tried_again(client):
+    started = start(client)
+
+    refused = client.post(f"/api/library/imports/{started['id']}/retry", headers=ALICE)
+
+    assert refused.status_code == 409
+    assert refused.get_json()["code"] == "not_retryable"
+    assert client.post(f"/api/library/imports/{started['id']}/retry", headers=BOB).status_code == 404
+
+
+def test_try_again_after_the_dataset_changed_does_not_import_the_new_version_unseen(client):
+    started = start(client)
+    set_import(client, started["id"], status="failed", revision="an-older-revision")
+
+    refused = client.post(f"/api/library/imports/{started['id']}/retry", headers=ALICE)
+
+    assert refused.status_code == 409
+    assert refused.get_json()["code"] == "changed"
+
+
+def test_the_current_list_holds_running_imports_and_recent_failures_not_put_away(client):
+    from datetime import timedelta
+
+    from dataset_library.imports import _now
+
+    running = start(client)
+    failed = start(client, size=11)
+    old_failure = start(client, size=12)
+    put_away = start(client, size=13)
+    done = start(client, size=14)
+    cancelled = start(client, size=15)
+    set_import(client, failed["id"], status="failed")
+    set_import(client, old_failure["id"], status="failed", updated_at=_now() - timedelta(days=2))
+    set_import(client, put_away["id"], status="failed")
+    set_import(client, done["id"], status="completed")
+    set_import(client, cancelled["id"], status="cancelled")
+    assert client.post(f"/api/library/imports/{put_away['id']}/dismiss", headers=ALICE).status_code == 200
+
+    current = client.get("/api/library/imports?current=true", headers=ALICE).get_json()["imports"]
+
+    assert [i["id"] for i in current] == [failed["id"], running["id"]]
+    assert client.get("/api/library/imports?current=true", headers=BOB).get_json()["imports"] == []
+    assert len(client.get("/api/library/imports", headers=ALICE).get_json()["imports"]) == 6
+
+
+def test_a_running_import_is_cancelled_before_it_is_put_away(client):
+    started = start(client)
+
+    refused = client.post(f"/api/library/imports/{started['id']}/dismiss", headers=ALICE)
+
+    assert refused.status_code == 409
+    assert refused.get_json()["code"] == "running"
