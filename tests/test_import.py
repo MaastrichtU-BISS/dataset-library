@@ -238,3 +238,17 @@ def test_a_cancelled_import_is_not_finished_by_the_worker(run, tmp_path):
 
     assert result["status"] == "cancelled"
     assert create.calls == []
+
+
+def test_an_admins_download_cap_replaces_the_workers_default(run, app, tmp_path):
+    from dataset_library.models import LibrarySettings
+
+    with app.app_context():
+        app.db.session.add(LibrarySettings(id=1, license_policy={}, max_download_mb=50))
+        app.db.session.commit()
+    shard = write_shard(tmp_path / "0000.parquet", [f"Clause {i}" for i in range(6)], [0] * 6)
+
+    result, create = run([shard], size=2)
+
+    assert result["status"] == "completed", result
+    assert create.fetched_with[3] == 50_000_000

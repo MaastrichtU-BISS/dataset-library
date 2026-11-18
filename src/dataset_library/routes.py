@@ -85,7 +85,7 @@ def options():
             "groups": GROUPS,
             "admin": bool(host.is_admin()),
             "importable": host.enqueue is not None,
-            "maxRows": host.max_rows(),
+            "maxRows": host.row_cap(),
             "sources": [
                 {"value": s.ref, "label": s.ref, "provider": s.provider}
                 for s in search_module.enabled_sources(host.db)
@@ -150,7 +150,7 @@ def _require_admin():
 @library_bp.route("/admin/settings", methods=["GET"])
 def get_settings():
     _require_admin()
-    return jsonify({**admin_module.current(_host().db), "groups": GROUPS})
+    return jsonify({**admin_module.current(_host().db, _host()), "groups": GROUPS})
 
 
 @library_bp.route("/admin/settings", methods=["PUT"])
@@ -158,7 +158,7 @@ def put_settings():
     _require_admin()
     host = _host()
     try:
-        changes = admin_module.save(host.db, request.get_json(silent=True) or {})
+        changes = admin_module.save(host.db, request.get_json(silent=True) or {}, host.hard_max_rows)
     except admin_module.Invalid as invalid:
         host.db.session.rollback()
         raise ApiError(400, "Some settings need fixing.", "invalid", fields=invalid.fields)
@@ -166,7 +166,7 @@ def put_settings():
         host.db.session.rollback()
         raise ApiError(503, "Hugging Face could not check the new sources. Try again in a few minutes.", "provider_unavailable")
     host.audit("library.settings_saved", **changes)
-    return jsonify({**admin_module.current(host.db), "groups": GROUPS})
+    return jsonify({**admin_module.current(host.db, host), "groups": GROUPS})
 
 
 @library_bp.route("/admin/sources/check", methods=["POST"])

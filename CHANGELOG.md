@@ -8,6 +8,21 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-17
+
+### Added
+
+- Admin-set limits (BAIGLE #118). `GET` / `PUT /api/library/admin/settings`
+  carry `limits`: the row cap (`maxRows`, 1 to `hard_max_rows`, 5,000 by
+  default) and the download cap (`maxDownloadMb`, 1 to 1,000). `null` returns to
+  the default, and a `PUT` without `limits` keeps them. The audit names
+  `limits_changed`.
+  - The row cap bounds imports and `/options` `maxRows`; `dataset_library.limits.row_cap(session)`
+    lets the host apply it to uploads too.
+  - The download cap replaces the worker's `max_bytes` in `run_import`.
+  - Migration `dl_0003_limits` adds `library_settings.max_rows` and `max_download_mb`.
+- `init_dataset_library(hard_max_rows=)`.
+
 ## [0.4.0] - 2026-11-12
 
 ### Added

@@ -3,8 +3,9 @@ from dataclasses import dataclass
 from typing import Callable, Protocol
 
 from .licenses import License, resolve_license
+from .limits import HARD_MAX_ROWS
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = ["Cache", "License", "init_dataset_library", "resolve_license"]
 
@@ -28,6 +29,13 @@ class _Host:
     audit: Callable[..., None]
     enqueue: Callable[[str], None] | None = None
     max_rows: Callable[[], int] = lambda: 1000
+    hard_max_rows: int = 5000
+
+    def row_cap(self):
+        """The cap a new dataset meets: the admin's, else the host's default."""
+        from .limits import row_cap
+
+        return row_cap(self.db.session) or self.max_rows()
 
 
 def init_dataset_library(
@@ -42,6 +50,7 @@ def init_dataset_library(
     audit=None,
     enqueue=None,
     max_rows=None,
+    hard_max_rows=None,
     url_prefix="/api/library",
 ):
     """Mount the library API on a host Flask app.
@@ -59,7 +68,10 @@ def init_dataset_library(
     ``enqueue(import_ref)`` hands a queued import to the host's worker, which
     calls ``dataset_library.imports.run_import``; without it there is no
     import. ``max_rows()`` is the most rows a dataset may have (legal-ml-core's
-    LEGAL_ML_MAX_ROWS), read once when an import is queued.
+    LEGAL_ML_MAX_ROWS) when an admin set none, read once when an import is
+    queued. An admin may set a cap from 1 to ``hard_max_rows`` (default
+    ``limits.HARD_MAX_ROWS``); ``limits.row_cap(session)`` returns it, so the
+    host's upload check can honour it too.
     """
     from .routes import library_bp
 
@@ -73,5 +85,6 @@ def init_dataset_library(
         audit=audit or (lambda event, **fields: None),
         enqueue=enqueue,
         max_rows=max_rows or (lambda: 1000),
+        hard_max_rows=hard_max_rows or HARD_MAX_ROWS,
     )
     app.register_blueprint(library_bp, url_prefix=url_prefix)

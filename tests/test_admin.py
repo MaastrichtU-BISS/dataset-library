@@ -50,7 +50,7 @@ def test_settings_are_saved_whole_and_apply_to_search(client, hub, audits):
         {"value": "coastalcph", "label": "coastalcph", "provider": "huggingface"}
     ]
     assert audits == [
-        {"event": "library.settings_saved", "sources_added": 2, "sources_removed": 0, "licenses_changed": ["cc-by-4.0", "mit"]}
+        {"event": "library.settings_saved", "sources_added": 2, "sources_removed": 0, "licenses_changed": ["cc-by-4.0", "mit"], "limits_changed": []}
     ]
 
     # A second save replaces the first: a source left out is removed.
@@ -58,7 +58,7 @@ def test_settings_are_saved_whole_and_apply_to_search(client, hub, audits):
     body = settings(client).get_json()
     assert [s["ref"] for s in body["sources"]] == ["nguha"]
     assert {lic["id"]: lic["level"] for lic in body["licenses"]}["mit"] == "allow"
-    assert audits[-1] == {"event": "library.settings_saved", "sources_added": 0, "sources_removed": 1, "licenses_changed": ["cc-by-4.0", "mit"]}
+    assert audits[-1] == {"event": "library.settings_saved", "sources_added": 0, "sources_removed": 1, "licenses_changed": ["cc-by-4.0", "mit"], "limits_changed": []}
 
 
 @pytest.mark.parametrize(
@@ -99,3 +99,47 @@ def test_checking_a_source_while_hugging_face_is_down_says_so(client, hub):
     resp = client.post("/api/library/admin/sources/check", json={"ref": "coastalcph"}, headers=ADMIN)
 
     assert resp.status_code == 503
+
+
+def test_fresh_limits_are_the_hosts_defaults_and_the_hard_maximum(client):
+    limits = settings(client).get_json()["limits"]
+
+    assert limits == {
+        "maxRows": None, "maxRowsDefault": 1000, "maxRowsHardMax": 5000,
+        "maxDownloadMb": None, "maxDownloadMbDefault": 200, "maxDownloadMbHardMax": 1000,
+    }
+
+
+def test_an_admins_row_cap_applies_to_what_students_are_offered(client, audits):
+    resp = save(client, {"sources": [], "license_policy": {}, "limits": {"maxRows": 2500, "maxDownloadMb": 50}})
+
+    assert resp.status_code == 200, resp.get_json()
+    assert resp.get_json()["limits"]["maxRows"] == 2500
+    assert resp.get_json()["limits"]["maxDownloadMb"] == 50
+    assert client.get("/api/library/options", headers=ALICE).get_json()["maxRows"] == 2500
+    assert audits[-1]["limits_changed"] == ["max_download_mb", "max_rows"]
+
+    # null goes back to the default; leaving limits out keeps them.
+    assert save(client, {"sources": [], "license_policy": {}}).get_json()["limits"]["maxRows"] == 2500
+    assert save(client, {"sources": [], "license_policy": {}, "limits": {"maxRows": None}}).get_json()["limits"]["maxRows"] is None
+    assert client.get("/api/library/options", headers=ALICE).get_json()["maxRows"] == 1000
+
+
+@pytest.mark.parametrize(
+    "limits, field",
+    [
+        ({"maxRows": 0}, "limits.maxRows"),
+        ({"maxRows": 5001}, "limits.maxRows"),
+        ({"maxRows": "lots"}, "limits.maxRows"),
+        ({"maxRows": True}, "limits.maxRows"),
+        ({"maxDownloadMb": 0}, "limits.maxDownloadMb"),
+        ({"maxDownloadMb": 1001}, "limits.maxDownloadMb"),
+    ],
+)
+def test_a_cap_out_of_range_is_named_and_nothing_is_saved(client, audits, limits, field):
+    resp = save(client, {"sources": [], "license_policy": {}, "limits": limits})
+
+    assert resp.status_code == 400
+    assert field in resp.get_json()["fields"]
+    assert settings(client).get_json()["limits"]["maxRows"] is None
+    assert audits == []

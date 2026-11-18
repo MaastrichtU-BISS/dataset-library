@@ -116,3 +116,13 @@ def test_the_student_may_name_the_dataset(client):
     assert start(client, name="  Contract clauses  ")["name"] == "Contract clauses"
     assert start(client, name="")["name"] == "LexGLUE (2)"
     assert start(client, status=400, name="x" * 256)["code"] == "bad_name"
+
+
+def test_an_admins_row_cap_bounds_the_sample(client):
+    from conftest import ADMIN
+
+    saved = client.put("/api/library/admin/settings", headers=ADMIN,
+                       json={"sources": [], "license_policy": {}, "limits": {"maxRows": 40}})
+    assert saved.status_code == 200, saved.get_json()
+
+    assert start(client, size=500)["size"] == 40
