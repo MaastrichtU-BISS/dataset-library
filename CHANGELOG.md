@@ -27,6 +27,28 @@ While the version is 0.x, minor releases may contain breaking changes.
     Hugging Face: …" when it was stratified.
   - Migration `dl_0005_label_balance` adds `library_imports.balance`,
     `sample_method` and `sample_note`.
+- Pins: a course admin curates a starting point (BAIGLE #119).
+  - `POST /api/library/pins` with `{"dataset": "org/name"}` (admins) → 201 and
+    the pin; the same provider and dataset id pins once (200 and the existing
+    pin). The dataset must still be in the library: 404 outside the enabled
+    sources, 403 `license_hidden`, 404 when private, 400 `bad_id`, 503 when
+    the Hub is down. The pin stores the card as it was pinned and the labels
+    verdict, so its badge is exact; the card's license carries the platform's
+    current level.
+  - `PATCH /api/library/pins/<pin_ref>` with `{"featured"?: bool, "title"?:
+    string|null}` (admins) → 200 and the pin. Featuring a fourth while three
+    are featured → 409 `too_many_featured`; a title over 120 characters → 400
+    `bad_title` (null or empty clears it); a featured that is not a boolean →
+    400 `bad_featured`; an unknown ref → 404.
+  - `GET /api/library/pins` (admins) → `{"pins": [...]}`, oldest first; 403
+    `not_admin` otherwise. `DELETE /api/library/pins/<pin_ref>` → 204.
+  - `GET /api/library/featured` (any signed-in user) → `{"featured": [...]}`:
+    up to three featured pins, oldest first, leaving out any whose license is
+    now hidden or whose owner is outside the enabled sources.
+  - Search results carry `pinRef` (the pin's ref, or null) on every card.
+  - Every pin change is audited: `library.pin_added`, `library.pin_updated`,
+    `library.pin_removed` (ids and flags only).
+  - Migration `dl_0006_pins` adds the `library_pins` table.
 
 ## [0.7.0] - 2026-11-18
 

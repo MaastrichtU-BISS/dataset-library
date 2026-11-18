@@ -64,6 +64,7 @@ label `dataset_library`).
   `{"status": "ok" | "stale" | "unavailable", "results": [...], "count": n}`.
   `stale`: the Hub is limiting requests and these are the last results, up to a
   day old. `unavailable`: the Hub is down or unreadable; nothing is raised.
+  Every card carries `pinRef`: the ref of the pin for that dataset, or null.
 - `GET /api/library/labels?ids=huggingface:org/name,...` → `{"labels": {id: "yes" | "no" | "unclear"}}`,
   from the dataset viewer's column types; up to 30 ids, cached an hour each.
 - `GET /api/library/datasets/huggingface/<org>/<name>?config=&split=` → the
@@ -72,6 +73,31 @@ label `dataset_library`).
 - `GET /api/library/options` → the task, license and source filters, the
   license table (`level` is this platform's: `allow`, `warn` or `hide`),
   `importable` and `maxRows` (the admin's cap, else `max_rows()`).
+
+- `GET /api/library/featured` (any signed-in user) → `{"featured": [...]}`:
+  up to three featured pins, oldest pinned first, leaving out any whose
+  license an admin has since hidden or whose owner is outside the enabled
+  sources. Empty until an admin features one.
+- Admins only (`is_admin()`) pin and feature:
+  - `POST /api/library/pins` with `{"dataset": "org/name"}` → 201 and the pin;
+    pinning the same provider and dataset id again → 200 and that pin (one pin
+    per provider and dataset id, enforced by a unique constraint too). Refused
+    like the preview route: 404 when the dataset is outside the enabled
+    sources or private, 403 `license_hidden`, 400 `bad_id`, 503 when the Hub
+    is down. The pin keeps the card as it was pinned and the labels verdict
+    (`labelled`: `yes`, `no` or `unclear`), so its badge stays exact; the
+    card's `license` is sent at the platform's current level.
+  - `GET /api/library/pins` → `{"pins": [...]}`, oldest first.
+  - `PATCH /api/library/pins/<pin_ref>` with `{"featured"?: bool, "title"?:
+    string|null}` → 200 and the pin. At most three are featured at a time (409
+    `too_many_featured`); a title over 120 characters → 400 `bad_title`; null
+    or empty clears it back to the card's; a featured that is not a boolean →
+    400 `bad_featured`; an unknown ref → 404.
+  - `DELETE /api/library/pins/<pin_ref>` → 204.
+  - Each change is audited: `library.pin_added`, `library.pin_updated`,
+    `library.pin_removed` — ids and flags only, never personal data. Pins are
+    course data; a host erasing a user should keep or null `pinned_by`, not
+    delete their pins.
 
 - `POST /api/library/imports` with `{"dataset", "config", "split", "textColumn",
   "labelColumn", "size", "name"?, "taskType"?, "licenseAck"?, "revision"?,

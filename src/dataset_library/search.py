@@ -11,7 +11,7 @@ import time
 from . import policy as policy_module
 from .errors import ProviderRateLimited, ProviderUnavailable
 from .licenses import LICENSES, UNKNOWN
-from .models import LibrarySource
+from .models import LibraryPin, LibrarySource
 from .providers import huggingface
 
 log = logging.getLogger("dataset_library")
@@ -57,6 +57,7 @@ def search(host, *, query, task, license_id, source):
             host.cache.set(f"library:search:{key}", cards, FRESH_SECONDS)
             host.cache.set(f"library:last:{key}", cards, LAST_GOOD_SECONDS)
     results = _apply_policy(cards, policy, license_id)
+    results = _with_pin_refs(host.db, results)
     log.info(
         "library.search provider=huggingface query=%r task=%s license=%s status=%s results=%d cache_hit=%s ms=%d",
         query, task, license_id, status, len(results), cache_hit, (time.monotonic() - started) * 1000,
@@ -75,6 +76,18 @@ def _apply_policy(cards, policy, license_id):
             continue
         results.append({**card, "license": license.at_level(card_level)})
     return results
+
+
+def _with_pin_refs(db, results):
+    """Every card carries the ref of its pin, when it has one; one query."""
+    external_ids = [card["externalId"] for card in results]
+    pins = {
+        pin.external_id: pin.id
+        for pin in db.session.query(LibraryPin).filter(
+            LibraryPin.provider == "huggingface", LibraryPin.external_id.in_(external_ids)
+        )
+    } if external_ids else {}
+    return [{**card, "pinRef": pins.get(card["externalId"])} for card in results]
 
 
 def _key(*parts):

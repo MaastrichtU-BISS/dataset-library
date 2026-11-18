@@ -48,6 +48,31 @@ class LibrarySource(LibraryBase):
         return {"id": self.id, "provider": self.provider, "kind": self.kind, "ref": self.ref, "enabled": self.enabled}
 
 
+class LibraryPin(LibraryBase):
+    """A dataset a course admin pinned as a starting point, with the card as it
+    was pinned and whether it has labels (#119).
+
+    Pins are course data, not personal data. `pinned_by` only says who pinned
+    it; when a host erases a user's data it should keep this column or set it
+    to null, not delete the pin with its owner.
+    """
+
+    __tablename__ = "library_pins"
+    __table_args__ = (UniqueConstraint("provider", "external_id", name="uq_library_pins_dataset"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    provider: Mapped[str] = mapped_column(String(40))
+    external_id: Mapped[str] = mapped_column(String(200))
+    # The admin's display title, or null to use the card's.
+    title: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    featured: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    labelled: Mapped[str] = mapped_column(String(10), default="unclear", server_default="unclear")
+    # The search card as it was pinned; the license level is re-derived on read.
+    card: Mapped[dict] = mapped_column(JSON)
+    pinned_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    pinned_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
 class LibraryImport(LibraryBase):
     """One import of a sample, from queued to completed, failed or cancelled. The
     database, not the queue, says where it is; a completed import is the

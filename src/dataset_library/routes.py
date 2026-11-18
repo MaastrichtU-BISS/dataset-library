@@ -4,6 +4,7 @@ from flask import Blueprint, current_app, jsonify, request
 from . import admin as admin_module
 from . import imports as imports_module
 from . import labels as labels_module
+from . import pins as pins_module
 from . import policy as policy_module
 from . import preview as preview_module
 from .errors import ProviderRateLimited, ProviderUnavailable
@@ -153,9 +154,70 @@ def provenance(dataset_ref):
     return jsonify(record)
 
 
+@library_bp.route("/featured", methods=["GET"])
+def featured():
+    """The course's featured pins, for the row any signed-in user sees."""
+    return jsonify({"featured": pins_module.featured(_host())})
+
+
 def _require_admin():
     if not _host().is_admin():
         raise ApiError(403, "Only the course's library admins can change these settings.", "not_admin")
+
+
+@library_bp.route("/pins", methods=["GET"])
+def list_pins():
+    _require_admin()
+    return jsonify({"pins": pins_module.list_all(_host())})
+
+
+@library_bp.route("/pins", methods=["POST"])
+def add_pin():
+    """Pin a library dataset; the same provider and dataset id is one pin."""
+    _require_admin()
+    dataset_id = ((request.get_json(silent=True) or {}).get("dataset") or "").strip()
+    if not DATASET_ID_PATTERN.match(dataset_id):
+        raise ApiError(400, f"Not a Hugging Face dataset id: {dataset_id}", "bad_id")
+    try:
+        pin, created = pins_module.add(_host(), dataset_id)
+    except preview_module.LicenseHidden:
+        raise ApiError(403, "This dataset's license is not allowed on this platform, so it cannot be pinned.", "license_hidden")
+    except preview_module.NotInLibrary:
+        raise ApiError(404, "That dataset is not in the library.", "not_found")
+    except PrivateDataset:
+        raise ApiError(404, "That dataset is not in the library.", "not_found")
+    except ProviderRateLimited:
+        raise ApiError(503, "Hugging Face is limiting requests. Try again in a few minutes.", "provider_rate_limited")
+    except ProviderUnavailable:
+        raise ApiError(503, "Hugging Face could not be reached. Try again in a few minutes.", "provider_unavailable")
+    return jsonify(pin), 201 if created else 200
+
+
+@library_bp.route("/pins/<pin_ref>", methods=["PATCH"])
+def patch_pin(pin_ref):
+    """Feature or unfeature a pin, and set or clear its display title."""
+    _require_admin()
+    try:
+        pin = pins_module.update(_host(), pin_ref, request.get_json(silent=True) or {})
+    except pins_module.NotFound:
+        raise ApiError(404, "No such pin.", "not_found")
+    except pins_module.TooManyFeatured:
+        raise ApiError(409, "At most 3 datasets can be featured. Unfeature one first.", "too_many_featured")
+    except pins_module.BadFeatured:
+        raise ApiError(400, "Say whether the pin is featured: true or false.", "bad_featured")
+    except pins_module.BadTitle:
+        raise ApiError(400, "Keep the title under 121 characters.", "bad_title")
+    return jsonify(pin)
+
+
+@library_bp.route("/pins/<pin_ref>", methods=["DELETE"])
+def remove_pin(pin_ref):
+    _require_admin()
+    try:
+        pins_module.remove(_host(), pin_ref)
+    except pins_module.NotFound:
+        raise ApiError(404, "No such pin.", "not_found")
+    return "", 204
 
 
 @library_bp.route("/admin/settings", methods=["GET"])
