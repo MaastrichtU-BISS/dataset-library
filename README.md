@@ -74,11 +74,15 @@ label `dataset_library`).
   `importable` and `maxRows` (the admin's cap, else `max_rows()`).
 
 - `POST /api/library/imports` with `{"dataset", "config", "split", "textColumn",
-  "labelColumn", "size", "name"?, "taskType"?, "licenseAck"?, "revision"?}` → 202 and the import,
-  `queued`. The size is cut to the row cap (the admin's, else `max_rows()`). The
-  same import (dataset, revision, mapping, size) while one is queued or running
-  → 200 and that one, queued once. Refused before anything is queued:
-  400 (`bad_id`, `bad_mapping`, `bad_size`, `bad_name`, `bad_task`, `bad_config`), 403
+  "labelColumn", "size", "name"?, "taskType"?, "licenseAck"?, "revision"?,
+  "balance"?}` → 202 and the import,
+  `queued`. The size is cut to the row cap (the admin's, else `max_rows()`).
+  `balance` keeps the label proportions of the whole dataset; it defaults to
+  `true` when a `labelColumn` is mapped and is always `false` without one. The
+  same import (dataset, revision, mapping, size, balance) while one is queued
+  or running → 200 and that one, queued once. Refused before anything is
+  queued: 400 (`bad_id`, `bad_mapping`, `bad_size`, `bad_name`, `bad_task`,
+  `bad_config`, `bad_balance`), 403
   (`license_hidden`), 404, 409
   (`gated`, `private` when the Hub's answer says the owner keeps it private
   (an anonymous 401/404 is `not_found`), `not_importable`, `needs_ack` for a license set to warn, `changed`
@@ -89,13 +93,16 @@ label `dataset_library`).
   `validating`, `saving`, `completed`, `failed`, `cancelled`), `error`, `code`, `rows`, `datasetRef`,
   the mapping (`textColumn`, `labelColumn`, `taskType`, `size`) and the
   provenance (`externalId`, `revision`, `url`, `license`, `licenseAckAt`, `importedAt`).
+  `balance`, `sampleMethod` (`"stratified"` or `"random"`) and `sampleNote`
+  (why a balance fell back to a random sample, else `null`) say how it sampled.
   `?current=true` → only those queued or running, and those failed in the last
   day and not put away.
 - `GET /api/library/provenance/<dataset_ref>` → the provenance of a Dataset the
   signed-in user imported: `provider`, `externalId`, `config`, `split`,
   `revision`, `url`, `importedAt`, `licenseAckAt` (when the license was
-  confirmed) and `license` (the license table entry, at the platform's current
-  level, which an admin may have changed since the import). 404 when this user
+  confirmed), `license` (the license table entry, at the platform's current
+  level, which an admin may have changed since the import), plus `balance`,
+  `sampleMethod` and `sampleNote`. 404 when this user
   has no completed import of it; works without an import queue.
 - `POST /api/library/imports/<ref>/cancel` → the import, `cancelled`; once it is
   `saving` or `completed`, 409 `too_late` (cancel and finishing never both win).

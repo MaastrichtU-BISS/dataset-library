@@ -5,6 +5,8 @@ keeps what it was given, as the host's would store it.
 """
 import csv
 import json
+import random
+from collections import Counter
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -24,6 +26,15 @@ def write_shard(path, texts, labels, row_group_size=None):
         "extra": {"dtype": "string", "_type": "Value"},
     }
     table = pa.table({"text": texts, "label": labels, "extra": ["x"] * len(texts)})
+    table = table.replace_schema_metadata({"huggingface": json.dumps({"info": {"features": features}})})
+    pq.write_table(table, path, row_group_size=row_group_size)
+    return path
+
+
+def write_unlabelled_shard(path, texts, row_group_size=None):
+    """A shard that does not hold the mapped label column at all."""
+    features = {"text": {"dtype": "string", "_type": "Value"}}
+    table = pa.table({"text": texts, "extra": ["x"] * len(texts)})
     table = table.replace_schema_metadata({"huggingface": json.dumps({"info": {"features": features}})})
     pq.write_table(table, path, row_group_size=row_group_size)
     return path
@@ -150,6 +161,101 @@ def test_pass_one_reads_row_counts_and_pass_two_only_the_mapped_columns_of_chose
     for path, group, _ in SpyParquet.reads:
         shard = path.rsplit("/", 1)[1][:4]
         assert any(t.startswith(f"Shard {int(shard)} clause ") and int(t.rsplit(" ", 1)[1]) // 10 == group for t in chosen)
+
+
+def test_a_balanced_import_keeps_uneven_labels_across_many_row_groups(run, tmp_path):
+    labels = [0] * 700 + [1] * 250 + [2] * 50
+    random.Random(1).shuffle(labels)
+    texts = [f"Clause {i}" for i in range(len(labels))]
+    shard = write_shard(tmp_path / "0000.parquet", texts, labels, row_group_size=50)
+
+    result, create = run([shard], size=200, balance=True)
+
+    assert result["status"] == "completed", result
+    assert result["balance"] is True
+    assert result["sampleMethod"] == "stratified"
+    assert result["sampleNote"] is None
+    rows = create.calls[0]["rows"]
+    assert len(rows) == 200
+    assert len({row["text"] for row in rows}) == 200
+    counts = Counter(row["label"] for row in rows)
+    assert abs(counts[LABELS[0]] - 140) <= 1
+    assert abs(counts[LABELS[1]] - 50) <= 1
+    assert abs(counts[LABELS[2]] - 10) <= 1
+    assert create.calls[0]["description"].startswith("A sample that keeps the label balance, from Hugging Face:")
+
+
+def test_a_balanced_import_reads_the_label_column_first_then_only_chosen_row_groups(run, tmp_path):
+    shards = [
+        write_shard(tmp_path / f"{n:04}.parquet", [f"Shard {n} clause {i}" for i in range(100)], [i % 3 for i in range(100)], row_group_size=10)
+        for n in range(2)
+    ]
+    SpyParquet.reads = []
+
+    result, create = run(shards, size=3, balance=True, open_parquet=SpyParquet)
+
+    assert result["status"] == "completed", result
+    label_reads = [(path, group) for path, group, columns in SpyParquet.reads if columns == ("label",)]
+    mapped_reads = [(path, group) for path, group, columns in SpyParquet.reads if columns == ("text", "label")]
+    assert all(columns in (("label",), ("text", "label")) for _, _, columns in SpyParquet.reads)
+    # Pass 1 reads every row group, and only its label column.
+    assert len(label_reads) == 20
+    # Pass 2 reads only the row groups that hold a chosen row.
+    chosen = {row["text"] for row in create.calls[0]["rows"]}
+    expected = set()
+    for text in chosen:
+        where, clause = text.split(" clause ")
+        n = int(where.removeprefix("Shard "))
+        expected.add((str(tmp_path / f"{n:04}.parquet"), int(clause) // 10))
+    assert {tuple(read) for read in mapped_reads} == expected
+
+
+def test_a_balanced_import_replaces_empty_text_from_the_same_label(run, tmp_path):
+    texts = ["", "", "Keep A", "Keep B", "Keep C", "Keep D", *[f"Other {i}" for i in range(6)]]
+    labels = [0] * 6 + [1] * 6
+    shard = write_shard(tmp_path / "0000.parquet", texts, labels)
+
+    result, create = run([shard], size=6, balance=True)
+
+    assert result["status"] == "completed", result
+    rows = create.calls[0]["rows"]
+    assert len(rows) == 6
+    assert Counter(row["label"] for row in rows) == {LABELS[0]: 3, LABELS[1]: 3}
+    assert all(row["text"].strip() for row in rows)
+
+
+def test_an_empty_label_column_falls_back_to_a_random_sample_with_a_note(run, tmp_path):
+    texts = [f"Clause {i}" for i in range(8)]
+    shard = write_shard(tmp_path / "0000.parquet", texts, [None, "", "  ", None, "", "  ", None, ""])
+
+    result, create = run([shard], size=3, balance=True)
+
+    assert result["status"] == "completed", result
+    assert result["sampleMethod"] == "random"
+    assert result["sampleNote"] == imports.LABEL_EMPTY
+    assert len(create.calls[0]["rows"]) == 3
+
+
+def test_a_label_column_missing_from_the_files_falls_back_with_its_own_note(run, tmp_path):
+    shard = write_unlabelled_shard(tmp_path / "0000.parquet", [f"Clause {i}" for i in range(8)])
+
+    result, create = run([shard], size=3, balance=True)
+
+    assert result["status"] == "completed", result
+    assert result["sampleMethod"] == "random"
+    assert result["sampleNote"] == imports.LABEL_MISSING
+    assert len(create.calls[0]["rows"]) == 3
+
+
+def test_with_the_balance_turned_off_a_labelled_dataset_is_sampled_at_random(run, tmp_path):
+    shard = write_shard(tmp_path / "0000.parquet", [f"Clause {i}" for i in range(30)], [i % 3 for i in range(30)])
+
+    result, create = run([shard], size=6, balance=False)
+
+    assert result["status"] == "completed", result
+    assert result["sampleMethod"] == "random"
+    assert result["sampleNote"] is None
+    assert create.calls[0]["description"].startswith("A random sample from Hugging Face:")
 
 
 def test_rows_with_empty_text_are_dropped_and_the_sample_stays_exact(run, tmp_path):

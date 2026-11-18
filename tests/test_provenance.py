@@ -13,7 +13,7 @@ from test_import import FakeCreateDataset, write_shard
 BOB = {"X-User": "bob"}
 
 
-def complete(app, tmp_path, *, license, license_ack_at=None):
+def complete(app, tmp_path, *, license, license_ack_at=None, balance=False):
     """Run one import to completed, as the host's worker would."""
     shard = write_shard(tmp_path / "0000.parquet", ["A clause", "Another"], [0, 1])
     with app.app_context():
@@ -22,7 +22,7 @@ def complete(app, tmp_path, *, license, license_ack_at=None):
             owner_id="alice", provider="huggingface", external_id="coastalcph/lex_glue",
             config="ledgar", split="train", text_column="text", label_column="label",
             task_type="classification", sample_size=2, max_rows=1000, name="LexGLUE",
-            license=license, license_ack_at=license_ack_at,
+            license=license, license_ack_at=license_ack_at, balance=balance,
             url="https://huggingface.co/datasets/coastalcph/lex_glue", status="queued",
         )
         session.add(record)
@@ -56,6 +56,21 @@ def test_a_confirmed_import_is_the_datasets_provenance(app, tmp_path):
     assert body["license"]["id"] == "cc-by-nd-4.0"
     assert body["license"]["level"] == "warn"
     assert body["license"]["ack"]
+    assert body["balance"] is False
+    assert body["sampleMethod"] == "random"
+    assert body["sampleNote"] is None
+
+
+def test_provenance_says_when_the_sample_kept_the_label_balance(app, tmp_path):
+    completed = complete(app, tmp_path, license="cc-by-4.0", balance=True)
+    assert completed["balance"] is True
+    assert completed["sampleMethod"] == "stratified"
+
+    body = app.test_client().get("/api/library/provenance/dataset-1", headers=ALICE).get_json()
+
+    assert body["balance"] is True
+    assert body["sampleMethod"] == "stratified"
+    assert body["sampleNote"] is None
 
 
 def test_an_allow_licenses_import_has_no_confirmation_time(app, tmp_path):

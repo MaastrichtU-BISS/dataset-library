@@ -8,6 +8,26 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-18
+
+### Added
+
+- Keeping the label balance when sampling (BAIGLE #115).
+  - `POST /api/library/imports` takes an optional `balance`. With a
+    `labelColumn` it defaults to `true`; without one it is always `false`, and
+    a value that is not a boolean is refused with 400 `bad_balance`.
+  - A balanced import samples proportionally on the label column (largest
+    remainder, so the size is exact), reading only that column first and then
+    only the mapped columns of the chosen row groups. An empty or missing
+    label column falls back to a random sample with a note saying so.
+  - Imports carry `balance`, `sampleMethod` (`"stratified"` or `"random"`) and
+    `sampleNote` (why a balance fell back, else `null`) in `to_dict()` and in
+    `GET /api/library/provenance/<dataset_ref>`.
+  - The Dataset description says "A sample that keeps the label balance, from
+    Hugging Face: …" when it was stratified.
+  - Migration `dl_0005_label_balance` adds `library_imports.balance`,
+    `sample_method` and `sample_note`.
+
 ## [0.7.0] - 2026-11-18
 
 ### Added

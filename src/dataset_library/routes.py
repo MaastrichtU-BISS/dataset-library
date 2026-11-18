@@ -199,7 +199,7 @@ def _importing():
 
 @library_bp.route("/imports", methods=["POST"])
 def start_import():
-    """Queue an import of a random sample; the worker does the rest."""
+    """Queue an import of a sample; the worker does the rest."""
     _importing()
     record, created = _starting(imports_module.start, request.get_json(silent=True) or {})
     # The same import already queued or running comes back as it is.

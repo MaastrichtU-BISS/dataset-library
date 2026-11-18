@@ -3,7 +3,7 @@ from the package's migrations."""
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Boolean, DateTime, Integer, String, UniqueConstraint
+from sqlalchemy import JSON, Boolean, DateTime, Integer, String, UniqueConstraint, false
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -69,6 +69,11 @@ class LibraryImport(LibraryBase):
     label_column: Mapped[str | None] = mapped_column(String(200), nullable=True)
     task_type: Mapped[str] = mapped_column(String(40))
     sample_size: Mapped[int] = mapped_column(Integer)
+    # Keep the label balance of the whole dataset (#115); needs a label column.
+    balance: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    # "stratified" or "random", and why a asked-for balance was not kept.
+    sample_method: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    sample_note: Mapped[str | None] = mapped_column(String(300), nullable=True)
     # The row cap when the import was queued; a later change does not touch it.
     max_rows: Mapped[int] = mapped_column(Integer)
     name: Mapped[str] = mapped_column(String(255))
@@ -104,6 +109,9 @@ class LibraryImport(LibraryBase):
             "textColumn": self.text_column,
             "labelColumn": self.label_column,
             "size": self.sample_size,
+            "balance": self.balance,
+            "sampleMethod": self.sample_method,
+            "sampleNote": self.sample_note,
             "rows": self.rows,
             "datasetRef": self.dataset_ref,
             "createdAt": self.created_at.isoformat() + "Z" if self.created_at else None,
