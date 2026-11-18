@@ -16,6 +16,7 @@ from dataset_library import imports
 from dataset_library.models import LibraryImport
 
 LABELS = ["Terminations", "Governing Laws", "Notices"]
+NER_NAMES = ["O", "B-PER", "I-PER", "B-ORG", "I-ORG"]
 
 
 def write_shard(path, texts, labels, row_group_size=None):
@@ -53,6 +54,42 @@ def write_labels_shard(path, texts, labels, label_feature=None, row_group_size=N
     return path
 
 
+def write_ner_shard(path, tokens, tags, tag_feature=None, row_group_size=None):
+    """A shard as a Hugging Face NER dataset writes one: tokens and BIO tags."""
+    features = {
+        "tokens": {"feature": {"dtype": "string", "_type": "Value"}, "_type": "Sequence"},
+        "ner_tags": tag_feature or {"feature": {"names": NER_NAMES, "_type": "ClassLabel"}, "_type": "Sequence"},
+    }
+    table = pa.table({"tokens": tokens, "ner_tags": tags})
+    table = table.replace_schema_metadata({"huggingface": json.dumps({"info": {"features": features}})})
+    pq.write_table(table, path, row_group_size=row_group_size)
+    return path
+
+
+def write_tner_shard(path, tokens, tags, row_group_size=None):
+    """A shard as tner/conll2003 writes one: tokens and numbered tags with no names."""
+    features = {
+        "tokens": {"feature": {"dtype": "string", "_type": "Value"}, "_type": "Sequence"},
+        "tags": {"feature": {"dtype": "int64", "_type": "Value"}, "_type": "Sequence"},
+    }
+    table = pa.table({"tokens": tokens, "tags": tags})
+    table = table.replace_schema_metadata({"huggingface": json.dumps({"info": {"features": features}})})
+    pq.write_table(table, path, row_group_size=row_group_size)
+    return path
+
+
+def write_summarization_shard(path, documents, summaries, row_group_size=None):
+    """A shard as Hugging Face writes a summarization dataset: document, summary."""
+    features = {
+        "document": {"dtype": "string", "_type": "Value"},
+        "summary": {"dtype": "string", "_type": "Value"},
+    }
+    table = pa.table({"document": documents, "summary": summaries})
+    table = table.replace_schema_metadata({"huggingface": json.dumps({"info": {"features": features}})})
+    pq.write_table(table, path, row_group_size=row_group_size)
+    return path
+
+
 class FakeCreateDataset:
     def __init__(self, refuse=None, while_saving=None):
         self.calls = []
@@ -62,6 +99,7 @@ class FakeCreateDataset:
     def __call__(self, owner_id, file_path, name, description, task_type):
         if self.while_saving:
             self.while_saving()
+        self.last_path = file_path
         with open(file_path, newline="") as f:
             rows = list(csv.DictReader(f))
         self.calls.append({"owner": owner_id, "name": name, "description": description, "task_type": task_type, "rows": rows})
@@ -90,8 +128,11 @@ def run(app, tmp_path):
             session = app.db.session
             record = LibraryImport(
                 owner_id="alice", provider="huggingface", external_id="coastalcph/lex_glue",
-                config="ledgar", split="train", text_column="text", label_column="label",
-                task_type="classification", sample_size=size, max_rows=1000, name="LexGLUE",
+                config="ledgar", split="train",
+                text_column=fields.pop("text_column", "text"),
+                label_column=fields.pop("label_column", "label"),
+                task_type=fields.pop("task_type", "classification"),
+                sample_size=size, max_rows=1000, name="LexGLUE",
                 license="cc-by-4.0", url="https://huggingface.co/datasets/coastalcph/lex_glue",
                 **fields,
             )
@@ -521,3 +562,345 @@ def test_a_balanced_sample_short_of_its_size_says_so(run, tmp_path):
     assert result["status"] == "completed", result
     assert len(create.calls[0]["rows"]) == 3
     assert result["sampleNote"] == imports.LABEL_ROUGH
+
+
+def test_an_ner_import_writes_joined_text_and_distinct_entity_types(run, tmp_path):
+    tokens = [["John", "Smith", "works", "at", "ACME"], ["ACME", "sued", "Mary", "Jones"]]
+    tags = [[0, 1, 2, 0, 3], [3, 0, 1, 2]]
+    shard = write_ner_shard(tmp_path / "0000.parquet", tokens, tags)
+
+    result, create = run([shard], size=2, task_type="ner", text_column="tokens", label_column="ner_tags")
+
+    assert result["status"] == "completed", result
+    [call] = create.calls
+    assert call["task_type"] == "ner"
+    assert list(call["rows"][0]) == ["text", "entities"]
+    assert {row["text"]: row["entities"] for row in call["rows"]} == {
+        "John Smith works at ACME": "PER, ORG",
+        "ACME sued Mary Jones": "ORG, PER",
+    }
+
+
+def test_an_ner_import_accepts_string_tags(run, tmp_path):
+    shard = write_ner_shard(
+        tmp_path / "0000.parquet",
+        [["Alice", "runs", "ACME"], ["Bob", "left"]],
+        [["B-PER", "O", "B-ORG"], ["B-PER", "O"]],
+        tag_feature={"feature": {"dtype": "string", "_type": "Value"}, "_type": "Sequence"},
+    )
+
+    result, create = run([shard], size=2, task_type="ner", text_column="tokens", label_column="ner_tags")
+
+    assert result["status"] == "completed", result
+    assert {row["text"]: row["entities"] for row in create.calls[0]["rows"]} == {
+        "Alice runs ACME": "PER, ORG",
+        "Bob left": "PER",
+    }
+
+
+def test_an_ner_row_with_only_outside_tags_keeps_an_empty_entities_cell(run, tmp_path):
+    shard = write_ner_shard(
+        tmp_path / "0000.parquet",
+        [["just", "words"], ["John", "Smith"]],
+        [[0, 0], [1, 2]],
+    )
+
+    result, create = run([shard], size=2, task_type="ner", text_column="tokens", label_column="ner_tags")
+
+    assert result["status"] == "completed", result
+    assert {row["text"]: row["entities"] for row in create.calls[0]["rows"]} == {
+        "just words": "",
+        "John Smith": "PER",
+    }
+
+
+def test_an_empty_token_list_is_empty_text_and_the_sample_stays_exact(run, tmp_path):
+    shard = write_ner_shard(
+        tmp_path / "0000.parquet",
+        [[], ["Kept", "one"], [], ["Kept", "two"]],
+        [[], [1], [], [1]],
+    )
+
+    result, create = run([shard], size=2, task_type="ner", text_column="tokens", label_column="ner_tags")
+
+    assert result["status"] == "completed", result
+    assert sorted(row["text"] for row in create.calls[0]["rows"]) == ["Kept one", "Kept two"]
+
+
+def test_numbered_tags_without_names_fail_with_a_plain_reason(run, tmp_path):
+    shard = write_ner_shard(
+        tmp_path / "0000.parquet",
+        [["John", "Smith"]],
+        [[1, 2]],
+        tag_feature={"feature": {"dtype": "int64", "_type": "Value"}, "_type": "Sequence"},
+    )
+
+    result, create = run([shard], size=1, task_type="ner", text_column="tokens", label_column="ner_tags")
+
+    assert result["status"] == "failed"
+    assert result["code"] == "no_entity_names"
+    assert "can't read entity names" in result["error"]
+    assert create.calls == []
+    assert not list((tmp_path / "data").glob("library-*.csv"))
+
+
+def test_tags_without_names_fail_before_any_row_is_read(run, tmp_path):
+    """The tner shape, mapped as a preview proposes it: no names, no rows read."""
+    shard = write_tner_shard(tmp_path / "0000.parquet", [["John", "Smith"], ["ACME"]], [[0, 1], [2]])
+    SpyParquet.reads = []
+
+    result, create = run(
+        [shard], size=2, task_type="ner", text_column="tokens", label_column="tags",
+        open_parquet=SpyParquet,
+    )
+
+    assert result["status"] == "failed"
+    assert result["code"] == "no_entity_names"
+    assert create.calls == []
+    assert SpyParquet.reads == []
+    assert not list((tmp_path / "data").glob("library-*.csv"))
+
+
+def test_tags_with_an_empty_name_list_also_fail_before_any_row_is_read(run, tmp_path):
+    shard = write_ner_shard(
+        tmp_path / "0000.parquet", [["John", "Smith"]], [[0, 1]],
+        tag_feature={"feature": {"names": [], "_type": "ClassLabel"}, "_type": "Sequence"},
+    )
+    SpyParquet.reads = []
+
+    result, create = run(
+        [shard], size=1, task_type="ner", text_column="tokens", label_column="ner_tags",
+        open_parquet=SpyParquet,
+    )
+
+    assert result["status"] == "failed"
+    assert result["code"] == "no_entity_names"
+    assert create.calls == []
+    assert SpyParquet.reads == []
+
+
+def test_nested_ner_columns_fail_before_any_row_is_read(run, tmp_path):
+    path = tmp_path / "0000.parquet"
+    pq.write_table(pa.table({"tokens": [[["John"]]], "ner_tags": [[["B-PER"]]]}), path)
+    SpyParquet.reads = []
+
+    result, create = run(
+        [path], size=1, task_type="ner", text_column="tokens", label_column="ner_tags",
+        open_parquet=SpyParquet,
+    )
+
+    assert result["status"] == "failed"
+    assert result["code"] == "nested_columns"
+    assert create.calls == []
+    assert SpyParquet.reads == []
+
+
+def test_a_nested_tag_column_next_to_flat_tokens_fails_before_any_row_is_read(run, tmp_path):
+    path = tmp_path / "0000.parquet"
+    pq.write_table(pa.table({"tokens": [["John", "Smith"]], "ner_tags": [[["B-PER"], ["I-PER"]]]}), path)
+    SpyParquet.reads = []
+
+    result, create = run(
+        [path], size=1, task_type="ner", text_column="tokens", label_column="ner_tags",
+        open_parquet=SpyParquet,
+    )
+
+    assert result["code"] == "nested_columns"
+    assert SpyParquet.reads == []
+
+
+def test_span_records_as_the_tag_column_fail_before_any_row_is_read(run, tmp_path):
+    path = tmp_path / "0000.parquet"
+    spans = [[{"start": 0, "end": 10, "type": "PER"}]]
+    pq.write_table(pa.table({"tokens": [["John", "Smith"]], "entities": spans}), path)
+    SpyParquet.reads = []
+
+    result, create = run(
+        [path], size=1, task_type="ner", text_column="tokens", label_column="entities",
+        open_parquet=SpyParquet,
+    )
+
+    assert result["code"] == "nested_columns"
+    assert create.calls == []
+    assert SpyParquet.reads == []
+
+
+def test_a_record_of_span_lists_as_the_tag_column_fails_before_any_row_is_read(run, tmp_path):
+    # Hugging Face stores Sequence({start, end, type}) as one record of lists.
+    path = tmp_path / "0000.parquet"
+    spans = [{"start": [0], "end": [10], "type": ["PER"]}]
+    pq.write_table(pa.table({"tokens": [["John", "Smith"]], "entities": spans}), path)
+    SpyParquet.reads = []
+
+    result, create = run(
+        [path], size=1, task_type="ner", text_column="tokens", label_column="entities",
+        open_parquet=SpyParquet,
+    )
+
+    assert result["code"] == "nested_columns"
+    assert create.calls == []
+    assert SpyParquet.reads == []
+
+
+def test_a_summarization_import_writes_text_and_summary(run, tmp_path):
+    shard = write_summarization_shard(
+        tmp_path / "0000.parquet",
+        ["The court held that the clause was void.", "The appeal was dismissed with costs."],
+        ["The clause was void.", "Appeal dismissed."],
+    )
+
+    result, create = run(
+        [shard], size=2, task_type="summarization", text_column="document", label_column="summary",
+    )
+
+    assert result["status"] == "completed", result
+    [call] = create.calls
+    assert call["task_type"] == "summarization"
+    assert list(call["rows"][0]) == ["text", "summary"]
+    assert {row["text"]: row["summary"] for row in call["rows"]} == {
+        "The court held that the clause was void.": "The clause was void.",
+        "The appeal was dismissed with costs.": "Appeal dismissed.",
+    }
+
+
+def test_summarization_rows_without_a_summary_are_replaced_and_the_sample_stays_exact(run, tmp_path):
+    shard = write_summarization_shard(
+        tmp_path / "0000.parquet",
+        [f"Doc {i}" for i in range(6)],
+        ["Summary one", "", None, "Summary four", "   ", "Summary six"],
+    )
+
+    result, create = run(
+        [shard], size=3, task_type="summarization", text_column="document", label_column="summary",
+    )
+
+    assert result["status"] == "completed", result
+    assert sorted(row["summary"] for row in create.calls[0]["rows"]) == [
+        "Summary four", "Summary one", "Summary six",
+    ]
+
+
+def test_summarization_with_no_summary_at_all_fails_and_no_dataset_is_made(run, tmp_path):
+    shard = write_summarization_shard(
+        tmp_path / "0000.parquet",
+        ["Doc one", "Doc two", "Doc three"],
+        ["", "  ", None],
+    )
+
+    result, create = run(
+        [shard], size=2, task_type="summarization", text_column="document", label_column="summary",
+    )
+
+    assert result["status"] == "failed"
+    assert result["code"] == "no_usable_rows"
+    assert "both a text and a summary" in result["error"]
+    assert create.calls == []
+    assert not list((tmp_path / "data").glob("library-*.csv"))
+
+
+def test_the_label_header_follows_the_task_type(run, tmp_path):
+    shard = write_ner_shard(tmp_path / "0000.parquet", [["John"], ["ACME"]], [[1], [3]])
+
+    result, create = run(
+        [shard], size=2, task_type="named_entity_recognition", text_column="tokens", label_column="ner_tags",
+    )
+
+    assert result["status"] == "completed", result
+    assert list(create.calls[0]["rows"][0]) == ["text", "entities"]
+
+
+def test_class_label_names_are_read_from_a_sequence_and_the_older_list_form(tmp_path):
+    sequence = write_ner_shard(tmp_path / "0000.parquet", [["a"]], [[1]])
+    older = write_ner_shard(
+        tmp_path / "0001.parquet", [["a"]], [[1]],
+        tag_feature={"feature": [{"_type": "ClassLabel", "names": NER_NAMES}], "_type": "Sequence"},
+    )
+
+    assert imports._label_names(pq.ParquetFile(sequence), "ner_tags") == NER_NAMES
+    assert imports._label_names(pq.ParquetFile(older), "ner_tags") == NER_NAMES
+
+
+@pytest.mark.parametrize("features", [None, ["not", "a", "dict"]])
+def test_label_names_without_a_feature_map_is_none(tmp_path, features):
+    path = tmp_path / "0000.parquet"
+    table = pa.table({"tokens": [["a"]], "ner_tags": [[1]]})
+    table = table.replace_schema_metadata({"huggingface": json.dumps({"info": {"features": features}})})
+    pq.write_table(table, path)
+
+    assert imports._label_names(pq.ParquetFile(path), "ner_tags") is None
+
+
+def test_ner_and_summarization_csvs_pass_legal_ml_cores_validation(run, tmp_path):
+    datasets = pytest.importorskip("legal_ml_core.routes.datasets")
+
+    ner = write_ner_shard(
+        tmp_path / "ner.parquet",
+        [["John", "Smith", "works", "at", "ACME"], ["ACME", "sued", "Mary", "Jones"]],
+        [[0, 1, 2, 0, 3], [3, 0, 1, 2]],
+    )
+    result, create = run([ner], size=2, task_type="ner", text_column="tokens", label_column="ner_tags")
+
+    assert result["status"] == "completed", result
+    _, error = datasets.validate_dataset_file(create.last_path, "ner")
+    assert error is None, error
+
+    summaries = write_summarization_shard(
+        tmp_path / "summaries.parquet",
+        ["The court held that the clause was void.", "The appeal was dismissed with costs."],
+        ["The clause was void.", "Appeal dismissed."],
+    )
+    result, create = run(
+        [summaries], size=2, task_type="summarization", text_column="document", label_column="summary",
+    )
+
+    assert result["status"] == "completed", result
+    _, error = datasets.validate_dataset_file(create.last_path, "summarization")
+    assert error is None, error
+
+
+def test_imported_csvs_become_datasets_through_legal_ml_cores_real_create_dataset(run, tmp_path):
+    pytest.importorskip("legal_ml_core")
+    from flask import Flask
+    from flask_sqlalchemy import SQLAlchemy
+    from legal_ml_core import create_dataset, init_ml_feature
+    from legal_ml_core.db import MLBase
+
+    app = Flask(__name__)
+    app.config.update(
+        TESTING=True,
+        SQLALCHEMY_DATABASE_URI="sqlite:///:memory:",
+        SQLALCHEMY_TRACK_MODIFICATIONS=False,
+        UPLOAD_FOLDER=str(tmp_path / "uploads"),
+        MODEL_FOLDER=str(tmp_path / "models"),
+    )
+    db = SQLAlchemy(model_class=MLBase)
+    db.init_app(app)
+    init_ml_feature(app, None, app.config["MODEL_FOLDER"], db=db)
+
+    ner = write_ner_shard(
+        tmp_path / "real_ner.parquet",
+        [["John", "Smith", "works", "at", "ACME"], ["ACME", "sued", "Mary", "Jones"]],
+        [[0, 1, 2, 0, 3], [3, 0, 1, 2]],
+    )
+    result, create = run([ner], size=2, task_type="ner", text_column="tokens", label_column="ner_tags")
+
+    assert result["status"] == "completed", result
+    summaries = write_summarization_shard(
+        tmp_path / "real_summaries.parquet",
+        ["The court held that the clause was void.", "The appeal was dismissed with costs."],
+        ["The clause was void.", "Appeal dismissed."],
+    )
+    summary_result, summary_create = run(
+        [summaries], size=2, task_type="summarization", text_column="document", label_column="summary",
+    )
+
+    assert summary_result["status"] == "completed", summary_result
+    with app.app_context():
+        db.create_all()
+        ner_dataset = create_dataset("alice", create.last_path, "Imported NER", "A sample", "ner")
+        summary_dataset = create_dataset(
+            "alice", summary_create.last_path, "Imported summaries", "A sample", "summarization",
+        )
+
+        assert (ner_dataset.task_type, ner_dataset.row_count) == ("ner", 2)
+        assert (summary_dataset.task_type, summary_dataset.row_count) == ("summarization", 2)

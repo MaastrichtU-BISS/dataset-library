@@ -13,7 +13,7 @@ from .providers import viewer
 log = logging.getLogger("dataset_library")
 
 CACHE_SECONDS = 3600
-TARGET_TEXT_COLUMNS = {"summary", "judgment"}
+TARGET_TEXT_COLUMNS = {"summary", "highlights", "judgment"}
 LABEL_LIKE = {"label", "labels", "answer", "answers", "gold", "class", "category", "target", "tags", "ner_tags",
               "outcome", "verdict", "entities"}
 

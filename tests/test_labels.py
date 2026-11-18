@@ -35,6 +35,28 @@ def test_several_at_once_and_each_cached_for_an_hour(client, hub, cache):
     assert 3600 in cache.ttls.values()
 
 
+def test_a_highlights_column_counts_as_a_summary(client, monkeypatch):
+    from dataset_library import labels as labels_module
+    from dataset_library.providers import viewer
+
+    def info(kind, *, dataset):
+        assert kind == "info"
+        return {
+            "dataset_info": {
+                "default": {
+                    "features": {
+                        "article": {"dtype": "string", "_type": "Value"},
+                        "highlights": {"dtype": "string", "_type": "Value"},
+                    }
+                }
+            }
+        }
+
+    monkeypatch.setattr(viewer, "get", info)
+
+    assert labels_module.of_dataset("cnn_dailymail") == "yes"
+
+
 def test_a_bad_id_is_refused_without_asking_anyone(client, hub):
     resp = client.get("/api/library/labels", query_string={"ids": "huggingface:../etc/passwd"}, headers=ALICE)
 

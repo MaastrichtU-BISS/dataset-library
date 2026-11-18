@@ -37,6 +37,7 @@ from . import policy as policy_module
 from .errors import ProviderError
 from .licenses import LICENSES, UNKNOWN
 from .models import LibraryImport
+from .ner import entity_types, tokens_to_text
 
 logger = logging.getLogger("dataset_library")
 
@@ -60,6 +61,18 @@ LABEL_TOO_MANY = "This label column has too many different values to balance, so
 LABEL_ROUGH = "Some labels had too few rows with text, so the sample is only roughly balanced."
 # Only these tasks have one class per row, so only they can be balanced by label.
 BALANCEABLE = {"classification", "document_classification", "judgment_prediction"}
+# These tasks store a list of BIO tags per row, not one label.
+NER_TASKS = {"ner", "named_entity_recognition"}
+# The host's training columns for the label side of each task (#117).
+LABEL_HEADERS = {"ner": "entities", "named_entity_recognition": "entities", "summarization": "summary"}
+NESTED_NER = (
+    "These columns hold records, maps or lists of lists, so they can't be read as "
+    "words and their entity tags. Pick a column of words and a column of tags."
+)
+NO_ENTITY_NAMES = (
+    "We can't read entity names: this dataset's tags are numbers without names, "
+    "so they can't become entity types."
+)
 # How much of a dataset an import may download before it samples.
 MAX_FETCH_BYTES = 200_000_000
 # How often a running import says it is alive, and how long a quiet one, or a
@@ -142,6 +155,8 @@ def start(host, owner_id, body, *, ack_at=None):
         raise Refused(400, "bad_mapping", "Pick the column that holds the text.")
     if label_column is not None and label_column not in columns:
         raise Refused(400, "bad_mapping", "Pick a label column from this dataset, or none.")
+    if label_column is not None and label_column == text_column:
+        raise Refused(400, "bad_mapping", "Pick different columns for the text and the label.")
     balance = body.get("balance")
     if balance is not None and not isinstance(balance, bool):
         raise Refused(400, "bad_balance", "Say whether to keep the label balance.")
@@ -513,13 +528,69 @@ def _fail(session, record, code, message):
 
 
 def _label_names(parquet_file, column):
+    """The class label names for `column`: a label, or a row's list of tags."""
     metadata = parquet_file.schema_arrow.metadata or {}
     try:
         features = json.loads(metadata[b"huggingface"])["info"]["features"]
-    except (KeyError, ValueError, TypeError):
+    except (KeyError, ValueError, TypeError, AttributeError):
         return None
-    feature = features.get(column) or {}
-    return feature.get("names") if feature.get("_type") == "ClassLabel" else None
+    if not isinstance(features, dict):
+        return None
+    return _class_label_names(features.get(column) or {})
+
+
+def _class_label_names(feature):
+    """Names from a ClassLabel, or from the ClassLabel inside a Sequence."""
+    if isinstance(feature, list):
+        for item in feature:
+            names = _class_label_names(item)
+            if names is not None:
+                return names
+        return None
+    if not isinstance(feature, dict):
+        return None
+    if feature.get("_type") == "ClassLabel":
+        return feature.get("names")
+    if feature.get("_type") in ("Sequence", "List", "LargeList"):
+        return _class_label_names(feature.get("feature"))
+    return None
+
+
+def _refuse_numbered_ner_tags(record, files):
+    """Fail before any row is read when NER columns cannot become words and
+    entity types: records, maps, lists of those or of lists, or numbered tags
+    the files do not name."""
+    if record.task_type not in NER_TASKS:
+        return
+    for parquet_file in files:
+        schema = parquet_file.schema_arrow
+        for column in (record.text_column, record.label_column):
+            if column and column in schema.names and _not_flat(schema.field(column).type):
+                raise ImportFailed("nested_columns", NESTED_NER)
+        if not record.label_column or record.label_column not in schema.names:
+            continue
+        if _integer_list(schema.field(record.label_column).type) and not _label_names(parquet_file, record.label_column):
+            raise ImportFailed("no_entity_names", NO_ENTITY_NAMES)
+
+
+def _not_flat(arrow_type):
+    """Whether an NER column is something other than a string or a flat list
+    of words or tags: a record (Hugging Face stores a sequence of span dicts
+    as a record of lists), a map, or a list of lists, records or maps."""
+    import pyarrow.types as pat
+
+    if pat.is_struct(arrow_type) or pat.is_map(arrow_type):
+        return True
+    lists = pat.is_list(arrow_type) or pat.is_large_list(arrow_type) or pat.is_fixed_size_list(arrow_type)
+    return lists and pat.is_nested(arrow_type.value_type)
+
+
+def _integer_list(arrow_type):
+    """Whether an Arrow type is a list of integers."""
+    import pyarrow.types as pat
+
+    lists = pat.is_list(arrow_type) or pat.is_large_list(arrow_type) or pat.is_fixed_size_list(arrow_type)
+    return lists and pat.is_integer(arrow_type.value_type)
 
 
 def _sample(record, paths, rng, open_parquet):
@@ -533,6 +604,7 @@ def _sample(record, paths, rng, open_parquet):
 
         open_parquet = pq.ParquetFile
     files = [open_parquet(path) for path in paths]
+    _refuse_numbered_ner_tags(record, files)
     if record.balance and record.label_column:
         rows, note = _sample_balanced(record, files, rng)
         if rows is not None:
@@ -550,23 +622,32 @@ def _sample_random(record, files, rng):
     """Pick rows uniformly at random.
 
     Pass 1 reads only each row group's row count; pass 2 reads only the mapped
-    columns of the row groups that hold a chosen row."""
+    columns of the row groups that hold a chosen row. A summarization row needs
+    both a text and a summary, so one with a missing summary is replaced like
+    one with empty text."""
     groups, total = _groups(files)
     columns = [record.text_column] + ([record.label_column] if record.label_column else [])
     names = [_label_names(f, record.label_column) if record.label_column else None for f in files]
+    needs_summary = record.task_type == "summarization" and record.label_column is not None
 
     want = min(record.sample_size, total)
     kept, seen = [], set()
     while len(kept) < want and len(seen) < total:
         batch = _draw(rng, total, seen, want - len(kept))
         for _, values, f_index in _read(files, groups, batch, columns):
-            text = values[0]
-            if text is None or not str(text).strip():
+            if not _text(record.task_type, values[0]).strip():
+                continue
+            if needs_summary and _empty_label(values[1]):
                 continue
             kept.append((values, f_index))
     if not kept:
+        if needs_summary:
+            raise ImportFailed(
+                "no_usable_rows",
+                "None of the rows we read had both a text and a summary, so there is nothing to import.",
+            )
         raise ImportFailed("no_usable_rows", "None of the rows we read had any text, so there is nothing to import.")
-    return [_mapped(values, names[f_index]) for values, f_index in kept[:want]]
+    return [_mapped(values, names[f_index], record.task_type) for values, f_index in kept[:want]]
 
 
 def _sample_balanced(record, files, rng):
@@ -646,8 +727,7 @@ def _sample_balanced(record, files, rng):
         pending = {value: [] for value in pending}
         for row, values, f_index in _read(files, groups, sorted(rows), columns):
             value = row_label[row]
-            text = values[0]
-            if text is None or not str(text).strip():
+            if not _text(record.task_type, values[0]).strip():
                 replacement = take_spare(value)
                 if replacement is not None:
                     pending[value].append(replacement)
@@ -673,8 +753,7 @@ def _sample_balanced(record, files, rng):
                 if not batch:
                     break
                 for _, values, f_index in _read(files, groups, sorted(batch), columns):
-                    text = values[0]
-                    if text is None or not str(text).strip():
+                    if not _text(record.task_type, values[0]).strip():
                         continue
                     chosen.append((values, f_index))
                     topped = True
@@ -687,7 +766,7 @@ def _sample_balanced(record, files, rng):
     # Short of the size, or filled from other labels: either way the
     # proportions are not the ones asked for, and the note says so.
     rough = topped or len(chosen) < want
-    return [_mapped(values, names[f_index]) for values, f_index in chosen], (LABEL_ROUGH if rough else None)
+    return [_mapped(values, names[f_index], record.task_type) for values, f_index in chosen], (LABEL_ROUGH if rough else None)
 
 
 def _groups(files):
@@ -774,12 +853,35 @@ def _read(files, groups, rows, columns):
     return out
 
 
-def _mapped(values, names):
-    """A row as written for the host: text, then the label by name when it has one."""
-    text = str(values[0])
+def _text(task_type, value):
+    """A row's text as written: NER tokens joined, anything else as it is."""
+    if task_type in NER_TASKS:
+        return tokens_to_text(value)
+    return "" if value is None else str(value)
+
+
+def _numbered(tags):
+    """Whether a tag list holds numbers, which only names can turn into types."""
+    if isinstance(tags, int) and not isinstance(tags, bool):
+        return True
+    return isinstance(tags, (list, tuple)) and any(
+        isinstance(tag, int) and not isinstance(tag, bool) for tag in tags
+    )
+
+
+def _mapped(values, names, task_type="classification"):
+    """A row as written for the host: text, then the label by name when it has one.
+
+    NER tags become the row's distinct entity types; numbered tags with no
+    names cannot, so the import says that rather than writing nonsense."""
+    text = _text(task_type, values[0])
     if len(values) == 1:
         return [text]
     label = values[1]
+    if task_type in NER_TASKS:
+        if _numbered(label) and not names:
+            raise ImportFailed("no_entity_names", NO_ENTITY_NAMES)
+        return [text, entity_types(label, names)]
     if names and isinstance(label, int) and 0 <= label < len(names):
         label = names[label]
     return [text, "" if label is None else str(label)]
@@ -787,7 +889,7 @@ def _mapped(values, names):
 
 def _write_csv(path, record, rows):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    header = ["text", "label"] if record.label_column else ["text"]
+    header = ["text", LABEL_HEADERS.get(record.task_type, "label")] if record.label_column else ["text"]
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(header)

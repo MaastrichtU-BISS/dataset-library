@@ -316,5 +316,55 @@
     ]
    }
   }
+ },
+ "coastalcph/legal_ner": {
+  "status": 200,
+  "body": {
+   "id": "coastalcph/legal_ner",
+   "author": "coastalcph",
+   "sha": "0e1f2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b",
+   "lastModified": "2025-05-01T10:00:00.000Z",
+   "private": false,
+   "gated": false,
+   "disabled": false,
+   "tags": [
+    "task_categories:token-classification",
+    "language:en",
+    "license:cc-by-4.0",
+    "size_categories:n<1K"
+   ],
+   "downloads": 12,
+   "likes": 1,
+   "description": "A small fixture of legal text with names and organisations tagged.",
+   "cardData": {
+    "pretty_name": "Legal NER",
+    "license": "cc-by-4.0"
+   }
+  }
+ },
+ "coastalcph/legal_summaries": {
+  "status": 200,
+  "body": {
+   "id": "coastalcph/legal_summaries",
+   "author": "coastalcph",
+   "sha": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+   "lastModified": "2025-06-01T10:00:00.000Z",
+   "private": false,
+   "gated": false,
+   "disabled": false,
+   "tags": [
+    "task_categories:summarization",
+    "language:en",
+    "license:cc-by-4.0",
+    "size_categories:n<1K"
+   ],
+   "downloads": 8,
+   "likes": 0,
+   "description": "A small fixture of judgments and their summaries.",
+   "cardData": {
+    "pretty_name": "Legal Summaries",
+    "license": "cc-by-4.0"
+   }
+  }
  }
 }

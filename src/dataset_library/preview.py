@@ -1,5 +1,6 @@
 """One dataset, opened from the library: its facts, configs and first rows."""
 import json
+import re
 
 from . import labels as labels_module
 from . import policy as policy_module
@@ -9,6 +10,28 @@ from .providers import huggingface, viewer
 CACHE_SECONDS = 600
 ROWS = 8
 CELL_CHARACTERS = 400
+# Names that say which column is which, before falling back to the types.
+NER_TEXT_COLUMNS = ("tokens", "words")
+# Tag columns in the order a label is chosen. The first two say NER by name;
+# the generic ones must show it (see `_entity_tags`).
+NER_LABEL_COLUMNS = ("ner_tags", "ner", "tags", "labels", "label")
+NER_NAMED_COLUMNS = ("ner_tags", "ner")
+GENERIC_TAG_COLUMNS = ("tags", "labels", "label")
+# Tag columns that are BIO but not entities: chunks, parts of speech.
+NOT_ENTITY_WORDS = ("chunk", "pos")
+# Source columns by name only: guessing by length once took metadata (a
+# `split` column, a title) as the document.
+SUMMARY_TEXT_COLUMNS = (
+    "document", "article", "text", "dialogue", "source", "input",
+    "report", "description", "content", "body",
+)
+# Only names that say "summary": generic `target`/`output` also hold code,
+# answers and translations.
+SUMMARY_LABEL_COLUMNS = ("summary", "highlights", "abstract")
+LIST_TYPES = ("Sequence", "List", "LargeList")
+# A BIO-style tag: a position letter, a separator, then the entity type.
+_BIO = re.compile(r"^[BIESLU][-_].")
+INTEGER_DTYPES = ("int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64")
 
 
 class NotInLibrary(Exception):
@@ -71,7 +94,11 @@ def _build(host, external_id, config, split):
     policy = policy_module.overrides(host.db)
     if policy_module.level(LICENSES.get(card["license"], UNKNOWN), policy) == "hide":
         raise LicenseHidden()
-    body = {**card, "preview": "unavailable", "configs": [], "config": None, "split": None, "columns": [], "rows": [], "rowCount": None}
+    body = {
+        **card,
+        "preview": "unavailable", "configs": [], "config": None, "split": None,
+        "columns": [], "rows": [], "rowCount": None, "proposed": _no_proposal(),
+    }
     body["labels"] = labels_module.for_ids(host.cache, [external_id])[external_id]
     try:
         configs = _configs(viewer.get("splits", dataset=external_id))
@@ -94,14 +121,133 @@ def _build(host, external_id, config, split):
         rows = viewer.get("first-rows", dataset=external_id, config=chosen["name"], split=split)
     except viewer.ViewerUnavailable:
         return body
-    features = rows.get("features") or []
+    features = [f for f in rows.get("features") or [] if isinstance(f, dict) and isinstance(f.get("name"), str)]
     body["columns"] = [{"name": f["name"], "type": _type(f.get("type"))} for f in features]
     body["rows"] = [
-        [_cell(r.get("row", {}).get(f["name"]), f.get("type")) for f in features]
+        [_cell((r.get("row") or {}).get(f["name"]), f.get("type")) for f in features]
         for r in (rows.get("rows") or [])[:ROWS]
     ]
     body["preview"] = "ok" if body["rows"] else "unavailable"
+    if body["preview"] == "ok":
+        body["proposed"] = _propose(card["tasks"], features, rows.get("rows") or [])
     return body
+
+
+def _no_proposal():
+    return {"taskType": None, "textColumn": None, "labelColumn": None}
+
+
+def _propose(tasks, features, rows):
+    """What the import's column step starts with: the task's usual columns
+    when the viewer shows a pair that fits, and nothing when it cannot tell."""
+    named = [(f["name"], f.get("type")) for f in features if isinstance(f, dict) and isinstance(f.get("name"), str)]
+    if "ner" in tasks:
+        text, label = _ner_columns(named, rows)
+        if text is not None and label is not None:
+            return {"taskType": "ner", "textColumn": text, "labelColumn": label}
+    if "summarization" in tasks:
+        label = _first_text(named, SUMMARY_LABEL_COLUMNS)
+        text = _first_text(named, SUMMARY_TEXT_COLUMNS, exclude=label)
+        if text is not None and label is not None and text != label:
+            return {"taskType": "summarization", "textColumn": text, "labelColumn": label}
+    return _no_proposal()
+
+
+def _ner_columns(named, rows):
+    """The `tokens`/`words` column and an entity tag column, or (None, None).
+
+    Hugging Face tags part-of-speech, chunking and parsing configs as token
+    classification too, so a tag column has to show it holds entities (see
+    `_entity_tags`), and the text is only ever a token column: guessing from
+    other string lists picked annotations as the text."""
+    lists = {name: _list_inner(type_) for name, type_ in named if _is_list(type_)}
+    text = next((name for name in NER_TEXT_COLUMNS if _is_text(lists.get(name))), None)
+    if text is None:
+        return None, None
+    tags = [
+        name for name, inner in lists.items()
+        if name not in NER_TEXT_COLUMNS and _is_tag(inner) and _entity_tags(name, inner, rows)
+    ]
+    order = [name for name in NER_LABEL_COLUMNS if name in tags]
+    order += [name for name in tags if name.endswith("tags") and name not in order]
+    order += [name for name in tags if name not in order]
+    return (text, order[0]) if order else (None, None)
+
+
+def _entity_tags(name, feature, rows):
+    """Whether a flat tag column holds entity tags.
+
+    `ner_tags` and `ner` say so by name. Otherwise class names, or the tags in
+    the first rows, must all be `O` or BIO with at least one BIO tag; numbered
+    tags without names (tner) count only under a generic name, so their import
+    can say it cannot read the entity names. Chunk and part-of-speech columns
+    never count."""
+    lowered = name.lower()
+    if any(word in lowered for word in NOT_ENTITY_WORDS):
+        return False
+    if name in NER_NAMED_COLUMNS:
+        return True
+    if _is_class_label(feature):
+        return _all_bio(feature.get("names") or [])
+    if _is_integer(feature):
+        return name in GENERIC_TAG_COLUMNS
+    values = [tag for row in rows if isinstance((cell := (row.get("row") or {}).get(name)), list) for tag in cell]
+    return _all_bio(values)
+
+
+def _all_bio(values):
+    tags = [value for value in values if isinstance(value, str) and value.strip()]
+    return any(_BIO.match(tag) for tag in tags) and all(tag == "O" or _BIO.match(tag) for tag in tags)
+
+
+def _first_text(named, preferred, exclude=None):
+    """The first plain text column among `preferred` names, in that order."""
+    types = dict(named)
+    for name in preferred:
+        type_ = types.get(name)
+        if name != exclude and not _is_list(type_) and _is_text(type_):
+            return name
+    return None
+
+
+def _is_list(feature):
+    return isinstance(feature, list) or (isinstance(feature, dict) and feature.get("_type") in LIST_TYPES)
+
+
+def _list_inner(feature):
+    """The element type of a list feature; a bare list is a list of one. A list
+    of lists stays a list, which no text or tag check accepts."""
+    if isinstance(feature, list):
+        return feature[0] if feature else None
+    return feature.get("feature") if isinstance(feature, dict) else None
+
+
+def _is_text(feature):
+    if isinstance(feature, str):
+        return feature in ("string", "large_string")
+    return (
+        isinstance(feature, dict)
+        and feature.get("_type") == "Value"
+        and feature.get("dtype") in ("string", "large_string")
+    )
+
+
+def _is_integer(feature):
+    return (
+        isinstance(feature, dict)
+        and feature.get("_type") == "Value"
+        and feature.get("dtype") in INTEGER_DTYPES
+    )
+
+
+def _is_tag(feature):
+    """A flat tag: a ClassLabel, a plain tag string, or a numbered tag."""
+    return _is_text(feature) or _is_integer(feature) or _is_class_label(feature)
+
+
+def _is_class_label(feature):
+    """A ClassLabel itself, not one nested in further lists."""
+    return isinstance(feature, dict) and feature.get("_type") == "ClassLabel"
 
 
 def _row_count(external_id, config, split):
