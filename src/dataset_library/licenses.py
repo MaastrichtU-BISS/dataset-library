@@ -20,6 +20,7 @@ _ND_CONDITION = (
     "so keep this dataset and its labels private."
 )
 _ND_ACK = "I will keep my copy and any labels I add private, and not share or publish them."
+_DEFAULT_ACK = "I have read the {name} license and will follow its terms."
 _SA_CONDITION = "If you share anything made from this data, you must share it under the same license."
 
 
@@ -44,6 +45,15 @@ class License:
 
     def to_dict(self):
         return {**asdict(self), "level": self.level}
+
+    def at_level(self, level):
+        """The license as this platform applies it. An admin can set a license
+        with no condition of its own to warn; it then still gets words to
+        confirm, so the student never ticks an empty checkbox."""
+        body = {**asdict(self), "level": level}
+        if level == "warn" and not self.ack:
+            body["ack"] = _DEFAULT_ACK.format(name=self.name)
+        return body
 
 
 def _cc(id_, name, path, short, nc=False, nd=False, sa=False):

@@ -53,7 +53,7 @@ def _apply_library_rules(host, body):
     level = policy_module.level(license, policy)
     if level == "hide":
         raise LicenseHidden()
-    return {**body, "license": {**license.to_dict(), "level": level}}
+    return {**body, "license": license.at_level(level)}
 
 
 def _build(host, external_id, config, split):

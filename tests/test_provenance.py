@@ -115,3 +115,17 @@ def test_provenance_reports_the_platforms_current_license_level(app, tmp_path):
     body = app.test_client().get("/api/library/provenance/dataset-1", headers=ALICE).get_json()
 
     assert body["license"]["level"] == "warn"
+
+
+def test_a_license_set_to_warn_without_its_own_words_gets_the_default_in_provenance(app, tmp_path):
+    from dataset_library.models import LibrarySettings
+
+    complete(app, tmp_path, license="mit", license_ack_at=datetime(2026, 1, 2, 3, 4, 5))
+    with app.app_context():
+        app.db.session.add(LibrarySettings(id=1, license_policy={"mit": "warn"}))
+        app.db.session.commit()
+
+    body = app.test_client().get("/api/library/provenance/dataset-1", headers=ALICE).get_json()
+
+    assert body["license"]["level"] == "warn"
+    assert body["license"]["ack"] == "I have read the MIT license and will follow its terms."

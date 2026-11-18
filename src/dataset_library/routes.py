@@ -73,7 +73,7 @@ def options():
     for license in LICENSES.values():
         level = policy_module.level(license, policy)
         if level != "hide":
-            licenses.append({**license.to_dict(), "level": level})
+            licenses.append(license.at_level(level))
     return jsonify(
         {
             "tasks": [

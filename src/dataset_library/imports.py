@@ -229,7 +229,7 @@ def provenance(host, owner_id, dataset_ref):
         "url": record.url,
         "importedAt": _iso(record.imported_at),
         "licenseAckAt": _iso(record.license_ack_at),
-        "license": {**license.to_dict(), "level": level},
+        "license": license.at_level(level),
     }
 
 

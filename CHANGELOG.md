@@ -28,6 +28,13 @@ While the version is 0.x, minor releases may contain breaking changes.
 - Importing a dataset its owner keeps private on Hugging Face is refused with
   409 `private` when the Hub's answer says it is private; an anonymous
   401/404 is treated as `not_found`.
+- A license only records a confirmation time when it is set to warn, and a
+  retried import keeps the time the student first confirmed.
+- The enabled sources and hidden licenses are checked before anything is asked
+  of the Hub or the viewer, so no answer reveals a dataset outside the library.
+- A license an admin sets to warn that has no confirmation words of its own
+  gets "I have read the <name> license and will follow its terms." wherever
+  the license is sent with its level (`License.at_level`).
 
 ## [0.6.0] - 2026-11-18
 
