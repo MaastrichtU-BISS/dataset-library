@@ -32,6 +32,7 @@ from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.orm.exc import ObjectDeletedError
 
 from .errors import ProviderError
+from .licenses import LICENSES, UNKNOWN
 from .models import LibraryImport
 
 logger = logging.getLogger("dataset_library")
@@ -93,7 +94,7 @@ def start(host, owner_id, body):
     ``body.revision``, when given, is the revision the student saw; an import
     of anything newer is refused."""
     from . import preview as preview_module
-    from .providers.huggingface import DATASET_ID_PATTERN
+    from .providers.huggingface import DATASET_ID_PATTERN, PrivateDataset
 
     external_id = body.get("dataset")
     if not isinstance(external_id, str) or not DATASET_ID_PATTERN.match(external_id):
@@ -110,8 +111,12 @@ def start(host, owner_id, body):
         raise Refused(400, "bad_size", "Say how many rows to import, as a whole number above 0.")
     try:
         dataset = preview_module.preview(host, external_id, body.get("config") or None, body.get("split") or None)
+    except preview_module.LicenseHidden:
+        raise Refused(403, "license_hidden", "This dataset's license is not allowed on this platform, so it cannot be imported.")
     except preview_module.NotInLibrary:
         raise Refused(404, "not_found", "That dataset is not in the library.")
+    except PrivateDataset:
+        raise Refused(409, "private", "Its owner keeps this dataset private on Hugging Face, so it cannot be imported.")
     except preview_module.UnknownConfig:
         raise Refused(400, "bad_config", "That dataset has no such configuration or split.")
     if dataset["gated"]:
@@ -189,6 +194,36 @@ def get(host, owner_id, import_ref):
 def for_owner(host, owner_id):
     found = host.db.session.query(LibraryImport).filter_by(owner_id=owner_id).order_by(LibraryImport.created_at.desc())
     return [record.to_dict() for record in found]
+
+
+def provenance(host, owner_id, dataset_ref):
+    """The most recent completed import that made this Dataset, as its
+    provenance: where it came from, under which license, and when the student
+    confirmed that license. None when this owner has no such import. Reads the
+    database only, so it works without an import queue."""
+    record = (
+        host.db.session.query(LibraryImport)
+        .filter_by(owner_id=owner_id, dataset_ref=dataset_ref, status=COMPLETED)
+        .order_by(sa.func.coalesce(LibraryImport.imported_at, LibraryImport.created_at).desc())
+        .first()
+    )
+    if record is None:
+        return None
+    return {
+        "provider": record.provider,
+        "externalId": record.external_id,
+        "config": record.config,
+        "split": record.split,
+        "revision": record.revision,
+        "url": record.url,
+        "importedAt": _iso(record.imported_at),
+        "licenseAckAt": _iso(record.license_ack_at),
+        "license": LICENSES.get(record.license, UNKNOWN).to_dict(),
+    }
+
+
+def _iso(value):
+    return value.isoformat() + "Z" if value else None
 
 
 def current(host, owner_id, now=None):

@@ -49,3 +49,14 @@ def test_flags_and_default_levels():
     assert not (by.nc or by.nd or by.sa or by.unknown) and by.level == "allow"
     assert by.group == "Open"
     assert by.url == "https://creativecommons.org/licenses/by/4.0/"
+
+
+def test_every_license_defaults_to_warn_exactly_when_it_has_a_condition():
+    from dataset_library.licenses import LICENSES
+
+    for license in LICENSES.values():
+        expected = "warn" if (license.nc or license.nd or license.unknown) else "allow"
+        assert license.level == expected, license.id
+    assert any(license.nd for license in LICENSES.values())
+    assert any(license.nc for license in LICENSES.values())
+    assert any(license.unknown for license in LICENSES.values())

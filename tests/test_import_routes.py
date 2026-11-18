@@ -85,7 +85,37 @@ def test_a_license_set_to_warn_needs_the_students_confirmation(make_app, queue):
     refused = start(client, status=409)
     assert refused["code"] == "needs_ack"
     assert queue.refs == []
-    assert start(client, licenseAck=True)["status"] == "queued"
+    started = start(client, licenseAck=True)
+    assert started["status"] == "queued"
+    from dataset_library.models import LibraryImport
+
+    with app.app_context():
+        assert app.db.session.get(LibraryImport, started["id"]).license_ack_at is not None
+
+
+def test_a_hidden_license_is_refused_but_the_preview_still_says_not_found(make_app, queue):
+    app = make_app(enqueue=queue, max_rows=lambda: 300)
+    from dataset_library.models import LibrarySettings
+
+    with app.app_context():
+        app.db.session.add(LibrarySettings(id=1, license_policy={"cc-by-4.0": "hide"}))
+        app.db.session.commit()
+    client = app.test_client()
+
+    refused = start(client, status=403)
+    assert refused["code"] == "license_hidden"
+    assert refused["error"] == "This dataset's license is not allowed on this platform, so it cannot be imported."
+    assert queue.refs == []
+    assert client.get("/api/library/datasets/huggingface/coastalcph/lex_glue", headers=ALICE).status_code == 404
+
+
+def test_a_private_dataset_is_refused_with_its_reason(client, queue):
+    refused = start(client, status=409, dataset="private-law/restricted_corpus", config=None, split=None)
+
+    assert refused["code"] == "private"
+    assert refused["error"] == "Its owner keeps this dataset private on Hugging Face, so it cannot be imported."
+    assert queue.refs == []
+    assert client.get("/api/library/datasets/huggingface/private-law/restricted_corpus", headers=ALICE).status_code == 404
 
 
 @pytest.mark.parametrize(

@@ -264,5 +264,31 @@
     ]
    }
   }
+ },
+ "private-law/restricted_corpus": {
+  "status": 200,
+  "body": {
+   "id": "private-law/restricted_corpus",
+   "author": "private-law",
+   "sha": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+   "lastModified": "2026-02-01T09:00:00.000Z",
+   "private": true,
+   "gated": false,
+   "disabled": false,
+   "tags": [
+    "task_categories:text-classification",
+    "language:en",
+    "license:cc-by-4.0"
+   ],
+   "downloads": 0,
+   "likes": 0,
+   "description": "A private legal corpus.",
+   "cardData": {
+    "pretty_name": "Restricted Corpus",
+    "license": [
+     "cc-by-4.0"
+    ]
+   }
+  }
  }
 }

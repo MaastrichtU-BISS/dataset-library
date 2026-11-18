@@ -15,6 +15,11 @@ class NotInLibrary(Exception):
     pass
 
 
+class LicenseHidden(NotInLibrary):
+    """The admin set this license to hide, so the dataset may not enter the
+    library at all; the import route says so rather than "not found"."""
+
+
 class UnknownConfig(Exception):
     pass
 
@@ -39,7 +44,7 @@ def _apply_library_rules(host, body):
     license = LICENSES.get(body["license"], UNKNOWN)
     level = policy_module.level(license, policy)
     if level == "hide":
-        raise NotInLibrary()
+        raise LicenseHidden()
     return {**body, "license": {**license.to_dict(), "level": level}}
 
 

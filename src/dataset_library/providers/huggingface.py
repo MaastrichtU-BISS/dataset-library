@@ -22,6 +22,11 @@ SIZE = {"n<1K": (0, 1_000)}
 _SUFFIX = {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000, "T": 1_000_000_000_000}
 
 
+class PrivateDataset(Exception):
+    """The Hub knows the dataset, but its owner keeps it private: it can still
+    be told apart from one nobody has, so the import can say why."""
+
+
 def search(query, task, license_id, authors, task_types):
     """Matching datasets as library cards. `authors` limits the search to those
     organisations (one Hub call each); empty searches the whole Hub."""
@@ -69,7 +74,11 @@ def dataset(external_id, task_types):
         record = response.json()
     except ValueError as exc:
         raise ProviderUnavailable("Unreadable answer") from exc
-    if not isinstance(record, dict) or record.get("private") or record.get("disabled"):
+    if not isinstance(record, dict):
+        return None
+    if record.get("private"):
+        raise PrivateDataset()
+    if record.get("disabled"):
         return None
     return _card(record, task_types)
 
