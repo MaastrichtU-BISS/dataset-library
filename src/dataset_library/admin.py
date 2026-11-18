@@ -21,7 +21,7 @@ def current(db, host):
     return {
         "sources": [s.to_dict() for s in sources],
         "licenses": [
-            {**lic.to_dict(), "default": lic.level, "level": level(lic, policy)} for lic in LICENSES.values()
+            {**lic.at_level(level(lic, policy)), "default": lic.level} for lic in LICENSES.values()
         ],
         "limits": {
             "maxRows": settings.max_rows if settings else None,

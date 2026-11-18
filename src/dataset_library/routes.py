@@ -9,7 +9,7 @@ from . import preview as preview_module
 from .errors import ProviderRateLimited, ProviderUnavailable
 from . import search as search_module
 from .licenses import GROUPS, LICENSES
-from .providers.huggingface import DATASET_ID_PATTERN
+from .providers.huggingface import DATASET_ID_PATTERN, PrivateDataset
 from .tasks import hugging_face_filter
 
 library_bp = Blueprint("dataset_library", __name__)
@@ -73,7 +73,7 @@ def options():
     for license in LICENSES.values():
         level = policy_module.level(license, policy)
         if level != "hide":
-            licenses.append({**license.to_dict(), "level": level})
+            licenses.append(license.at_level(level))
     return jsonify(
         {
             "tasks": [
@@ -132,7 +132,7 @@ def dataset(dataset_ref):
                 _host(), dataset_ref, request.args.get("config") or None, request.args.get("split") or None
             )
         )
-    except preview_module.NotInLibrary:
+    except (preview_module.NotInLibrary, PrivateDataset):
         raise ApiError(404, "That dataset is not in the library.", "not_found")
     except preview_module.UnknownConfig:
         raise ApiError(400, "That dataset has no such configuration or split.", "bad_config")
@@ -140,6 +140,17 @@ def dataset(dataset_ref):
         raise ApiError(503, "Hugging Face is limiting requests. Try again in a few minutes.", "provider_rate_limited")
     except ProviderUnavailable:
         raise ApiError(503, "Hugging Face is unavailable right now. Try again in a few minutes.", "provider_unavailable")
+
+
+@library_bp.route("/provenance/<dataset_ref>", methods=["GET"])
+def provenance(dataset_ref):
+    """Where a Dataset the signed-in user imported came from, under which
+    license, and when the student confirmed it. Reads the database only, so it
+    works without an import queue; 404 when this user has no such import."""
+    record = imports_module.provenance(_host(), _host().current_owner(), dataset_ref)
+    if record is None:
+        raise ApiError(404, "No such import.", "not_found")
+    return jsonify(record)
 
 
 def _require_admin():

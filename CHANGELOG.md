@@ -8,6 +8,35 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-18
+
+### Added
+
+- Provenance for an imported Dataset (BAIGLE #116).
+  - `GET /api/library/provenance/<dataset_ref>` returns the signed-in owner's
+    most recent completed import of that Dataset: `provider`, `externalId`,
+    `config`, `split`, `revision`, `url`, `importedAt`, `licenseAckAt` and the
+    stored `license` from the license table, with its current platform level
+    (an admin may have changed it since the import); 404 when there is none. It
+    reads the database only, so it works without an import queue.
+  - `LibraryImport.to_dict()` carries `licenseAckAt`.
+
+### Changed
+
+- Importing a dataset whose license an admin set to `hide` is refused with
+  403 `license_hidden`; the preview route still answers 404.
+- Importing a dataset its owner keeps private on Hugging Face is refused with
+  409 `private` when the Hub's answer says it is private; an anonymous
+  401/404 is treated as `not_found`.
+- A license only records a confirmation time when it is set to warn, and a
+  retried import keeps the time the student first confirmed.
+- The requested dataset's source is checked before the Hub is asked, and the
+  owner and license the Hub returns are checked before the viewer is asked,
+  so no answer reveals a dataset outside the library.
+- A license an admin sets to warn that has no confirmation words of its own
+  gets "I have read the <name> license and will follow its terms." wherever
+  the license is sent with its level (`License.at_level`).
+
 ## [0.6.0] - 2026-11-18
 
 ### Added

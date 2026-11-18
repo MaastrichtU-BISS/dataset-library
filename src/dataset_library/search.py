@@ -73,7 +73,7 @@ def _apply_policy(cards, policy, license_id):
         card_level = policy_module.level(license, policy)
         if card_level == "hide":
             continue
-        results.append({**card, "license": {**license.to_dict(), "level": card_level}})
+        results.append({**card, "license": license.at_level(card_level)})
     return results
 
 

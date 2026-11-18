@@ -15,11 +15,24 @@ class NotInLibrary(Exception):
     pass
 
 
+class LicenseHidden(NotInLibrary):
+    """The admin set this license to hide, so the dataset may not enter the
+    library at all; the import route says so rather than "not found"."""
+
+
 class UnknownConfig(Exception):
     pass
 
 
 def preview(host, external_id, config=None, split=None):
+    """One dataset's preview. The library's own rules come first: a dataset
+    outside the enabled sources never reaches the Hub or the cache, so its
+    cards and viewer answers are not fetched and no refusal reveals it."""
+    from .search import enabled_sources
+
+    sources = {source.ref for source in enabled_sources(host.db)}
+    if sources and external_id.split("/", 1)[0] not in sources:
+        raise NotInLibrary()
     key = f"library:preview:{external_id}:{config or ''}:{split or ''}"
     body = host.cache.get(key)
     if body is None:
@@ -39,14 +52,25 @@ def _apply_library_rules(host, body):
     license = LICENSES.get(body["license"], UNKNOWN)
     level = policy_module.level(license, policy)
     if level == "hide":
-        raise NotInLibrary()
-    return {**body, "license": {**license.to_dict(), "level": level}}
+        raise LicenseHidden()
+    return {**body, "license": license.at_level(level)}
 
 
 def _build(host, external_id, config, split):
     card = huggingface.dataset(external_id, host.task_types)
     if card is None:
         raise NotInLibrary()
+    # The Hub may answer with a renamed dataset under another owner: check the
+    # owner it names, then the license, before asking the viewer or checking
+    # configs, so neither leaks a dataset outside the library.
+    from .search import enabled_sources
+
+    sources = {source.ref for source in enabled_sources(host.db)}
+    if sources and card["author"] not in sources:
+        raise NotInLibrary()
+    policy = policy_module.overrides(host.db)
+    if policy_module.level(LICENSES.get(card["license"], UNKNOWN), policy) == "hide":
+        raise LicenseHidden()
     body = {**card, "preview": "unavailable", "configs": [], "config": None, "split": None, "columns": [], "rows": [], "rowCount": None}
     body["labels"] = labels_module.for_ids(host.cache, [external_id])[external_id]
     try:

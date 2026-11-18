@@ -49,3 +49,27 @@ def test_flags_and_default_levels():
     assert not (by.nc or by.nd or by.sa or by.unknown) and by.level == "allow"
     assert by.group == "Open"
     assert by.url == "https://creativecommons.org/licenses/by/4.0/"
+
+
+def test_every_license_defaults_to_warn_exactly_when_it_is_nc_nd_or_unknown():
+    from dataset_library.licenses import LICENSES
+
+    for license in LICENSES.values():
+        expected = "warn" if (license.nc or license.nd or license.unknown) else "allow"
+        assert license.level == expected, license.id
+    assert LICENSES["cc-by-nc-4.0"].level == "warn"
+    assert LICENSES["cc-by-sa-4.0"].level == "allow"
+    assert any(license.nd for license in LICENSES.values())
+    assert any(license.nc for license in LICENSES.values())
+    assert any(license.unknown for license in LICENSES.values())
+
+
+def test_a_license_an_admin_sets_to_warn_always_has_words_to_confirm():
+    from dataset_library.licenses import LICENSES
+
+    mit = LICENSES["mit"].at_level("warn")
+    assert mit["level"] == "warn"
+    assert mit["ack"] == "I have read the MIT license and will follow its terms."
+    assert LICENSES["mit"].at_level("allow")["ack"] is None
+    nd = LICENSES["cc-by-nd-4.0"]
+    assert nd.at_level("warn")["ack"] == nd.ack

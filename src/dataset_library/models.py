@@ -98,6 +98,7 @@ class LibraryImport(LibraryBase):
             "revision": self.revision,
             "url": self.url,
             "license": self.license,
+            "licenseAckAt": self.license_ack_at.isoformat() + "Z" if self.license_ack_at else None,
             "name": self.name,
             "taskType": self.task_type,
             "textColumn": self.text_column,

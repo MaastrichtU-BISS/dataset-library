@@ -85,7 +85,140 @@ def test_a_license_set_to_warn_needs_the_students_confirmation(make_app, queue):
     refused = start(client, status=409)
     assert refused["code"] == "needs_ack"
     assert queue.refs == []
-    assert start(client, licenseAck=True)["status"] == "queued"
+    started = start(client, licenseAck=True)
+    assert started["status"] == "queued"
+    from dataset_library.models import LibraryImport
+
+    with app.app_context():
+        assert app.db.session.get(LibraryImport, started["id"]).license_ack_at is not None
+
+
+def test_a_hidden_license_is_refused_but_the_preview_still_says_not_found(make_app, queue):
+    app = make_app(enqueue=queue, max_rows=lambda: 300)
+    from dataset_library.models import LibrarySettings
+
+    with app.app_context():
+        app.db.session.add(LibrarySettings(id=1, license_policy={"cc-by-4.0": "hide"}))
+        app.db.session.commit()
+    client = app.test_client()
+
+    refused = start(client, status=403)
+    assert refused["code"] == "license_hidden"
+    assert refused["error"] == "This dataset's license is not allowed on this platform, so it cannot be imported."
+    assert queue.refs == []
+    assert client.get("/api/library/datasets/huggingface/coastalcph/lex_glue", headers=ALICE).status_code == 404
+
+
+def test_a_hidden_license_is_refused_before_the_config_is_checked(make_app, queue):
+    app = make_app(enqueue=queue, max_rows=lambda: 300)
+    from dataset_library.models import LibrarySettings
+
+    with app.app_context():
+        app.db.session.add(LibrarySettings(id=1, license_policy={"cc-by-4.0": "hide"}))
+        app.db.session.commit()
+    client = app.test_client()
+
+    refused = start(client, status=403, config="no-such-config")
+    assert refused["code"] == "license_hidden"
+    assert queue.refs == []
+
+    preview = client.get(
+        "/api/library/datasets/huggingface/coastalcph/lex_glue?config=no-such-config", headers=ALICE
+    )
+    assert preview.status_code == 404
+    assert preview.get_json()["code"] == "not_found"
+
+
+def test_an_allow_license_stores_no_confirmation_time_even_when_acknowledged(client):
+    from dataset_library.models import LibraryImport
+
+    started = start(client, licenseAck=True)
+
+    with client.application.app_context():
+        assert client.application.db.session.get(LibraryImport, started["id"]).license_ack_at is None
+
+
+@pytest.mark.parametrize("ending", ["failed", "cancelled"])
+def test_a_retry_keeps_when_the_student_first_confirmed_the_license(make_app, queue, ending):
+    from datetime import datetime
+
+    from dataset_library.models import LibraryImport, LibrarySettings
+
+    app = make_app(enqueue=queue, max_rows=lambda: 300)
+    with app.app_context():
+        app.db.session.add(LibrarySettings(id=1, license_policy={"cc-by-4.0": "warn"}))
+        app.db.session.commit()
+    client = app.test_client()
+    started = start(client, licenseAck=True)
+    confirmed = datetime(2026, 1, 2, 3, 4, 5)
+    with app.app_context():
+        session = app.db.session
+        record = session.get(LibraryImport, started["id"])
+        record.license_ack_at = confirmed
+        record.status = ending
+        session.commit()
+
+    retried = client.post(f"/api/library/imports/{started['id']}/retry", headers=ALICE)
+
+    assert retried.status_code == 202, retried.get_json()
+    with app.app_context():
+        again = app.db.session.get(LibraryImport, retried.get_json()["id"])
+        assert again.license_ack_at == confirmed
+
+
+def test_try_again_after_a_license_turns_to_warn_asks_for_confirmation(make_app, queue):
+    from dataset_library.models import LibraryImport, LibrarySettings
+
+    app = make_app(enqueue=queue, max_rows=lambda: 300)
+    client = app.test_client()
+    started = start(client)
+    with app.app_context():
+        session = app.db.session
+        session.get(LibraryImport, started["id"]).status = "failed"
+        session.add(LibrarySettings(id=1, license_policy={"cc-by-4.0": "warn"}))
+        session.commit()
+
+    refused = client.post(f"/api/library/imports/{started['id']}/retry", headers=ALICE)
+
+    assert refused.status_code == 409
+    assert refused.get_json()["code"] == "needs_ack"
+    assert queue.refs == [started["id"]]
+
+
+# The Hub only says `private: true` to an authenticated request. This fixture is
+# that answer; an anonymous request for a private dataset gets 401/404, the same
+# as a missing one, and is reported as `not_found`.
+def test_a_private_dataset_is_refused_with_its_reason(client, queue):
+    refused = start(client, status=409, dataset="private-law/restricted_corpus", config=None, split=None)
+
+    assert refused["code"] == "private"
+    assert refused["error"] == "Its owner keeps this dataset private on Hugging Face, so it cannot be imported."
+    assert queue.refs == []
+    assert client.get("/api/library/datasets/huggingface/private-law/restricted_corpus", headers=ALICE).status_code == 404
+
+
+def test_a_private_dataset_outside_the_enabled_sources_is_just_not_found(make_app, queue):
+    from dataset_library.models import LibrarySource
+
+    app = make_app(enqueue=queue, max_rows=lambda: 300)
+    with app.app_context():
+        app.db.session.add(LibrarySource(provider="huggingface", kind="org", ref="coastalcph"))
+        app.db.session.commit()
+    client = app.test_client()
+
+    refused = start(client, status=404, dataset="private-law/restricted_corpus", config=None, split=None)
+
+    assert refused["code"] == "not_found"
+    assert queue.refs == []
+
+
+def test_a_hub_401_for_a_dataset_is_reported_as_not_found(client, queue, hub):
+    hub.fail = 401
+
+    refused = start(client, status=404)
+
+    assert refused["code"] == "not_found"
+    assert queue.refs == []
 
 
 @pytest.mark.parametrize(
@@ -250,3 +383,45 @@ def test_a_running_import_is_cancelled_before_it_is_put_away(client):
 
     assert refused.status_code == 409
     assert refused.get_json()["code"] == "running"
+
+
+def test_a_retry_keeps_the_confirmation_after_the_license_turns_to_allow(make_app, queue):
+    from datetime import datetime
+
+    from dataset_library.models import LibraryImport, LibrarySettings
+
+    app = make_app(enqueue=queue, max_rows=lambda: 300)
+    with app.app_context():
+        app.db.session.add(LibrarySettings(id=1, license_policy={"cc-by-4.0": "warn"}))
+        app.db.session.commit()
+    client = app.test_client()
+    started = start(client, licenseAck=True)
+    confirmed = datetime(2026, 1, 2, 3, 4, 5)
+    with app.app_context():
+        session = app.db.session
+        record = session.get(LibraryImport, started["id"])
+        record.license_ack_at, record.status = confirmed, "failed"
+        session.get(LibrarySettings, 1).license_policy = {}
+        session.commit()
+
+    retried = client.post(f"/api/library/imports/{started['id']}/retry", headers=ALICE)
+
+    assert retried.status_code == 202, retried.get_json()
+    with app.app_context():
+        assert app.db.session.get(LibraryImport, retried.get_json()["id"]).license_ack_at == confirmed
+
+
+def test_a_dataset_the_hub_moved_to_an_owner_outside_the_library_is_not_found(make_app, queue):
+    from dataset_library.models import LibrarySettings, LibrarySource
+
+    app = make_app(enqueue=queue, max_rows=lambda: 300)
+    with app.app_context():
+        app.db.session.add(LibrarySource(provider="huggingface", kind="org", ref="coastalcph"))
+        app.db.session.add(LibrarySettings(id=1, license_policy={"cc-by-4.0": "hide"}))
+        app.db.session.commit()
+    client = app.test_client()
+
+    refused = start(client, status=404, dataset="coastalcph/moved_corpus", config=None, split=None)
+
+    assert refused["code"] == "not_found"
+    assert queue.refs == []
