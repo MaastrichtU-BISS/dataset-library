@@ -59,6 +59,12 @@ LABEL_EMPTY = "The label column was empty, so this is a random sample instead of
 LABEL_LISTS = "The label column holds lists, so this is a random sample instead of a balanced one."
 LABEL_TOO_MANY = "This label column has too many different values to balance, so this is a random sample instead."
 LABEL_ROUGH = "Some labels had too few rows with text, so the sample is only roughly balanced."
+# An NER import whose tags never cover their words (sub-word tags, for example)
+# completes with every row left to annotate; the note says why.
+NER_UNTAGGED = (
+    "None of these rows had a tag for every word, so their entities were not "
+    "imported: mark them in the annotation queue."
+)
 # Only these tasks have one class per row, so only they can be balanced by label.
 BALANCEABLE = {"classification", "document_classification", "judgment_prediction"}
 # These tasks store a list of BIO tags per row, not one label.
@@ -584,8 +590,7 @@ def _not_flat(arrow_type):
 
     if pat.is_struct(arrow_type) or pat.is_map(arrow_type):
         return True
-    lists = pat.is_list(arrow_type) or pat.is_large_list(arrow_type) or pat.is_fixed_size_list(arrow_type)
-    return lists and pat.is_nested(arrow_type.value_type)
+    return _is_list(arrow_type) and pat.is_nested(arrow_type.value_type)
 
 
 def _is_list(arrow_type):
@@ -598,8 +603,7 @@ def _integer_list(arrow_type):
     """Whether an Arrow type is a list of integers."""
     import pyarrow.types as pat
 
-    lists = pat.is_list(arrow_type) or pat.is_large_list(arrow_type) or pat.is_fixed_size_list(arrow_type)
-    return lists and pat.is_integer(arrow_type.value_type)
+    return _is_list(arrow_type) and pat.is_integer(arrow_type.value_type)
 
 
 def _sample(record, paths, rng, open_parquet):
@@ -607,7 +611,8 @@ def _sample(record, paths, rng, open_parquet):
     on the label column when asked and it has labels.
 
     Returns the rows, the method used (``"stratified"`` or ``"random"``) and a
-    note when a balance was asked for but could not be kept."""
+    note when a balance was asked for but could not be kept, or when no NER
+    row had a tag for every word."""
     if open_parquet is None:
         import pyarrow.parquet as pq
 
@@ -624,7 +629,8 @@ def _sample(record, paths, rng, open_parquet):
         return rows, "random", note
     rows = _sample_random(record, files, rng)
     rng.shuffle(rows)
-    return rows, "random", None
+    untagged = record.task_type in NER_TASKS and record.label_column and all(row[1] == "" for row in rows)
+    return rows, "random", NER_UNTAGGED if untagged else None
 
 
 def _sample_random(record, files, rng):

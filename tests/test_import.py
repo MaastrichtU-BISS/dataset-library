@@ -786,6 +786,34 @@ def test_a_string_text_with_numbered_unnamed_tags_imports_blank_rather_than_fail
     assert _mapped(["John works", [1, 0]], None, "ner") == ["John works", ""]
 
 
+def test_a_string_text_shard_with_unnamed_numbered_tags_imports_with_blank_entities(run, tmp_path):
+    # The file-level no_entity_names check applies only to token lists.
+    path = tmp_path / "0000.parquet"
+    features = {
+        "text": {"dtype": "string", "_type": "Value"},
+        "tags": {"feature": {"dtype": "int64", "_type": "Value"}, "_type": "Sequence"},
+    }
+    table = pa.table({"text": ["John works", "Ada writes"], "tags": [[1, 0], [1, 0]]})
+    table = table.replace_schema_metadata({"huggingface": json.dumps({"info": {"features": features}})})
+    pq.write_table(table, path)
+
+    result, create = run([path], size=2, task_type="ner", text_column="text", label_column="tags")
+
+    assert result["status"] == "completed", result
+    assert all(row["entities"] == "" for row in create.calls[0]["rows"])
+
+
+def test_an_ner_import_with_no_fully_tagged_row_says_why_its_entities_are_blank(run, tmp_path):
+    # Sub-word tags: more tags than words in every row.
+    shard = write_ner_shard(tmp_path / "0000.parquet", [["John", "Smith"], ["Ada"]], [[1, 2, 0], [1, 0]])
+
+    result, create = run([shard], size=2, task_type="ner", text_column="tokens", label_column="ner_tags")
+
+    assert result["status"] == "completed", result
+    assert all(row["entities"] == "" for row in create.calls[0]["rows"])
+    assert "tag for every word" in (result.get("sampleNote") or "")
+
+
 def test_a_summarization_import_writes_text_and_summary(run, tmp_path):
     shard = write_summarization_shard(
         tmp_path / "0000.parquet",

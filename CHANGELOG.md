@@ -29,7 +29,9 @@ While the version is 0.x, minor releases may contain breaking changes.
     scalar, shorter than its tokens or partly empty, gets a blank `entities`
     cell, so it waits to be annotated instead of counting as a row with no
     entities or a partial annotation. For a string text column, numbered
-    tags without names therefore no longer fail the import.
+    tags without names therefore no longer fail the import. When no sampled
+    row has a tag for every word (sub-word tags, for example), the import
+    completes with a `sampleNote` saying the entities are left to annotate.
   - The conversion lives in `dataset_library.ner.spans`; `tokens_to_text` is
     unchanged.
 

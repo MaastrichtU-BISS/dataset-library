@@ -69,7 +69,9 @@ def spans(tokens, tags, names=None):
     continue one of its type or start a new one, ``E-``/``L-`` continue or
     start then close, ``S-``/``U-`` is a one-token span, a tag with no prefix
     continues an open span of its type or starts one, and ``O``, an empty tag
-    or a placeholder (``X``, ``PAD``) is outside.
+    or a placeholder (``X``, ``PAD``, ``[CLS]``, ``[SEP]``) is outside. Missing
+    tags (a list shorter than the tokens) count as outside here; the import
+    only calls this for rows with a tag for every token.
 
     A whitespace token never starts or ends a span. In a word-level row an
     ``O`` on it closes the open span. In a character-level row (klue's ``ner``
