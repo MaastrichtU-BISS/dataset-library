@@ -166,8 +166,9 @@ def test_ner_takes_a_string_tag_sequence_and_a_name_ending_in_tags():
         {"name": "pos", "type": _sequence(_class_label(["NN"]))},
         {"name": "entity_tags", "type": _sequence(_string())},
     ]
+    rows = [{"row": {"words": ["Ada", "Lovelace"], "pos": [0, 0], "entity_tags": ["B-PER", "I-PER"]}}]
 
-    assert _propose(["ner"], features, []) == {"taskType": "ner", "textColumn": "words", "labelColumn": "entity_tags"}
+    assert _propose(["ner"], features, rows) == {"taskType": "ner", "textColumn": "words", "labelColumn": "entity_tags"}
 
 
 def test_ner_covers_the_viewers_bare_list_type():
@@ -248,10 +249,84 @@ def test_a_card_tagged_both_tasks_falls_back_when_ner_has_no_pair():
     }
 
 
-def test_list_inner_unwraps_a_sequence_whose_feature_is_a_one_element_list():
+def test_list_inner_keeps_a_list_of_lists_a_list():
+    # In Hugging Face's features a list inside a Sequence is a list of lists.
     feature = {"_type": "Sequence", "feature": [{"_type": "Value", "dtype": "string"}]}
 
-    assert _list_inner(feature) == {"_type": "Value", "dtype": "string"}
+    assert _list_inner(feature) == [{"_type": "Value", "dtype": "string"}]
+
+
+def test_ner_declines_nested_token_and_tag_lists():
+    features = [
+        {"name": "tokens", "type": _sequence([_string()])},
+        {"name": "ner_tags", "type": _sequence([_class_label(["O", "B-PER"])])},
+    ]
+
+    assert _propose(["ner"], features, []) == NOTHING
+
+
+def test_a_dependency_parsing_config_on_an_ner_card_proposes_nothing():
+    # klue/klue's dp config: tagged token classification, but its numbered
+    # lists are word positions and heads, not entity tags.
+    features = [
+        {"name": "sentence", "type": _string()},
+        {"name": "index", "type": _sequence(_integer("int32"))},
+        {"name": "word_form", "type": _sequence(_string())},
+        {"name": "lemma", "type": _sequence(_string())},
+        {"name": "pos", "type": _sequence(_string())},
+        {"name": "head", "type": _sequence(_integer("int32"))},
+        {"name": "deprel", "type": _sequence(_string())},
+    ]
+    rows = [{"row": {"index": [1, 2], "word_form": ["a", "b"], "lemma": ["a", "b"], "pos": ["NNG", "VV"],
+                     "head": [2, 0], "deprel": ["NP_SBJ", "VP"]}}]
+
+    assert _propose(["ner"], features, rows) == NOTHING
+
+
+def test_part_of_speech_tags_are_not_entity_types():
+    # A Universal Dependencies shape, and a tokens + pos_tags one.
+    upos = [
+        {"name": "tokens", "type": _sequence(_string())},
+        {"name": "upos", "type": _sequence(_class_label(["NOUN", "VERB", "ADJ"]))},
+    ]
+    pos_tags = [
+        {"name": "tokens", "type": _sequence(_string())},
+        {"name": "pos_tags", "type": _sequence(_class_label(["NN", "VB", "IN"]))},
+    ]
+
+    assert _propose(["ner"], upos, []) == NOTHING
+    assert _propose(["ner"], pos_tags, []) == NOTHING
+
+
+def test_an_unusual_tag_column_with_bio_class_names_is_the_label():
+    features = [
+        {"name": "tokens", "type": _sequence(_string())},
+        {"name": "pos_tags", "type": _sequence(_class_label(["NN", "VB"]))},
+        {"name": "entities_bio", "type": _sequence(_class_label(["O", "B-ORG", "I-ORG"]))},
+    ]
+
+    assert _propose(["ner"], features, []) == {"taskType": "ner", "textColumn": "tokens", "labelColumn": "entities_bio"}
+
+
+def test_summarization_never_picks_an_id_column_as_the_text():
+    features = [
+        {"name": "id", "type": _string()},
+        {"name": "doc_id", "type": _string()},
+        {"name": "summary", "type": _string()},
+    ]
+    rows = [{"row": {"id": "a-very-long-identifier-0001", "doc_id": "another-long-id", "summary": "s"}}]
+
+    assert _propose(["summarization"], features, rows) == NOTHING
+
+
+def test_a_feature_without_a_name_is_ignored():
+    features = [
+        {"type": _sequence(_string())},
+        {"name": "tokens", "type": _sequence(_string())},
+        {"name": "ner_tags", "type": _sequence(_class_label(["O", "B-PER"]))},
+    ]
+
+    assert _propose(["ner"], features, []) == {"taskType": "ner", "textColumn": "tokens", "labelColumn": "ner_tags"}
 
 
 def test_summarization_falls_back_to_the_longest_text_column_for_the_source():

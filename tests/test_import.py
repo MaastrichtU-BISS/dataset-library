@@ -661,6 +661,24 @@ def test_tags_without_names_fail_before_any_row_is_read(run, tmp_path):
     assert not list((tmp_path / "data").glob("library-*.csv"))
 
 
+def test_tags_with_an_empty_name_list_also_fail_before_any_row_is_read(run, tmp_path):
+    shard = write_ner_shard(
+        tmp_path / "0000.parquet", [["John", "Smith"]], [[0, 1]],
+        tag_feature={"feature": {"names": [], "_type": "ClassLabel"}, "_type": "Sequence"},
+    )
+    SpyParquet.reads = []
+
+    result, create = run(
+        [shard], size=1, task_type="ner", text_column="tokens", label_column="ner_tags",
+        open_parquet=SpyParquet,
+    )
+
+    assert result["status"] == "failed"
+    assert result["code"] == "no_entity_names"
+    assert create.calls == []
+    assert SpyParquet.reads == []
+
+
 def test_a_summarization_import_writes_text_and_summary(run, tmp_path):
     shard = write_summarization_shard(
         tmp_path / "0000.parquet",

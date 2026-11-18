@@ -16,23 +16,26 @@ While the version is 0.x, minor releases may contain breaking changes.
   - A preview of a card tagged `ner` or `summarization` now carries
     `proposed: {taskType, textColumn, labelColumn}`, so the import's column
     step starts on the right columns. A task is proposed only when the
-    selected config holds a distinct text and label pair for it. NER picks the
-    label first (`ner_tags`, `tags`, `ner`, `labels`, `label`, then any name
-    ending in `tags`, else the first ClassLabel or numbered tag list that is
-    not the text), then the text avoiding it (`tokens`, `words`, else the
-    first remaining list of strings); tag lists may hold ClassLabels, strings
-    or integers, and the same column is never used for both. Summarization
-    proposes the first of `document`, `article`, `text`, `dialogue`, `source`,
-    `input` and of `summary`, `highlights`, `abstract`, `target`, `output`,
-    falling back to the longest sampled text column. All three are `null` when
-    no pair fits the selected config (a `ner`-tagged classification config,
-    for example) or the preview is unavailable.
+    selected config holds a distinct text and label pair for it. NER takes a
+    tag list (ClassLabels, strings or integers) named `ner_tags`, `tags`,
+    `ner`, `labels` or `label` as the label; any other tag list must show BIO
+    tags (`B-PER`) in its class names or first rows, preferring names ending
+    in `tags`, so part-of-speech and parsing configs on a token-classification
+    card get no proposal. The text is a list of strings that is neither the
+    label nor BIO-tagged (`tokens`, `words`, else the first). Lists of lists
+    are not proposed. Summarization proposes the first of `document`,
+    `article`, `text`, `dialogue`, `source`, `input` and of `summary`,
+    `highlights`, `abstract`, `target`, `output`, falling back to the longest
+    sampled text column that is not an id (`id`, `*_id`). All three are
+    `null` when no pair fits the selected config (a `ner`-tagged
+    classification or dependency-parsing config, for example) or the preview
+    is unavailable.
   - NER imports join a row's tokens into `text` and write the row's distinct
     entity types into `entities` (BIO position stripped, `O` dropped, first
     seen first, missing tokens skipped). Numbered tags are read through the
     ClassLabel names in the Parquet's `huggingface` metadata, including a
     ClassLabel inside a Sequence and its older list form. A tag column that is
-    a list of numbers with no names fails the import with `no_entity_names`
+    a list of numbers with no names (or an empty name list) fails the import with `no_entity_names`
     before any row is sampled, with a per-row check as a backstop.
   - Summarization imports write the source document as `text` and its target
     as `summary`. A row whose summary is missing or blank is skipped and

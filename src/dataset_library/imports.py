@@ -561,7 +561,7 @@ def _refuse_numbered_ner_tags(record, files):
         schema = parquet_file.schema_arrow
         if record.label_column not in schema.names:
             continue
-        if _integer_list(schema.field(record.label_column).type) and _label_names(parquet_file, record.label_column) is None:
+        if _integer_list(schema.field(record.label_column).type) and not _label_names(parquet_file, record.label_column):
             raise ImportFailed("no_entity_names", NO_ENTITY_NAMES)
 
 
