@@ -881,6 +881,12 @@ def _mapped(values, names, task_type="classification"):
     if task_type in NER_TASKS:
         if _numbered(label) and not names:
             raise ImportFailed("no_entity_names", NO_ENTITY_NAMES)
+        # Only a token list with its tags says where entities are. A missing
+        # tag value, or a text that is already a string, leaves the cell blank
+        # so the row waits to be annotated rather than training as "no
+        # entities" or as one entity over the whole text.
+        if label is None or not isinstance(values[0], (list, tuple)):
+            return [text, ""]
         text, found = spans(values[0], label, names)
         return [text, json.dumps(found, ensure_ascii=False)]
     if names and isinstance(label, int) and 0 <= label < len(names):

@@ -220,3 +220,54 @@ def test_a_string_row_is_its_own_text_and_has_no_spans():
 
     assert (text, found) == ("Already a sentence.", [])
     check(text, found)
+
+
+def _types(found):
+    return [(span["text"], span["type"]) for span in found]
+
+
+def test_an_o_on_a_newline_ends_a_span_in_a_word_level_row():
+    for tags in (["I-PER", "O", "I-PER"], ["B-PER", "O", "I-PER"]):
+        text, found = spans(["Smith", "\n", "Jones"], tags)
+        check(text, found)
+        assert _types(found) == [("Smith", "PER"), ("Jones", "PER")]
+
+
+def test_a_character_level_row_keeps_a_multi_word_entity_across_an_o_space():
+    # klue/klue's ner tags the spaces inside an entity O and carries on with I-.
+    text, found = spans(["강", "원", " ", "영", "동"], ["B-LC", "I-LC", "O", "I-LC", "I-LC"])
+    check(text, found)
+    assert _types(found) == [("강원 영동", "LC")]
+
+
+def test_an_o_space_separates_io_entities_in_a_character_level_row():
+    text, found = spans(["김", " ", "이"], ["PER", "O", "PER"])
+    check(text, found)
+    assert _types(found) == [("김", "PER"), ("이", "PER")]
+
+
+def test_a_tagged_space_with_another_type_or_a_new_start_closes_the_span():
+    text, found = spans(["가", "나", " ", "다"], ["B-PER", "I-PER", "B-ORG", "I-PER"])
+    check(text, found)
+    assert _types(found) == [("가나", "PER"), ("다", "PER")]
+
+
+def test_bmes_middle_tags_continue_the_entity():
+    text, found = spans(["张", "三", "丰"], ["B-PER", "M-PER", "E-PER"])
+    check(text, found)
+    assert _types(found) == [("张 三 丰", "PER")]
+
+
+def test_whitespace_at_a_tokens_edges_is_not_part_of_the_span():
+    text, found = spans([" John", "Smith\xa0"], ["B-PER", "I-PER"])
+    check(text, found)
+    assert _types(found) == [("John Smith", "PER")]
+
+
+def test_outside_and_placeholder_tags_are_never_types():
+    for tag in ("B-O", "X", "PAD", "[PAD]", "<pad>", "B- "):
+        assert spans(["a"], [tag])[1] == []
+
+
+def test_a_space_after_the_prefix_is_not_part_of_the_type():
+    assert _types(spans(["a", "b"], ["B- PER", "I-PER"])[1]) == [("a b", "PER")]

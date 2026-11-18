@@ -766,6 +766,17 @@ def test_a_record_of_span_lists_as_the_tag_column_fails_before_any_row_is_read(r
     assert SpyParquet.reads == []
 
 
+def test_a_missing_tag_value_or_a_string_text_leaves_the_entities_blank():
+    # A blank cell keeps the row waiting to be annotated in legal-ml-core;
+    # "[]" would count as annotated with no entities.
+    from dataset_library.imports import _mapped
+
+    assert _mapped([["John", "Smith"], None], None, "ner") == ["John Smith", ""]
+    assert _mapped(["John Smith works", ["B-PER", "I-PER", "O"]], None, "ner") == ["John Smith works", ""]
+    assert _mapped(["John Smith works", "PER, ORG"], None, "ner") == ["John Smith works", ""]
+    assert _mapped([["John", "works"], ["O", "O"]], None, "ner") == ["John works", "[]"]
+
+
 def test_a_summarization_import_writes_text_and_summary(run, tmp_path):
     shard = write_summarization_shard(
         tmp_path / "0000.parquet",
