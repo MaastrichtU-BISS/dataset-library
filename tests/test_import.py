@@ -510,9 +510,10 @@ def test_a_label_with_no_place_of_its_own_still_fills_the_sample(run, tmp_path):
 
 
 def test_a_balanced_sample_short_of_its_size_says_so(run, tmp_path):
-    # Only 3 rows have text in all; the sample cannot reach 10 and the note says so.
+    # One label, 3 rows with text: nothing to top up from, the sample cannot
+    # reach 10, and the note still says so.
     texts = ["One", "", "Two", "", "Three"] + [""] * 20
-    labels = [0, 0, 1, 1, 0] + [1] * 20
+    labels = [0] * 25
     shard = write_shard(tmp_path / "0000.parquet", texts, labels)
 
     result, create = run([shard], size=10, balance=True)
