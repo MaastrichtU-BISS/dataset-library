@@ -51,7 +51,7 @@ def test_flags_and_default_levels():
     assert by.url == "https://creativecommons.org/licenses/by/4.0/"
 
 
-def test_every_license_defaults_to_warn_exactly_when_it_has_a_condition():
+def test_every_license_defaults_to_warn_exactly_when_it_is_nc_nd_or_unknown():
     from dataset_library.licenses import LICENSES
 
     for license in LICENSES.values():
