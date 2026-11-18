@@ -1,4 +1,7 @@
+from dataset_library.preview import _propose
 from tests.conftest import ALICE
+
+NOTHING = {"taskType": None, "textColumn": None, "labelColumn": None}
 
 
 def preview(client, external_id, status=200, **params):
@@ -101,3 +104,117 @@ def test_previews_are_cached_for_ten_minutes(client, hub):
     preview(client, "AI-team-UoA/greek_legal_code")
 
     assert len(hub.calls) == calls
+
+
+def test_an_ner_card_proposes_its_tokens_and_tag_columns(client):
+    body = preview(client, "coastalcph/legal_ner")
+
+    assert body["tasks"] == ["ner"]
+    assert body["proposed"] == {"taskType": "ner", "textColumn": "tokens", "labelColumn": "ner_tags"}
+
+
+def test_a_summarization_card_proposes_its_document_and_summary_columns(client):
+    body = preview(client, "coastalcph/legal_summaries")
+
+    assert body["tasks"] == ["summarization"]
+    assert body["proposed"] == {"taskType": "summarization", "textColumn": "document", "labelColumn": "summary"}
+
+
+def test_a_classification_card_proposes_nothing(client):
+    body = preview(client, "AI-team-UoA/greek_legal_code")
+
+    assert body["proposed"] == NOTHING
+
+
+def test_an_unavailable_preview_proposes_nothing(client):
+    body = preview(client, "jfrenz/legalglue")
+
+    assert body["preview"] == "unavailable"
+    assert body["proposed"] == NOTHING
+
+
+def _string():
+    return {"dtype": "string", "_type": "Value"}
+
+
+def _sequence(feature):
+    return {"_type": "Sequence", "feature": feature}
+
+
+def _class_label(names):
+    return {"_type": "ClassLabel", "names": names}
+
+
+def test_ner_prefers_tokens_and_ner_tags_over_the_other_names():
+    features = [
+        {"name": "words", "type": _sequence(_string())},
+        {"name": "tokens", "type": _sequence(_string())},
+        {"name": "tags", "type": _sequence(_class_label(["O"]))},
+        {"name": "ner_tags", "type": _sequence(_class_label(["O"]))},
+    ]
+
+    assert _propose(["ner"], features, []) == {"taskType": "ner", "textColumn": "tokens", "labelColumn": "ner_tags"}
+
+
+def test_ner_takes_a_string_tag_sequence_and_a_name_ending_in_tags():
+    features = [
+        {"name": "words", "type": _sequence(_string())},
+        {"name": "pos", "type": _sequence(_class_label(["NN"]))},
+        {"name": "entity_tags", "type": _sequence(_string())},
+    ]
+
+    assert _propose(["ner"], features, []) == {"taskType": "ner", "textColumn": "words", "labelColumn": "entity_tags"}
+
+
+def test_ner_covers_the_viewers_bare_list_type():
+    features = [
+        {"name": "tokens", "type": [_string()]},
+        {"name": "ner_tags", "type": [_class_label(["O", "B-PER"])]},
+    ]
+
+    assert _propose(["ner"], features, []) == {"taskType": "ner", "textColumn": "tokens", "labelColumn": "ner_tags"}
+
+
+def test_ner_without_the_expected_columns_still_names_the_task():
+    features = [{"name": "text", "type": _string()}]
+
+    assert _propose(["ner"], features, []) == {"taskType": "ner", "textColumn": None, "labelColumn": None}
+
+
+def test_summarization_falls_back_to_the_longest_text_column_for_the_source():
+    features = [
+        {"name": "id", "type": {"dtype": "int64", "_type": "Value"}},
+        {"name": "body", "type": _string()},
+        {"name": "notes", "type": _string()},
+        {"name": "summary", "type": _string()},
+    ]
+    rows = [
+        {"row": {"body": "short", "notes": "a much longer note", "summary": "one"}},
+        {"row": {"body": "tiny", "notes": "another long note here", "summary": "two"}},
+    ]
+
+    assert _propose(["summarization"], features, rows) == {
+        "taskType": "summarization", "textColumn": "notes", "labelColumn": "summary",
+    }
+
+
+def test_summarization_uses_the_usual_names_before_the_length_fallback():
+    features = [
+        {"name": "source", "type": _string()},
+        {"name": "article", "type": _string()},
+        {"name": "highlights", "type": _string()},
+        {"name": "summary", "type": _string()},
+    ]
+
+    assert _propose(["summarization"], features, []) == {
+        "taskType": "summarization", "textColumn": "article", "labelColumn": "summary",
+    }
+
+
+def test_ner_wins_when_the_card_lists_both_tasks():
+    features = [
+        {"name": "tokens", "type": _sequence(_string())},
+        {"name": "ner_tags", "type": _sequence(_class_label(["O"]))},
+    ]
+
+    assert _propose(["ner", "summarization"], features, [])["taskType"] == "ner"

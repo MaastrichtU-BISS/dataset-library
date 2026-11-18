@@ -8,6 +8,40 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-18
+
+### Added
+
+- NER and summarization dataset imports (BAIGLE #117).
+  - A preview of a card tagged `ner` or `summarization` now carries
+    `proposed: {taskType, textColumn, labelColumn}`, so the import's column
+    step starts on the right columns. NER proposes a list-of-strings text
+    column (`tokens`, then `words`) and a list-of-tags label column
+    (`ner_tags`, then `tags`, then any name ending in `tags`), accepting both
+    the ClassLabel and the string form. Summarization proposes the first of
+    `document`, `article`, `text`, `dialogue`, `source`, `input` and of
+    `summary`, `highlights`, `abstract`, `target`, `output`, falling back to
+    the longest sampled text column. All three are `null` when the task has no
+    proposal or the preview is unavailable.
+  - NER imports join a row's tokens into `text` and write the row's distinct
+    entity types into `entities` (BIO position stripped, `O` dropped, first
+    seen first). Numbered tags are read through the ClassLabel names in the
+    Parquet's `huggingface` metadata, including a ClassLabel inside a Sequence
+    and its older list form. Numbered tags with no names fail the import with
+    `no_entity_names` and a message saying the entity names cannot be read.
+  - Summarization imports write the source document as `text` and its target
+    as `summary`.
+  - The import CSV's second header follows the task type: `entities` for
+    `ner` and `named_entity_recognition`, `summary` for `summarization`, and
+    `label` for classification-like tasks (unchanged). A dataset with no label
+    column still writes `text` alone.
+  - The conversion lives in `dataset_library.ner` as `tokens_to_text` and
+    `entity_types`.
+  - Tests cover NER with numbered and string tags, rows with no entities,
+    empty token lists, tags without names, summarization, the preview
+    proposals, and the written CSVs against legal-ml-core's real
+    `validate_dataset_file` (skipped when legal-ml-core is not installed).
+
 ## [0.8.0] - 2026-11-18
 
 ### Added

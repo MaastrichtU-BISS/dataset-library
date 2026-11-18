@@ -9,6 +9,12 @@ from .providers import huggingface, viewer
 CACHE_SECONDS = 600
 ROWS = 8
 CELL_CHARACTERS = 400
+# Names that say which column is which, before falling back to the types.
+NER_TEXT_COLUMNS = ("tokens", "words")
+NER_LABEL_COLUMNS = ("ner_tags", "tags")
+SUMMARY_TEXT_COLUMNS = ("document", "article", "text", "dialogue", "source", "input")
+SUMMARY_LABEL_COLUMNS = ("summary", "highlights", "abstract", "target", "output")
+LIST_TYPES = ("Sequence", "List", "LargeList")
 
 
 class NotInLibrary(Exception):
@@ -71,7 +77,11 @@ def _build(host, external_id, config, split):
     policy = policy_module.overrides(host.db)
     if policy_module.level(LICENSES.get(card["license"], UNKNOWN), policy) == "hide":
         raise LicenseHidden()
-    body = {**card, "preview": "unavailable", "configs": [], "config": None, "split": None, "columns": [], "rows": [], "rowCount": None}
+    body = {
+        **card,
+        "preview": "unavailable", "configs": [], "config": None, "split": None,
+        "columns": [], "rows": [], "rowCount": None, "proposed": _no_proposal(),
+    }
     body["labels"] = labels_module.for_ids(host.cache, [external_id])[external_id]
     try:
         configs = _configs(viewer.get("splits", dataset=external_id))
@@ -101,7 +111,97 @@ def _build(host, external_id, config, split):
         for r in (rows.get("rows") or [])[:ROWS]
     ]
     body["preview"] = "ok" if body["rows"] else "unavailable"
+    if body["preview"] == "ok":
+        body["proposed"] = _propose(card["tasks"], features, rows.get("rows") or [])
     return body
+
+
+def _no_proposal():
+    return {"taskType": None, "textColumn": None, "labelColumn": None}
+
+
+def _propose(tasks, features, rows):
+    """What the import's column step starts with: the task's usual columns
+    when the viewer shows them, and nothing when it cannot tell."""
+    if "ner" in tasks:
+        task = "ner"
+    elif "summarization" in tasks:
+        task = "summarization"
+    else:
+        return _no_proposal()
+    named = [(f.get("name"), f.get("type")) for f in features if isinstance(f, dict)]
+    if task == "ner":
+        text = _pick(
+            [name for name, type_ in named if _is_list(type_) and _is_text(_list_inner(type_))],
+            NER_TEXT_COLUMNS,
+        )
+        label = _pick(
+            [name for name, type_ in named if _is_list(type_) and (
+                _is_text(_list_inner(type_)) or labels_module.is_class_label(_list_inner(type_))
+            )],
+            NER_LABEL_COLUMNS, suffix="tags",
+        )
+    else:
+        label = _first_text(named, SUMMARY_LABEL_COLUMNS)
+        text = _first_text(named, SUMMARY_TEXT_COLUMNS, exclude=label)
+        if text is None:
+            text = _longest_text(named, rows, exclude=label)
+    return {"taskType": task, "textColumn": text, "labelColumn": label}
+
+
+def _pick(candidates, preferred, suffix=None):
+    for name in preferred:
+        if name in candidates:
+            return name
+    if suffix:
+        for name in candidates:
+            if name.endswith(suffix):
+                return name
+    return candidates[0] if candidates else None
+
+
+def _first_text(named, preferred, exclude=None):
+    """The first plain text column among `preferred` names, in that order."""
+    types = dict(named)
+    for name in preferred:
+        type_ = types.get(name)
+        if name != exclude and not _is_list(type_) and _is_text(type_):
+            return name
+    return None
+
+
+def _longest_text(named, rows, exclude=None):
+    """The plain text column whose sample rows read longest."""
+    best, best_length = None, -1.0
+    for name, type_ in named:
+        if name == exclude or _is_list(type_) or not _is_text(type_):
+            continue
+        lengths = [len(value) for row in rows if isinstance((value := (row.get("row") or {}).get(name)), str)]
+        length = sum(lengths) / len(lengths) if lengths else 0
+        if length > best_length:
+            best, best_length = name, length
+    return best
+
+
+def _is_list(feature):
+    return isinstance(feature, list) or (isinstance(feature, dict) and feature.get("_type") in LIST_TYPES)
+
+
+def _list_inner(feature):
+    """The element type of a list feature; a bare list is a list of one."""
+    if isinstance(feature, list):
+        return feature[0] if feature else None
+    return feature.get("feature") if isinstance(feature, dict) else None
+
+
+def _is_text(feature):
+    if isinstance(feature, str):
+        return feature in ("string", "large_string")
+    return (
+        isinstance(feature, dict)
+        and feature.get("_type") == "Value"
+        and feature.get("dtype") in ("string", "large_string")
+    )
 
 
 def _row_count(external_id, config, split):

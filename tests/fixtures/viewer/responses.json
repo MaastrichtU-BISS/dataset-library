@@ -2022,5 +2022,183 @@
    ],
    "truncated": true
   }
+ },
+ "splits?dataset=coastalcph/legal_ner": {
+  "status": 200,
+  "body": {
+   "splits": [
+    {
+     "dataset": "coastalcph/legal_ner",
+     "config": "default",
+     "split": "train"
+    }
+   ]
+  }
+ },
+ "info?dataset=coastalcph/legal_ner&config=default": {
+  "status": 200,
+  "body": {
+   "dataset_info": {
+    "splits": {
+     "train": {
+      "name": "train",
+      "num_examples": 2
+     }
+    },
+    "config_name": "default",
+    "dataset_name": "legal_ner"
+   },
+   "partial": false
+  }
+ },
+ "first-rows?dataset=coastalcph/legal_ner&config=default&split=train": {
+  "status": 200,
+  "body": {
+   "dataset": "coastalcph/legal_ner",
+   "config": "default",
+   "split": "train",
+   "features": [
+    {
+     "feature_idx": 0,
+     "name": "tokens",
+     "type": {
+      "_type": "Sequence",
+      "feature": {
+       "dtype": "string",
+       "_type": "Value"
+      }
+     }
+    },
+    {
+     "feature_idx": 1,
+     "name": "ner_tags",
+     "type": {
+      "_type": "Sequence",
+      "feature": {
+       "names": [
+        "O",
+        "B-PER",
+        "I-PER",
+        "B-ORG",
+        "I-ORG"
+       ],
+       "_type": "ClassLabel"
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "row_idx": 0,
+     "row": {
+      "tokens": [
+       "John",
+       "Smith",
+       "works",
+       "at",
+       "ACME"
+      ],
+      "ner_tags": [
+       0,
+       1,
+       2,
+       0,
+       3
+      ]
+     },
+     "truncated_cells": []
+    },
+    {
+     "row_idx": 1,
+     "row": {
+      "tokens": [
+       "ACME",
+       "sued",
+       "Mary",
+       "Jones"
+      ],
+      "ner_tags": [
+       3,
+       0,
+       1,
+       2
+      ]
+     },
+     "truncated_cells": []
+    }
+   ]
+  }
+ },
+ "splits?dataset=coastalcph/legal_summaries": {
+  "status": 200,
+  "body": {
+   "splits": [
+    {
+     "dataset": "coastalcph/legal_summaries",
+     "config": "default",
+     "split": "train"
+    }
+   ]
+  }
+ },
+ "info?dataset=coastalcph/legal_summaries&config=default": {
+  "status": 200,
+  "body": {
+   "dataset_info": {
+    "splits": {
+     "train": {
+      "name": "train",
+      "num_examples": 2
+     }
+    },
+    "config_name": "default",
+    "dataset_name": "legal_summaries"
+   },
+   "partial": false
+  }
+ },
+ "first-rows?dataset=coastalcph/legal_summaries&config=default&split=train": {
+  "status": 200,
+  "body": {
+   "dataset": "coastalcph/legal_summaries",
+   "config": "default",
+   "split": "train",
+   "features": [
+    {
+     "feature_idx": 0,
+     "name": "document",
+     "type": {
+      "dtype": "string",
+      "_type": "Value"
+     }
+    },
+    {
+     "feature_idx": 1,
+     "name": "summary",
+     "type": {
+      "dtype": "string",
+      "_type": "Value"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "row_idx": 0,
+     "row": {
+      "document": "The court held that the clause was void.",
+      "summary": "The clause was void."
+     },
+     "truncated_cells": []
+    },
+    {
+     "row_idx": 1,
+     "row": {
+      "document": "The appeal was dismissed with costs.",
+      "summary": "Appeal dismissed."
+     },
+     "truncated_cells": []
+    }
+   ]
+  }
  }
 }
