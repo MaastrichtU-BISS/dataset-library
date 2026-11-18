@@ -175,7 +175,13 @@ def list_pins():
 def add_pin():
     """Pin a library dataset; the same provider and dataset id is one pin."""
     _require_admin()
-    dataset_id = ((request.get_json(silent=True) or {}).get("dataset") or "").strip()
+    body = request.get_json(silent=True)
+    if body is not None and not isinstance(body, dict):
+        raise ApiError(400, "Send a JSON object.", "bad_request")
+    submitted = (body or {}).get("dataset")
+    if not isinstance(submitted, str):
+        raise ApiError(400, "Pick a Hugging Face dataset id.", "bad_id")
+    dataset_id = submitted.strip()
     if not DATASET_ID_PATTERN.match(dataset_id):
         raise ApiError(400, f"Not a Hugging Face dataset id: {dataset_id}", "bad_id")
     try:
@@ -197,8 +203,11 @@ def add_pin():
 def patch_pin(pin_ref):
     """Feature or unfeature a pin, and set or clear its display title."""
     _require_admin()
+    body = request.get_json(silent=True)
+    if body is not None and not isinstance(body, dict):
+        raise ApiError(400, "Send a JSON object.", "bad_request")
     try:
-        pin = pins_module.update(_host(), pin_ref, request.get_json(silent=True) or {})
+        pin = pins_module.update(_host(), pin_ref, body or {})
     except pins_module.NotFound:
         raise ApiError(404, "No such pin.", "not_found")
     except pins_module.TooManyFeatured:

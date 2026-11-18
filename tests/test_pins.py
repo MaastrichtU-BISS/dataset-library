@@ -132,7 +132,7 @@ def test_a_display_title_is_set_cleared_and_length_checked(client, audits):
 
     titled = patch(client, ref, {"title": "  Legal GLUE  "})
     assert titled["title"] == "Legal GLUE" and titled["titleOverride"] == "Legal GLUE"
-    assert audits[-1] == {"event": "library.pin_updated", "external_id": "coastalcph/lex_glue", "title": "Legal GLUE"}
+    assert audits[-1] == {"event": "library.pin_updated", "external_id": "coastalcph/lex_glue", "title_changed": True}
 
     for cleared in ("", "   ", None):
         cleared_pin = patch(client, ref, {"title": cleared})
@@ -257,3 +257,76 @@ def test_search_results_carry_the_ref_of_their_pin(client):
 
 def test_the_featured_row_is_empty_for_a_fresh_course(client):
     assert client.get("/api/library/featured", headers=ALICE).get_json() == {"featured": []}
+
+
+def test_a_pin_inserted_between_the_lookup_and_the_insert_is_returned(client, monkeypatch):
+    from dataset_library import pins
+    from dataset_library.models import LibraryPin
+
+    def insert_first(cache, ids):
+        # Another request wins the race after our lookup but before our insert.
+        session = client.application.db.session
+        session.add(LibraryPin(provider="huggingface", external_id="coastalcph/lex_glue", card={}, labelled="unclear"))
+        session.commit()
+        return {external_id: "unclear" for external_id in ids}
+
+    monkeypatch.setattr(pins.labels_module, "for_ids", insert_first)
+
+    body = pin(client, "coastalcph/lex_glue", status=200)
+
+    assert body["externalId"] == "coastalcph/lex_glue"
+    with client.application.app_context():
+        assert client.application.db.session.query(LibraryPin).count() == 1
+
+
+def test_a_pin_uses_the_hubs_canonical_id(client, monkeypatch):
+    from dataset_library import pins
+    from dataset_library.models import LibraryPin
+
+    real_preview = pins.preview_module.preview
+
+    def renamed(host, external_id, *args, **kwargs):
+        body = real_preview(host, external_id, *args, **kwargs)
+        return {**body, "externalId": "canonical/name", "id": "huggingface:canonical/name"}
+
+    monkeypatch.setattr(pins.preview_module, "preview", renamed)
+
+    body = pin(client, "coastalcph/lex_glue")
+
+    assert body["externalId"] == "canonical/name"
+    with client.application.app_context():
+        stored = client.application.db.session.query(LibraryPin).one()
+        assert stored.external_id == "canonical/name"
+
+
+def test_the_audit_never_carries_the_title_and_an_empty_patch_is_not_audited(client, audits):
+    ref = pin(client, "coastalcph/lex_glue")["ref"]
+    audits.clear()
+
+    patch(client, ref, {"title": "Secret title"})
+    assert audits == [
+        {"event": "library.pin_updated", "external_id": "coastalcph/lex_glue", "title_changed": True}
+    ]
+
+    audits.clear()
+    patch(client, ref, {})
+    patch(client, ref, {"title": "Secret title"})
+    patch(client, ref, {"featured": False})
+    assert audits == []
+
+
+@pytest.mark.parametrize("body, code", [([], "bad_request"), ({"dataset": 123}, "bad_id")])
+def test_a_malformed_pin_body_is_refused(client, body, code):
+    resp = client.post("/api/library/pins", json=body, headers=ADMIN)
+
+    assert resp.status_code == 400
+    assert resp.get_json()["code"] == code
+
+
+def test_a_patch_body_that_is_not_an_object_is_refused(client):
+    ref = pin(client, "coastalcph/lex_glue")["ref"]
+
+    resp = client.patch(f"/api/library/pins/{ref}", json=[], headers=ADMIN)
+
+    assert resp.status_code == 400
+    assert resp.get_json()["code"] == "bad_request"

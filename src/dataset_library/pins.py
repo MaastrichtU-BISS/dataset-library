@@ -6,7 +6,7 @@ re-derived on read, so an admin's later policy change applies at once. A
 dataset must still be in the library to be pinned, and only what the library
 still serves reaches the featured row (#119).
 """
-from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 
 from . import labels as labels_module
 from . import policy as policy_module
@@ -47,20 +47,31 @@ def add(host, external_id):
     Refuses first what the preview refuses, so nothing outside the library
     is pinned (or named by a refusal)."""
     body = preview_module.preview(host, external_id)
-    existing = host.db.session.query(LibraryPin).filter_by(provider=PROVIDER, external_id=external_id).first()
+    # The Hub's card may name the same dataset under another id (a rename or a
+    # redirect); the pin, its labels and its audit all use that canonical id.
+    canonical = body["externalId"]
+    existing = host.db.session.query(LibraryPin).filter_by(provider=PROVIDER, external_id=canonical).first()
     if existing is not None:
         return to_dict(existing, policy_module.overrides(host.db)), False
-    labelled = labels_module.for_ids(host.cache, [external_id])[external_id]
+    labelled = labels_module.for_ids(host.cache, [canonical])[canonical]
     pin = LibraryPin(
         provider=PROVIDER,
-        external_id=external_id,
+        external_id=canonical,
         card={key: body[key] for key in CARD_FIELDS},
         labelled=labelled,
         pinned_by=host.current_owner(),
     )
     host.db.session.add(pin)
-    host.db.session.commit()
-    host.audit("library.pin_added", provider=PROVIDER, external_id=external_id)
+    try:
+        host.db.session.commit()
+    except IntegrityError:
+        # Another request pinned it between our lookup and this insert.
+        host.db.session.rollback()
+        existing = host.db.session.query(LibraryPin).filter_by(provider=PROVIDER, external_id=canonical).first()
+        if existing is not None:
+            return to_dict(existing, policy_module.overrides(host.db)), False
+        raise
+    host.audit("library.pin_added", provider=PROVIDER, external_id=canonical)
     return to_dict(pin, policy_module.overrides(host.db)), True
 
 
@@ -70,20 +81,20 @@ def update(host, pin_ref, body):
     if pin is None:
         raise NotFound()
     changes = {}
+    audit = {"external_id": pin.external_id}
     if "featured" in body:
         featured = body["featured"]
         if not isinstance(featured, bool):
             raise BadFeatured()
-        if featured and not pin.featured:
-            count = (
-                host.db.session.query(func.count())
-                .select_from(LibraryPin)
-                .filter(LibraryPin.featured.is_(True), LibraryPin.id != pin.id)
-                .scalar()
-            )
-            if count >= MAX_FEATURED:
-                raise TooManyFeatured()
-        changes["featured"] = featured
+        if featured != pin.featured:
+            if featured:
+                # Lock the pins so two requests cannot both see room for a fourth.
+                locked = host.db.session.query(LibraryPin).with_for_update().all()
+                count = sum(1 for other in locked if other.featured and other.id != pin.id)
+                if count >= MAX_FEATURED:
+                    raise TooManyFeatured()
+            changes["featured"] = featured
+            audit["featured"] = featured
     if "title" in body:
         title = body["title"]
         if isinstance(title, str):
@@ -92,13 +103,16 @@ def update(host, pin_ref, body):
             raise BadTitle()
         if title and len(title) > MAX_TITLE:
             raise BadTitle()
-        changes["title"] = title
-    if "featured" in body:
-        pin.featured = body["featured"]
-    if "title" in body:
-        pin.title = changes["title"]
+        if title != pin.title:
+            changes["title"] = title
+            # The title itself is free text; the audit only says what happened.
+            audit["title_cleared" if title is None else "title_changed"] = True
+    if not changes:
+        return to_dict(pin, policy_module.overrides(host.db))
+    for key, value in changes.items():
+        setattr(pin, key, value)
     host.db.session.commit()
-    host.audit("library.pin_updated", external_id=pin.external_id, **changes)
+    host.audit("library.pin_updated", **audit)
     return to_dict(pin, policy_module.overrides(host.db))
 
 

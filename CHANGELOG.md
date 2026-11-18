@@ -55,7 +55,9 @@ While the version is 0.x, minor releases may contain breaking changes.
     now hidden or whose owner is outside the enabled sources.
   - Search results carry `pinRef` (the pin's ref, or null) on every card.
   - Every pin change is audited: `library.pin_added`, `library.pin_updated`,
-    `library.pin_removed` (ids and flags only).
+    `library.pin_removed` (ids and flags only). A title change records
+    `title_changed` or `title_cleared`, never the title itself, and an update
+    that changes nothing is not audited.
   - Migration `dl_0006_pins` adds the `library_pins` table.
 
 ## [0.7.0] - 2026-11-18
