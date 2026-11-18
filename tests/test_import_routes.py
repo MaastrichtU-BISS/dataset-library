@@ -383,3 +383,45 @@ def test_a_running_import_is_cancelled_before_it_is_put_away(client):
 
     assert refused.status_code == 409
     assert refused.get_json()["code"] == "running"
+
+
+def test_a_retry_keeps_the_confirmation_after_the_license_turns_to_allow(make_app, queue):
+    from datetime import datetime
+
+    from dataset_library.models import LibraryImport, LibrarySettings
+
+    app = make_app(enqueue=queue, max_rows=lambda: 300)
+    with app.app_context():
+        app.db.session.add(LibrarySettings(id=1, license_policy={"cc-by-4.0": "warn"}))
+        app.db.session.commit()
+    client = app.test_client()
+    started = start(client, licenseAck=True)
+    confirmed = datetime(2026, 1, 2, 3, 4, 5)
+    with app.app_context():
+        session = app.db.session
+        record = session.get(LibraryImport, started["id"])
+        record.license_ack_at, record.status = confirmed, "failed"
+        session.get(LibrarySettings, 1).license_policy = {}
+        session.commit()
+
+    retried = client.post(f"/api/library/imports/{started['id']}/retry", headers=ALICE)
+
+    assert retried.status_code == 202, retried.get_json()
+    with app.app_context():
+        assert app.db.session.get(LibraryImport, retried.get_json()["id"]).license_ack_at == confirmed
+
+
+def test_a_dataset_the_hub_moved_to_an_owner_outside_the_library_is_not_found(make_app, queue):
+    from dataset_library.models import LibrarySettings, LibrarySource
+
+    app = make_app(enqueue=queue, max_rows=lambda: 300)
+    with app.app_context():
+        app.db.session.add(LibrarySource(provider="huggingface", kind="org", ref="coastalcph"))
+        app.db.session.add(LibrarySettings(id=1, license_policy={"cc-by-4.0": "hide"}))
+        app.db.session.commit()
+    client = app.test_client()
+
+    refused = start(client, status=404, dataset="coastalcph/moved_corpus", config=None, split=None)
+
+    assert refused["code"] == "not_found"
+    assert queue.refs == []

@@ -30,8 +30,9 @@ While the version is 0.x, minor releases may contain breaking changes.
   401/404 is treated as `not_found`.
 - A license only records a confirmation time when it is set to warn, and a
   retried import keeps the time the student first confirmed.
-- The enabled sources and hidden licenses are checked before anything is asked
-  of the Hub or the viewer, so no answer reveals a dataset outside the library.
+- The requested dataset's source is checked before the Hub is asked, and the
+  owner and license the Hub returns are checked before the viewer is asked,
+  so no answer reveals a dataset outside the library.
 - A license an admin sets to warn that has no confirmation words of its own
   gets "I have read the <name> license and will follow its terms." wherever
   the license is sent with its level (`License.at_level`).

@@ -60,8 +60,14 @@ def _build(host, external_id, config, split):
     card = huggingface.dataset(external_id, host.task_types)
     if card is None:
         raise NotInLibrary()
-    # Before asking the viewer or checking configs: a hidden license must not
-    # leak that the dataset exists through a "bad config" answer.
+    # The Hub may answer with a renamed dataset under another owner: check the
+    # owner it names, then the license, before asking the viewer or checking
+    # configs, so neither leaks a dataset outside the library.
+    from .search import enabled_sources
+
+    sources = {source.ref for source in enabled_sources(host.db)}
+    if sources and card["author"] not in sources:
+        raise NotInLibrary()
     policy = policy_module.overrides(host.db)
     if policy_module.level(LICENSES.get(card["license"], UNKNOWN), policy) == "hide":
         raise LicenseHidden()

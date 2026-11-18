@@ -134,10 +134,12 @@ def start(host, owner_id, body, *, ack_at=None):
         raise Refused(400, "bad_mapping", "Pick a label column from this dataset, or none.")
     if dataset["license"]["level"] == "warn" and body.get("licenseAck") is not True:
         raise Refused(409, "needs_ack", "Confirm the license terms to import this dataset.")
-    # Only a license that asks for confirmation records a time; an allow license
-    # stores none even when the client sent `licenseAck: true`.
+    # Only a license that asks for confirmation records a new time; an allow
+    # license stores none even when the client sent `licenseAck: true`. A retry
+    # keeps the time the student first confirmed, even if an admin has since
+    # set the license to allow: the confirmation still happened.
     confirmed = dataset["license"]["level"] == "warn" and body.get("licenseAck") is True
-    license_ack_at = (ack_at or _now()) if confirmed else None
+    license_ack_at = ack_at or (_now() if confirmed else None)
     seen_revision = body.get("revision")
     if seen_revision and dataset.get("revision") and seen_revision != dataset["revision"]:
         raise Refused(409, "changed", CHANGED)
