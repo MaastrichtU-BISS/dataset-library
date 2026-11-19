@@ -35,6 +35,9 @@ While the version is 0.x, minor releases may contain breaking changes.
     is (query, task, license, source; a hidden license is left out), each with a
     `snapshot` of `{"status"}`: `ready`, `queued`, `building`, `failed` or `none`.
     With no pins, the results stay empty, as before.
+  - A dataset opened while Hugging Face cannot be asked (`GET /api/library/datasets/huggingface/<id>`)
+    shows its copy instead: the card, the copy's columns and its first rows, with `offline: true`.
+    A copy whose license is now hidden is not shown. The import takes the same facts.
   - `GET /api/library/pins` carries each pin's `snapshot` (`status`, `error`,
     `revision`, `rows`) and `upstreamChanged`. `POST /api/library/pins/<pin_ref>/snapshot`
     (admins) keeps a copy for a pin that has none or whose copy failed: 202, 409

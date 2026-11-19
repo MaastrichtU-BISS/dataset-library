@@ -155,7 +155,7 @@ def start(host, owner_id, body, *, ack_at=None):
             copy = snapshots_module.copy_for_offline(host, external_id, body.get("config") or None, body.get("split") or None)
             if copy is None:
                 raise
-            dataset = snapshots_module.offline_preview(host, copy)
+            dataset = snapshots_module.offline_detail(host, copy, rows=False)
     except preview_module.LicenseHidden:
         raise Refused(403, "license_hidden", "This dataset's license is not allowed on this platform, so it cannot be imported.")
     except preview_module.NotInLibrary:

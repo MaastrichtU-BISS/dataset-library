@@ -505,3 +505,43 @@ def test_the_sweep_fails_a_copy_a_worker_left_building(client, app, snapshot_dir
 
     copy = copy_row(app, pinned["ref"])
     assert (copy["status"], copy["error_code"]) == ("failed", "stopped")
+
+
+# --- Opening a dataset while Hugging Face is down ----------------------------------
+
+def test_a_dataset_opens_from_its_copy_while_hugging_face_is_down(client, app, hub, cache, snapshot_dir, tmp_path):
+    ready_copy(client, app, snapshot_dir, tmp_path)
+    take_hub_down(hub, cache)
+
+    resp = client.get(f"/api/library/datasets/huggingface/{GREEK}", headers=ALICE)
+
+    assert resp.status_code == 200, resp.get_json()
+    body = resp.get_json()
+    assert (body["preview"], body["offline"], body["config"], body["split"]) == ("ok", True, "volume", "train")
+    assert [(column["name"], column["type"]) for column in body["columns"]] == [("text", "text"), ("label", "number"), ("extra", "text")]
+    # The rows are the copy's first rows, with class labels by name, as the live preview shows them.
+    assert body["rows"] == [
+        ["A clause", "Terminations", "x"], ["Another", "Governing Laws", "x"], ["Third", "Notices", "x"],
+    ]
+    assert (body["rowCount"], body["revision"]) == (3, SHA)
+
+
+def test_a_dataset_whose_copy_file_cannot_be_read_still_opens_without_rows(client, app, hub, cache, snapshot_dir, tmp_path):
+    _, copy = ready_copy(client, app, snapshot_dir, tmp_path)
+    os.remove(os.path.join(snapshot_dir, copy["file_path"]))
+    take_hub_down(hub, cache)
+
+    body = client.get(f"/api/library/datasets/huggingface/{GREEK}", headers=ALICE).get_json()
+
+    assert (body["preview"], body["rows"], body["offline"]) == ("ok", [], True)
+    assert [column["name"] for column in body["columns"]] == ["text", "label", "extra"]
+
+
+def test_a_copy_whose_license_is_now_hidden_is_not_opened_offline(client, app, hub, cache, snapshot_dir, tmp_path):
+    ready_copy(client, app, snapshot_dir, tmp_path)
+    set_policy(app, {"cc-by-4.0": "hide"})
+    take_hub_down(hub, cache)
+
+    resp = client.get(f"/api/library/datasets/huggingface/{GREEK}", headers=ALICE)
+
+    assert (resp.status_code, resp.get_json()["code"]) == (404, "not_found")

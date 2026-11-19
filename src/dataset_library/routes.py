@@ -7,8 +7,9 @@ from . import labels as labels_module
 from . import pins as pins_module
 from . import policy as policy_module
 from . import preview as preview_module
-from .errors import ProviderRateLimited, ProviderUnavailable
+from .errors import ProviderError, ProviderRateLimited, ProviderUnavailable
 from . import search as search_module
+from . import snapshots as snapshots_module
 from .licenses import GROUPS, LICENSES
 from .providers.huggingface import DATASET_ID_PATTERN, PrivateDataset
 from .tasks import hugging_face_filter
@@ -124,23 +125,27 @@ def labels():
 # their own database ids (BAIGLE refuses any that is not a UUID).
 @library_bp.route("/datasets/huggingface/<path:dataset_ref>", methods=["GET"])
 def dataset(dataset_ref):
-    """One dataset's facts, configs and first rows (`?config=&split=`)."""
+    """One dataset's facts, configs and first rows (`?config=&split=`). While Hugging
+    Face cannot be asked, the copy the platform keeps of this part stands in (#121)."""
     if not DATASET_ID_PATTERN.match(dataset_ref):
         raise ApiError(400, f"Not a Hugging Face dataset id: {dataset_ref}", "bad_id")
+    config, split = request.args.get("config") or None, request.args.get("split") or None
     try:
-        return jsonify(
-            preview_module.preview(
-                _host(), dataset_ref, request.args.get("config") or None, request.args.get("split") or None
-            )
-        )
+        return jsonify(preview_module.preview(_host(), dataset_ref, config, split))
     except (preview_module.NotInLibrary, PrivateDataset):
         raise ApiError(404, "That dataset is not in the library.", "not_found")
     except preview_module.UnknownConfig:
         raise ApiError(400, "That dataset has no such configuration or split.", "bad_config")
-    except ProviderRateLimited:
-        raise ApiError(503, "Hugging Face is limiting requests. Try again in a few minutes.", "provider_rate_limited")
-    except ProviderUnavailable:
-        raise ApiError(503, "Hugging Face is unavailable right now. Try again in a few minutes.", "provider_unavailable")
+    except ProviderError as down:
+        copy = snapshots_module.copy_for_offline(_host(), dataset_ref, config, split)
+        if copy is None:
+            if isinstance(down, ProviderRateLimited):
+                raise ApiError(503, "Hugging Face is limiting requests. Try again in a few minutes.", "provider_rate_limited")
+            raise ApiError(503, "Hugging Face is unavailable right now. Try again in a few minutes.", "provider_unavailable")
+        try:
+            return jsonify(snapshots_module.offline_detail(_host(), copy))
+        except preview_module.LicenseHidden:
+            raise ApiError(404, "That dataset is not in the library.", "not_found")
 
 
 @library_bp.route("/provenance/<dataset_ref>", methods=["GET"])

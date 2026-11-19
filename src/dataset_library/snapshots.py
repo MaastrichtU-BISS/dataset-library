@@ -218,29 +218,92 @@ def copy_for_offline(host, external_id, config, split):
     return copy
 
 
-def offline_preview(host, copy):
-    """What a preview says about a copy's dataset, taken from the pin it was made for,
-    for an import while Hugging Face cannot be asked. The license is the platform's
-    level now, as preview applies it. Raises LicenseHidden when it is hidden."""
+def offline_detail(host, copy, *, rows=True):
+    """A dataset as the library shows it while Hugging Face cannot be asked: the card
+    of the pin the copy was made for, the copy's columns and its first rows. An import
+    takes the same facts (`rows=False` skips reading the file). The license is the
+    platform's level now, as preview applies it; LicenseHidden when it is hidden."""
     pin = host.db.session.get(LibraryPin, copy.pin_id)
     license = LICENSES.get(copy.license or "", UNKNOWN)
     level = policy_module.level(license, policy_module.overrides(host.db))
     if level == "hide":
         raise LicenseHidden()
     card = pin.card
+    columns = [{"name": column["name"], "type": _readable_type(column.get("type", ""))} for column in copy.columns or []]
+    sample = []
+    if rows and host.snapshot_dir is not None and copy.file_path:
+        sample = _first_rows(file_of(host.snapshot_dir, copy), [column["name"] for column in columns])
     return {
+        "id": f"{copy.provider}:{copy.external_id}",
+        "provider": copy.provider,
         "externalId": copy.external_id,
+        "author": copy.external_id.split("/")[0],
         "title": card.get("title") or copy.external_id.split("/")[-1],
         "url": card.get("url"),
-        "citation": card.get("citation"),
-        "gated": bool(card.get("gated")),
-        "preview": "ok",
+        "tasks": card.get("tasks") or [],
         "license": license.at_level(level),
+        "size": card.get("size"),
+        "gated": bool(card.get("gated")),
+        "description": card.get("description"),
+        "updated": card.get("updated"),
+        "revision": copy.revision,
+        "downloads": card.get("downloads") or 0,
+        "citation": {**card["citation"], "revision": copy.revision} if card.get("citation") else None,
+        "labels": pin.labelled,
+        "preview": "ok",
+        "configs": [{"name": copy.config, "splits": [copy.split]}],
         "config": copy.config,
         "split": copy.split,
-        "columns": copy.columns or [],
-        "revision": copy.revision,
+        "columns": columns,
+        "rows": sample,
+        "rowCount": copy.row_count,
+        "proposed": {"taskType": None, "textColumn": None, "labelColumn": None},
+        # The copy stands in for Hugging Face: the page says so, and it can still be imported.
+        "offline": True,
     }
+
+
+def _readable_type(arrow_type):
+    """A column's type as a student reads it, from the copy's Arrow type."""
+    if arrow_type in ("string", "large_string"):
+        return "text"
+    if arrow_type.startswith(("int", "uint", "float", "double", "halffloat")):
+        return "number"
+    if arrow_type == "bool":
+        return "yes/no"
+    if arrow_type.startswith(("list", "large_list", "fixed_size_list")):
+        return "list"
+    return arrow_type
+
+
+def _first_rows(path, names):
+    """The first rows of a copy's file, cells as the preview shows them. Nothing when the
+    file cannot be read: the copy still imports, it just shows no rows."""
+    import pyarrow.parquet as pq
+
+    from .preview import ROWS, _cell
+
+    try:
+        parquet_file = pq.ParquetFile(path)
+        batch = next(parquet_file.iter_batches(batch_size=ROWS, columns=names), None)
+    except (OSError, ValueError, KeyError) as exc:
+        logger.warning(f"library.snapshot.preview_unreadable file={os.path.basename(path)} error={exc}")
+        return []
+    if batch is None:
+        return []
+    features = _features(parquet_file.schema_arrow.metadata)
+    table = batch.to_pydict()
+    return [[_cell(table[name][index], features.get(name)) for name in names] for index in range(batch.num_rows)]
+
+
+def _features(metadata):
+    """The Hugging Face feature map a shard carries in its schema metadata, or {}."""
+    import json
+
+    try:
+        return json.loads((metadata or {})[b"huggingface"])["info"]["features"] or {}
+    except (KeyError, ValueError, TypeError):
+        return {}
 
 
 def file_of(snapshot_dir, copy):

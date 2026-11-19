@@ -164,6 +164,8 @@ label `dataset_library`).
   `not_retryable`).
 - `POST /api/library/imports/<ref>/dismiss` → puts a finished import away;
   409 `running` while it runs.
+- `GET /api/library/datasets/huggingface/<org>/<name>` while Hugging Face cannot be asked: the copy the
+  platform keeps of that part stands in (`offline: true`, its columns and first rows); 503 without one.
 - Admins only: `POST /api/library/pins/<pin_ref>/snapshot` keeps a copy of a pin
   that has none, or whose copy failed (202; the worker makes it). 409 `not_allowed`
   unless the dataset's license is Allow; 404 `not_offered` when the host keeps no
