@@ -120,6 +120,27 @@ class Refused(Exception):
         self.status, self.code, self.message = status, code, message
 
 
+def _facts(host, external_id, config, split):
+    """The dataset as an import checks it, and the copy it reads (or None). When Hugging
+    Face cannot be asked, or the viewer did not answer, the platform's copy of this part
+    stands in, if it has one (#121); otherwise the preview is used as it is, and a
+    ProviderError is raised only when there is no copy to fall back on."""
+    from . import preview as preview_module  # lazy, as start() imports it
+
+    try:
+        dataset = preview_module.preview(host, external_id, config, split)
+    except ProviderError:
+        copy = snapshots_module.copy_for_offline(host, external_id, config, split)
+        if copy is None:
+            raise
+        return snapshots_module.offline_detail(host, copy, rows=False), copy
+    if dataset.get(preview_module.VIEWER_DOWN):
+        copy = snapshots_module.copy_for_offline(host, external_id, config, split)
+        if copy is not None:
+            return snapshots_module.offline_detail(host, copy, rows=False), copy
+    return dataset, None
+
+
 def start(host, owner_id, body, *, ack_at=None):
     """Check the request against the dataset as previewed, store the import as
     queued, then hand it to the host's queue. Returns the import as JSON, and
@@ -146,16 +167,8 @@ def start(host, owner_id, body, *, ack_at=None):
     size = body.get("size")
     if isinstance(size, bool) or not isinstance(size, int) or size < 1:
         raise Refused(400, "bad_size", "Say how many rows to import, as a whole number above 0.")
-    copy = None
     try:
-        try:
-            dataset = preview_module.preview(host, external_id, body.get("config") or None, body.get("split") or None)
-        except ProviderError:
-            # Hugging Face cannot be asked: a copy of this part of the dataset stands in (#121).
-            copy = snapshots_module.copy_for_offline(host, external_id, body.get("config") or None, body.get("split") or None)
-            if copy is None:
-                raise
-            dataset = snapshots_module.offline_detail(host, copy, rows=False)
+        dataset, copy = _facts(host, external_id, body.get("config") or None, body.get("split") or None)
     except preview_module.LicenseHidden:
         raise Refused(403, "license_hidden", "This dataset's license is not allowed on this platform, so it cannot be imported.")
     except preview_module.NotInLibrary:

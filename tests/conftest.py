@@ -86,6 +86,7 @@ class FakeHub:
         self.records = list(records.values())
         self.calls = []
         self.fail = None  # an HTTP status, "malformed" or "timeout"
+        self.viewer_fail = None  # an HTTP status for the dataset viewer alone: the Hub still answers
         self.gone_revisions = set()  # (dataset id, sha) pairs the Hub no longer has
 
     def get(self, url, params=None, timeout=None, **kwargs):
@@ -98,6 +99,8 @@ class FakeHub:
         if self.fail:
             return FakeResponse(self.fail, {"error": "busy"})
         if url.startswith(VIEWER_URL):
+            if self.viewer_fail:
+                return FakeResponse(self.viewer_fail, {"error": "The viewer is down"})
             query = url.removeprefix(VIEWER_URL) + "?" + "&".join(f"{k}={params[k]}" for k in ("dataset", "config", "split") if k in params)
             recorded = VIEWER.get(query, {"status": 404, "body": {"error": "not recorded"}})
             return FakeResponse(recorded["status"], recorded["body"])

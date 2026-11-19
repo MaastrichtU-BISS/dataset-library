@@ -62,6 +62,37 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 - `search()` returns the pinned datasets, not an empty list, when the Hub is
   unavailable. The status stays `unavailable`, which the page shows as its banner.
+- Copies are kept for a viewer outage too (#121 rework). When the dataset viewer
+  (datasets-server) does not answer but the Hub does, the preview says so with
+  `viewerDown: true` and is not cached. The dataset opens from its copy of the same
+  part (`offline: true`), and `POST /imports` reads the copy, as it does when the Hub
+  is down. With no copy, the preview is unchanged and the import is refused as
+  `not_importable`. A configured part is no longer refused while the viewer is down.
+- A try at a copy has its own id (a failed copy is tried again as a new row), and its
+  files are named by that id: `<id>.parquet`, and the work directory `.incoming/<id>`.
+  A try still running after its copy was swept and tried again cannot finish the
+  newer copy or delete its files. A building copy refreshes `updated_at` every 15
+  seconds, so the sweep fails only builds that have really stopped.
+- Unpinning deletes a copy's file and work area by the copy's id, whatever path its row
+  holds, so a file left by a crashed build goes too. The sweep fails a stuck build and
+  removes its work area and file; it also removes any work area or copy file that no
+  copy still owns.
+- A copy is kept only while its pin exists and its license is still Allow, checked when
+  it is ready. A copy whose pin is removed, or whose license is no longer Allow, while
+  it is made is dropped with its file. An import reads a copy, or an offline dataset
+  shows one, only while the pin exists and the license is Allow; a hidden license is
+  not in the library (404, or `license_hidden` for an import).
+- A request that loses a race to another request for the same pin returns the copy
+  that other request queued.
+- `check_upstream` records each answer on its own, so a copy unpinned meanwhile is a
+  no-op, and the round ends at the first check the Hub cannot answer.
+- An offline dataset's columns are typed from the copy's Hugging Face features, as the
+  live preview types them (a ClassLabel is a class label), and its proposed task is the
+  one the live preview would propose from the same columns (NER and summarization keep
+  theirs). `rowCount` is the copy's rows, not the split's.
+- An offline search result's `title` is the pin's title, else the card's, else the last
+  part of the dataset id, as `pins.to_dict` names a pin.
+- A copy file that cannot be read (corrupt, or missing) opens without rows, never a 500.
 
 ## [0.11.0] - 2026-11-19
 

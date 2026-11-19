@@ -5,17 +5,19 @@ Shards are small Parquet files; the Hub is faked at its HTTP boundary, as in the
 other tests, so nothing here reaches the network."""
 import errno
 import os
+import time
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pyarrow.parquet as pq
 import pytest
 import sqlalchemy as sa
 
-from dataset_library import imports, pins, snapshots
+from dataset_library import imports, pins, preview as preview_module, snapshots
 from dataset_library.errors import ProviderUnavailable
-from dataset_library.models import LibraryImport, LibrarySettings, LibrarySnapshot
+from dataset_library.models import LibraryImport, LibraryPin, LibrarySettings, LibrarySnapshot
 from dataset_library.providers import huggingface
-from test_import import FakeCreateDataset, run, write_shard  # noqa: F401 - `run` is a fixture
+from test_import import FakeCreateDataset, run, write_ner_shard, write_shard, write_summarization_shard  # noqa: F401 - `run` is a fixture
 from tests.conftest import ADMIN, ALICE
 
 # AI-team-UoA/greek_legal_code: its revision in the recorded Hub fixture, classification, cc-by-4.0 (Allow), with rows
@@ -366,6 +368,9 @@ def test_an_import_that_loses_hugging_face_mid_run_reads_the_copy_of_the_same_pa
     assert result["status"] == "completed"
     assert (result["source"], result["revision"]) == ("snapshot", SHA)
     assert len(create.calls[0]["rows"]) == 2
+    # The Dataset's provenance says the same: the copy was read, at its revision.
+    provenance = client.get(f"/api/library/provenance/{result['datasetRef']}", headers=ALICE).get_json()
+    assert (provenance["source"], provenance["revision"]) == ("snapshot", SHA)
 
 
 def test_a_copy_of_another_part_is_not_read_in_place_of_a_download(app, run, client, snapshot_dir, tmp_path):
@@ -520,7 +525,10 @@ def test_a_dataset_opens_from_its_copy_while_hugging_face_is_down(client, app, h
     assert resp.status_code == 200, resp.get_json()
     body = resp.get_json()
     assert (body["preview"], body["offline"], body["config"], body["split"]) == ("ok", True, "volume", "train")
-    assert [(column["name"], column["type"]) for column in body["columns"]] == [("text", "text"), ("label", "number"), ("extra", "text")]
+    # The label is a ClassLabel in the copy's Hugging Face features, so it shows as one, as the live preview does.
+    assert [(column["name"], column["type"]) for column in body["columns"]] == [
+        ("text", "text"), ("label", "class label, 3 classes"), ("extra", "text"),
+    ]
     # The rows are the copy's first rows, with class labels by name, as the live preview shows them.
     assert body["rows"] == [
         ["A clause", "Terminations", "x"], ["Another", "Governing Laws", "x"], ["Third", "Notices", "x"],
@@ -547,3 +555,432 @@ def test_a_copy_whose_license_is_now_hidden_is_not_opened_offline(client, app, h
     resp = client.get(f"/api/library/datasets/huggingface/{GREEK}", headers=ALICE)
 
     assert (resp.status_code, resp.get_json()["code"]) == (404, "not_found")
+
+
+def drop_pin_row(app, pin_ref):
+    """A pin removed underneath its copy, as a removal that has not reached the copy would leave it."""
+    with app.app_context():
+        app.db.session.execute(sa.text("DELETE FROM library_pins WHERE id = :id"), {"id": pin_ref})
+        app.db.session.commit()
+
+
+# --- A viewer that is down while the Hub answers (#121) -------------------------------
+
+def take_viewer_down(hub, cache):
+    """datasets-server stops answering while the Hub still does; previews cached while it answered are gone."""
+    hub.viewer_fail = 503
+    cache.expire("library:")
+
+
+def test_with_only_the_viewer_down_a_dataset_opens_from_its_copy_and_imports_from_it(client, app, hub, cache, snapshot_dir, tmp_path):
+    ready_copy(client, app, snapshot_dir, tmp_path)
+    take_viewer_down(hub, cache)
+
+    body = client.get(f"/api/library/datasets/huggingface/{GREEK}", headers=ALICE).get_json()
+
+    assert (body["preview"], body["offline"], body["config"], body["split"]) == ("ok", True, "volume", "train")
+    assert body["rows"][0] == ["A clause", "Terminations", "x"]
+    resp = offline_import(client)
+    assert resp.status_code == 202, resp.get_json()
+    started = resp.get_json()
+    assert (started["source"], started["revision"]) == ("snapshot", SHA)
+
+    result, create = work_off(app, started["id"], snapshot_dir, tmp_path)
+
+    assert result["status"] == "completed"
+    assert len(create.calls[0]["rows"]) == 2
+    provenance = client.get(f"/api/library/provenance/{result['datasetRef']}", headers=ALICE).get_json()
+    assert (provenance["source"], provenance["revision"]) == ("snapshot", SHA)
+
+
+def test_a_preview_built_while_the_viewer_is_down_is_not_kept_for_the_next_open(client, hub, cache):
+    take_viewer_down(hub, cache)
+    first = client.get(f"/api/library/datasets/huggingface/{GREEK}", headers=ALICE).get_json()
+    assert (first["preview"], first["viewerDown"]) == ("unavailable", True)
+
+    hub.viewer_fail = None
+    second = client.get(f"/api/library/datasets/huggingface/{GREEK}", headers=ALICE).get_json()
+
+    assert second["preview"] == "ok"
+    assert "viewerDown" not in second
+
+
+def test_with_the_viewer_down_and_no_copy_an_import_is_still_refused_as_not_importable(client, hub, cache, imports_queue):
+    take_viewer_down(hub, cache)
+
+    resp = offline_import(client)
+
+    assert (resp.status_code, resp.get_json()["code"]) == (409, "not_importable")
+    assert imports_queue.refs == []
+
+
+def test_a_pin_made_while_the_viewer_is_down_says_its_copy_was_busy_and_a_retry_makes_one(client, app, hub, cache, copies_queue):
+    take_viewer_down(hub, cache)
+    pinned = pin_as_admin(client)
+    assert (pinned["snapshot"]["status"], pinned["snapshot"]["error"]) == ("failed", snapshots.BUSY)
+
+    hub.viewer_fail = None
+    resp = client.post(f"/api/library/pins/{pinned['ref']}/snapshot", headers=ADMIN)
+
+    assert resp.status_code == 202, resp.get_json()
+    assert resp.get_json()["snapshot"]["status"] == "queued"
+    assert copies_queue.refs == [copy_row(app, pinned["ref"])["id"]]
+
+
+# --- Crashed builds (#121) ------------------------------------------------------------
+
+def leave_killed_build(app, copy_id, snapshot_dir):
+    """What a worker killed mid-build leaves: its row building and long stale, a part file in
+    its work area, and its staged file already renamed into the snapshot directory."""
+    work = os.path.join(snapshot_dir, snapshots.INCOMING, copy_id)
+    os.makedirs(work)
+    with open(os.path.join(work, "0000.parquet"), "wb") as part:
+        part.write(b"part")
+    kept = os.path.join(snapshot_dir, f"{copy_id}.parquet")
+    with open(kept, "wb") as staged:
+        staged.write(b"copy")
+    with app.app_context():
+        copy = app.db.session.get(LibrarySnapshot, copy_id)
+        copy.status, copy.updated_at = "building", utc_now() - timedelta(hours=2)
+        app.db.session.commit()
+    return work, kept
+
+
+def test_the_sweep_fails_a_killed_build_and_removes_what_it_left(client, app, snapshot_dir):
+    pinned = pin_as_admin(client)
+    copy_id = copy_row(app, pinned["ref"])["id"]
+    work, kept = leave_killed_build(app, copy_id, snapshot_dir)
+
+    with app.app_context():
+        assert snapshots.sweep(app.db.session, snapshot_dir) == [copy_id]
+
+    copy = copy_row(app, pinned["ref"])
+    assert (copy["status"], copy["error_code"]) == ("failed", "stopped")
+    assert not os.path.exists(work)
+    assert not os.path.exists(kept)
+
+
+def test_unpinning_a_failed_copy_deletes_a_stray_file_and_work_area_under_its_id(client, app, snapshot_dir):
+    pinned = pin_as_admin(client)
+    copy_id = copy_row(app, pinned["ref"])["id"]
+    work, kept = leave_killed_build(app, copy_id, snapshot_dir)
+    with app.app_context():
+        copy = app.db.session.get(LibrarySnapshot, copy_id)
+        # Failed, and with a path the row does not hold: the files are found by the copy's id, not its path.
+        copy.status, copy.file_path = "failed", "unrecorded.parquet"
+        app.db.session.commit()
+
+    assert client.delete(f"/api/library/pins/{pinned['ref']}", headers=ADMIN).status_code == 204
+
+    assert copy_row(app) is None
+    assert not os.path.exists(kept)
+    assert not os.path.exists(work)
+
+
+def test_the_sweep_removes_files_and_work_areas_that_no_kept_copy_owns(client, app, snapshot_dir, tmp_path):
+    pinned, copy = ready_copy(client, app, snapshot_dir, tmp_path)
+    ghost = "5f1d0b8e-6c2a-4f3e-9a7b-2d4c6e8f0a1b"  # a copy with no row at all
+    ghost_work = os.path.join(snapshot_dir, snapshots.INCOMING, ghost)
+    ghost_file = os.path.join(snapshot_dir, f"{ghost}.parquet")
+    os.makedirs(ghost_work)
+    open(ghost_file, "wb").close()
+    kept_work = os.path.join(snapshot_dir, snapshots.INCOMING, copy["id"])
+    os.makedirs(kept_work)
+
+    with app.app_context():
+        snapshots.sweep(app.db.session, snapshot_dir)
+
+    assert not os.path.exists(ghost_work)
+    assert not os.path.exists(ghost_file)
+    assert not os.path.exists(kept_work)
+    assert copy_files(snapshot_dir) == [copy["file_path"]]
+
+
+# --- Attempts and heartbeats (#121) ---------------------------------------------------
+
+def test_a_stale_build_is_retried_as_a_new_copy_and_the_old_try_cannot_finish_or_delete_it(client, app, snapshot_dir, tmp_path):
+    pinned = pin_as_admin(client)
+    old_id = copy_row(app, pinned["ref"])["id"]
+    shards = shards_of_three(tmp_path)
+    host = app.extensions["dataset_library"]
+
+    def fetch_until_the_copy_is_retried(external_id, config, split, max_bytes, dest_dir):
+        # The worker of the first try goes quiet: the sweep fails it, an admin asks again, and the new try is made.
+        with app.app_context():
+            assert snapshots.sweep(app.db.session, snapshot_dir, now=utc_now() + timedelta(hours=1)) == [old_id]
+            assert pins.take_copy(host, pinned["ref"])["snapshot"]["status"] == "queued"
+        build_copy(app, copy_row(app, pinned["ref"])["id"], snapshot_dir, shards)
+        # Then the first try finishes, late, with what it fetched.
+        return imports.Fetched(paths=[str(path) for path in shards], revision=SHA)
+
+    with app.app_context():
+        snapshots.run_copy(
+            old_id, session=app.db.session, fetch_shards=fetch_until_the_copy_is_retried,
+            snapshot_dir=snapshot_dir, max_bytes=10**9, heartbeat_seconds=None,
+        )
+
+    copy = copy_row(app, pinned["ref"])
+    assert copy["id"] != old_id
+    assert (copy["status"], copy["row_count"]) == ("ready", 3)
+    assert copy_files(snapshot_dir) == [copy["file_path"]]
+    assert os.listdir(os.path.join(snapshot_dir, snapshots.INCOMING)) == []
+    with app.app_context():
+        assert app.db.session.get(LibrarySnapshot, old_id) is None
+
+
+def test_a_building_copy_refreshes_its_updated_at_while_it_runs(make_app, hub, tmp_path, snapshot_dir):
+    """On a file database, so the heartbeat's own connection sees the copy."""
+    app = make_app(
+        enqueue=Queue(), enqueue_snapshot=Queue(), snapshot_dir=snapshot_dir, max_rows=lambda: 300,
+        config={"SQLALCHEMY_DATABASE_URI": f"sqlite:///{tmp_path / 'db.sqlite'}"},
+    )
+    pinned = pin_as_admin(app.test_client())
+    copy_id = copy_row(app, pinned["ref"])["id"]
+    shards = shards_of_three(tmp_path)
+    beats = []
+
+    def slow_fetch(external_id, config, split, max_bytes, dest_dir):
+        with app.db.engine.connect() as connection:
+            first = connection.execute(sa.text("SELECT updated_at FROM library_snapshots")).scalar_one()
+        time.sleep(0.3)
+        with app.db.engine.connect() as connection:
+            beats.append((first, connection.execute(sa.text("SELECT updated_at FROM library_snapshots")).scalar_one()))
+        return imports.Fetched(paths=[str(path) for path in shards], revision=SHA)
+
+    with app.app_context():
+        snapshots.run_copy(
+            copy_id, session=app.db.session, fetch_shards=slow_fetch,
+            snapshot_dir=snapshot_dir, max_bytes=10**9, heartbeat_seconds=0.05,
+        )
+
+    [(first, later)] = beats
+    assert later > first
+    assert copy_row(app, pinned["ref"])["status"] == "ready"
+
+
+# --- Pins and licenses that change while a copy is made (#121) ------------------------
+
+def test_no_copy_is_queued_for_a_pin_removed_meanwhile(client, app, copies_queue):
+    pinned = pin_as_admin(client)
+    host = app.extensions["dataset_library"]
+    queued = list(copies_queue.refs)
+    with app.app_context():
+        facts = preview_module.preview(host, GREEK)
+        pins.remove(host, pinned["ref"])
+        # The request still holds the pin it found before the removal.
+        stale = SimpleNamespace(id=pinned["ref"], provider="huggingface", external_id=GREEK)
+        assert snapshots.request_copy(host, stale, facts) is None
+
+    assert copy_row(app) is None
+    assert copies_queue.refs == queued
+
+
+def test_a_request_that_finds_a_copy_queued_meanwhile_returns_that_copy(client, app, copies_queue, monkeypatch):
+    pinned = pin_as_admin(client)
+    existing = copy_row(app, pinned["ref"])["id"]
+    host = app.extensions["dataset_library"]
+    real_for_pin = snapshots.for_pin
+    looks = []
+
+    def first_look_finds_nothing(session, pin_id):
+        # The other request has not committed its copy when this one first looks.
+        looks.append(pin_id)
+        return None if len(looks) == 1 else real_for_pin(session, pin_id)
+
+    monkeypatch.setattr(snapshots, "for_pin", first_look_finds_nothing)
+    stale = SimpleNamespace(id=pinned["ref"], provider="huggingface", external_id=GREEK)
+    with app.app_context():
+        facts = preview_module.preview(host, GREEK)
+        returned = snapshots.request_copy(host, stale, facts).id
+
+    assert returned == existing
+    assert copies_queue.refs == [existing]
+
+
+def test_a_pin_removed_while_its_copy_is_made_gets_no_copy_and_no_file(client, app, snapshot_dir, tmp_path):
+    pinned = pin_as_admin(client)
+    copy_id = copy_row(app, pinned["ref"])["id"]
+    shards = shards_of_three(tmp_path)
+
+    def fetch_and_unpin(external_id, config, split, max_bytes, dest_dir):
+        drop_pin_row(app, pinned["ref"])
+        return imports.Fetched(paths=[str(path) for path in shards], revision=SHA)
+
+    with app.app_context():
+        snapshots.run_copy(
+            copy_id, session=app.db.session, fetch_shards=fetch_and_unpin,
+            snapshot_dir=snapshot_dir, max_bytes=10**9, heartbeat_seconds=None,
+        )
+
+    assert copy_row(app) is None
+    assert copy_files(snapshot_dir) == []
+    assert os.listdir(os.path.join(snapshot_dir, snapshots.INCOMING)) == []
+
+
+def test_a_license_changed_to_warn_while_its_copy_is_made_leaves_no_copy_and_no_file(client, app, snapshot_dir, tmp_path):
+    pinned = pin_as_admin(client)
+    copy_id = copy_row(app, pinned["ref"])["id"]
+    shards = shards_of_three(tmp_path)
+
+    def fetch_and_restrict(external_id, config, split, max_bytes, dest_dir):
+        set_policy(app, {"cc-by-4.0": "warn"})
+        return imports.Fetched(paths=[str(path) for path in shards], revision=SHA)
+
+    with app.app_context():
+        snapshots.run_copy(
+            copy_id, session=app.db.session, fetch_shards=fetch_and_restrict,
+            snapshot_dir=snapshot_dir, max_bytes=10**9, heartbeat_seconds=None,
+        )
+
+    assert copy_row(app) is None
+    assert copy_files(snapshot_dir) == []
+    assert os.listdir(os.path.join(snapshot_dir, snapshots.INCOMING)) == []
+
+
+@pytest.mark.parametrize("change", ["license", "pin"])
+def test_a_copy_is_not_offered_once_its_license_is_not_allow_or_its_pin_is_gone(client, app, hub, cache, snapshot_dir, tmp_path, change):
+    pinned, _ = ready_copy(client, app, snapshot_dir, tmp_path)
+    if change == "license":
+        set_policy(app, {"cc-by-4.0": "warn"})
+    else:
+        drop_pin_row(app, pinned["ref"])
+    take_hub_down(hub, cache)
+
+    resp = client.get(f"/api/library/datasets/huggingface/{GREEK}", headers=ALICE)
+
+    assert (resp.status_code, resp.get_json()["code"]) == (503, "provider_unavailable")
+
+
+@pytest.mark.parametrize("change", ["license", "pin"])
+def test_a_running_import_reads_no_copy_once_its_license_is_not_allow_or_its_pin_is_gone(app, run, client, snapshot_dir, tmp_path, change):
+    pinned, _ = ready_copy(client, app, snapshot_dir, tmp_path)
+    if change == "license":
+        set_policy(app, {"cc-by-4.0": "warn"})
+    else:
+        drop_pin_row(app, pinned["ref"])
+
+    result, create = run(
+        [write_shard(tmp_path / "unused.parquet", ["x"], [0])], size=2,
+        external_id=GREEK, config="volume", fail_fetch=ProviderUnavailable("Hugging Face 503"), snapshot_dir=snapshot_dir,
+    )
+
+    assert (result["status"], result["code"]) == ("failed", "provider_busy")
+    assert create.calls == []
+
+
+# --- Upstream checks (#121) -----------------------------------------------------------
+
+def add_ready_copies(app, count):
+    """Ready copies of `count` pins, made directly: what these tests are about is the Hub's answers."""
+    external_ids = [f"coastalcph/kept-{n}" for n in range(count)]
+    with app.app_context():
+        session = app.db.session
+        for external_id in external_ids:
+            pin = LibraryPin(provider="huggingface", external_id=external_id, card={"license": {"id": "cc-by-4.0"}}, labelled="unclear")
+            session.add(pin)
+            session.flush()
+            session.add(LibrarySnapshot(
+                pin_id=pin.id, provider="huggingface", external_id=external_id, config="ledgar", split="train",
+                revision=SHA, license="cc-by-4.0", status="ready", row_count=1,
+            ))
+        session.commit()
+    return external_ids
+
+
+def test_a_hub_outage_ends_the_upstream_round_at_its_first_failed_check(app):
+    add_ready_copies(app, 3)
+    asked = []
+
+    def hub_down(external_id, revision):
+        asked.append(external_id)
+        raise ProviderUnavailable("Hugging Face 503")
+
+    with app.app_context():
+        assert snapshots.check_upstream(app.db.session, revision_exists=hub_down) == 0
+        assert app.db.session.query(LibrarySnapshot).filter(LibrarySnapshot.upstream_checked_at.is_(None)).count() == 3
+    assert len(asked) == 1
+
+
+def test_a_copy_unpinned_during_the_upstream_round_is_a_no_op_and_the_rest_are_still_checked(app):
+    external_ids = add_ready_copies(app, 3)
+    gone = external_ids[0]
+
+    def check(external_id, revision):
+        if external_id == gone:
+            # The copy is unpinned while the Hub is asked about it.
+            with app.app_context():
+                app.db.session.execute(sa.text("DELETE FROM library_snapshots WHERE external_id = :id"), {"id": gone})
+                app.db.session.commit()
+            return False
+        return True
+
+    with app.app_context():
+        assert snapshots.check_upstream(app.db.session, revision_exists=check) == 2
+        rows = {copy.external_id: copy for copy in app.db.session.query(LibrarySnapshot)}
+    assert gone not in rows
+    assert {rows[external_id].upstream_checked_at is not None for external_id in external_ids[1:]} == {True}
+    assert not any(rows[external_id].upstream_changed for external_id in external_ids[1:])
+
+
+# --- Opening a copy offline: types, proposals, and what the rows are (#121) -----------
+
+NER = "coastalcph/legal_ner"
+SUMMARIES = "coastalcph/legal_summaries"
+
+
+def test_an_offline_open_proposes_the_task_the_live_preview_would_for_its_columns(client, app, hub, cache, snapshot_dir, tmp_path):
+    pinned = pin_as_admin(client, NER)
+    shard = write_ner_shard(tmp_path / "ner.parquet", [["Clause", "one"], ["Another"]], [[1, 0], [0]])
+    build_copy(app, copy_row(app, pinned["ref"])["id"], snapshot_dir, [shard])
+    take_hub_down(hub, cache)
+
+    body = client.get(f"/api/library/datasets/huggingface/{NER}", headers=ALICE).get_json()
+
+    assert body["offline"] is True
+    assert [column["name"] for column in body["columns"]] == ["tokens", "ner_tags"]
+    assert body["proposed"] == {"taskType": "ner", "textColumn": "tokens", "labelColumn": "ner_tags"}
+    assert body["rowCount"] == 2
+
+
+def test_an_offline_open_proposes_the_summary_columns_for_a_summarization_pin(client, app, hub, cache, snapshot_dir, tmp_path):
+    pinned = pin_as_admin(client, SUMMARIES)
+    shard = write_summarization_shard(tmp_path / "summaries.parquet", ["A long document.", "Another"], ["Short.", "Brief."])
+    build_copy(app, copy_row(app, pinned["ref"])["id"], snapshot_dir, [shard])
+    take_hub_down(hub, cache)
+
+    body = client.get(f"/api/library/datasets/huggingface/{SUMMARIES}", headers=ALICE).get_json()
+
+    assert body["proposed"] == {"taskType": "summarization", "textColumn": "document", "labelColumn": "summary"}
+    assert body["rowCount"] == 2
+
+
+def test_a_corrupt_copy_opens_without_rows_instead_of_failing(client, app, hub, cache, snapshot_dir, tmp_path):
+    _, copy = ready_copy(client, app, snapshot_dir, tmp_path)
+    with open(os.path.join(snapshot_dir, copy["file_path"]), "wb") as corrupt:
+        corrupt.write(b"not a Parquet file at all" * 10)
+    take_hub_down(hub, cache)
+
+    resp = client.get(f"/api/library/datasets/huggingface/{GREEK}", headers=ALICE)
+
+    assert resp.status_code == 200, resp.get_json()
+    body = resp.get_json()
+    assert (body["preview"], body["rows"], body["offline"]) == ("ok", [], True)
+    assert [column["name"] for column in body["columns"]] == ["text", "label", "extra"]
+
+
+def test_an_offline_search_names_each_pin_by_its_title_then_its_cards_then_its_id(client, app, hub, cache):
+    pin_as_admin(client, GREEK)
+    named = pin_as_admin(client, "coastalcph/lex_glue")
+    assert client.patch(f"/api/library/pins/{named['ref']}", json={"title": "Our LexGLUE"}, headers=ADMIN).status_code == 200
+    untitled = pin_as_admin(client, NER)
+    with app.app_context():
+        pin = app.db.session.get(LibraryPin, untitled["ref"])
+        pin.card = {**pin.card, "title": None}
+        app.db.session.commit()
+    take_hub_down(hub, cache)
+
+    body = client.get("/api/library/search", headers=ALICE).get_json()
+
+    assert body["status"] == "unavailable"
+    titles = {card["externalId"]: card["title"] for card in body["results"]}
+    assert titles == {GREEK: "Greek Legal Code", "coastalcph/lex_glue": "Our LexGLUE", NER: "legal_ner"}

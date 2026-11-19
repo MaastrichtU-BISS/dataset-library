@@ -243,6 +243,8 @@ def offline(host, *, query, task, license_id, source):
             continue
         results.append({
             **card,
+            # As to_dict names a pin: its own title, the card's, else the last part of its id.
+            "title": pin.title or card.get("title") or pin.external_id.split("/")[-1],
             "license": license.at_level(level),
             "pinRef": pin.id,
             "labelled": pin.labelled,

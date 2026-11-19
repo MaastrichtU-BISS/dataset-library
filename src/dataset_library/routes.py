@@ -131,21 +131,34 @@ def dataset(dataset_ref):
         raise ApiError(400, f"Not a Hugging Face dataset id: {dataset_ref}", "bad_id")
     config, split = request.args.get("config") or None, request.args.get("split") or None
     try:
-        return jsonify(preview_module.preview(_host(), dataset_ref, config, split))
+        body = preview_module.preview(_host(), dataset_ref, config, split)
     except (preview_module.NotInLibrary, PrivateDataset):
         raise ApiError(404, "That dataset is not in the library.", "not_found")
     except preview_module.UnknownConfig:
         raise ApiError(400, "That dataset has no such configuration or split.", "bad_config")
     except ProviderError as down:
+        view = _copy_view(dataset_ref, config, split)
+        if view is not None:
+            return view
+        if isinstance(down, ProviderRateLimited):
+            raise ApiError(503, "Hugging Face is limiting requests. Try again in a few minutes.", "provider_rate_limited")
+        raise ApiError(503, "Hugging Face is unavailable right now. Try again in a few minutes.", "provider_unavailable")
+    if body.get(preview_module.VIEWER_DOWN):
+        # The viewer did not answer: the copy of this part, when there is one, shows the rows (#121).
+        view = _copy_view(dataset_ref, config, split)
+        if view is not None:
+            return view
+    return jsonify(body)
+
+
+def _copy_view(dataset_ref, config, split):
+    """The platform's copy of this part of the dataset as the page shows it, or None when
+    there is no copy to show (#121). A copy whose license is now hidden is not in the library."""
+    try:
         copy = snapshots_module.copy_for_offline(_host(), dataset_ref, config, split)
-        if copy is None:
-            if isinstance(down, ProviderRateLimited):
-                raise ApiError(503, "Hugging Face is limiting requests. Try again in a few minutes.", "provider_rate_limited")
-            raise ApiError(503, "Hugging Face is unavailable right now. Try again in a few minutes.", "provider_unavailable")
-        try:
-            return jsonify(snapshots_module.offline_detail(_host(), copy))
-        except preview_module.LicenseHidden:
-            raise ApiError(404, "That dataset is not in the library.", "not_found")
+        return None if copy is None else jsonify(snapshots_module.offline_detail(_host(), copy))
+    except preview_module.LicenseHidden:
+        raise ApiError(404, "That dataset is not in the library.", "not_found")
 
 
 @library_bp.route("/provenance/<dataset_ref>", methods=["GET"])
