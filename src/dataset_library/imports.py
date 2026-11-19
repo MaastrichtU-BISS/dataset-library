@@ -140,7 +140,9 @@ def _facts(host, provider, external_id, config, split, binding=None):
         except ProviderError as down:
             raise Refused(503, "provider_busy", COMMUNITY_BUSY) from down
         if body["preparing"]:
-            raise Refused(503, "preparing", community_provider.PREPARING)
+            # The record passed its live checks; only the cached head is missing (it expired, or was never read). The
+            # worker reads the file and checks the columns itself, as for a file too large to preview (#122 round 3).
+            body = {**body, "importable": True, "preview": "unseen"}
         if not body["importable"]:
             # A record that has closed or gone since the preview is refused in the words a queued import gets (#122,
             # fix 5); the restricted and metadata-only explanations are the preview's.
@@ -217,8 +219,9 @@ def start(host, owner_id, body, *, ack_at=None, pin=None):
         raise Refused(409, "not_importable", "Hugging Face cannot show this dataset's rows, so it cannot be imported.")
     columns = {c["name"] for c in dataset["columns"]}
     text_column, label_column = body.get("textColumn"), body.get("labelColumn") or None
-    # A Community file too large to preview has no columns to check here; the worker checks the names it reads (#122).
-    unseen = provider == COMMUNITY and dataset["preview"] == "too_large"
+    # A Community file too large to preview, or whose preview is not cached, has no columns to check here; the worker
+    # checks the names it reads (#122).
+    unseen = provider == COMMUNITY and dataset["preview"] in ("too_large", "unseen")
     if unseen:
         mapped = isinstance(text_column, str) and text_column.strip() != ""
         labelled = label_column is None or isinstance(label_column, str)

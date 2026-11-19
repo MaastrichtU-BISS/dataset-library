@@ -52,6 +52,9 @@ While the version is 0.x, minor releases may contain breaking changes.
     minutes by origin, Publication, file, checksum and cap, a refusal included. A file over the preview
     budget (16 MB) is not read: `preview` is `too_large` ("Too large to preview here; it can still be
     imported") and the card, files and size stand. A hidden license is refused before anything is queued.
+    A start or retry whose preview is no longer cached (it expired while the student chose columns) is not
+    refused: the record's live checks still apply, and the worker checks the columns against the file it reads.
+    A preview job that finds its answer already cached reads nothing.
   - Import: `POST /api/library/imports` with `provider: "community"` and the record id as `dataset`.
     The same license confirmation as Hugging Face applies: a warn license needs `licenseAck`, a hide
     license is refused with 403. A record that is not importable is refused with 409 and its reason.

@@ -407,7 +407,7 @@ def test_a_community_citation_has_no_revision_when_it_is_started(client, app):
     assert row_of(app, ref)["revision"] is not None  # the checksum stays on the import, for the change check
 
 
-def test_a_start_while_the_preview_is_still_being_prepared_asks_for_a_retry(make_app, zenodo, queue, previews, cache):
+def test_a_start_with_no_cached_preview_is_queued_and_left_to_the_worker(make_app, zenodo, queue, previews, cache):
     app = make_app(
         community_datasets=zenodo.datasets,
         community_record=zenodo.record,
@@ -420,19 +420,41 @@ def test_a_start_while_the_preview_is_still_being_prepared_asks_for_a_retry(make
     app.previews, app.zenodo, app.cache = previews, zenodo, cache
     client = app.test_client()
     switch(client)
-    # The student starts without the worker having read the preview: nothing is cached, so the start asks for a retry
-    # and queues the preview, once (#122, fix 1).
+    # The student starts without a cached preview (it expired while they chose columns, or was never read): the record
+    # passed its live checks, so the import is queued and the worker checks the columns against the file it reads.
     response = client.post("/api/library/imports", json={
         "provider": "community", "dataset": "101", "taskType": "classification",
         "textColumn": "text", "labelColumn": "label", "size": 5,
     }, headers=ALICE)
-    refused = response.get_json()
-    assert response.status_code == 503
-    assert len(previews.jobs) == 1
+    assert response.status_code == 202, response.get_json()
+    assert len(queue.refs) == 1
 
-    assert refused["code"] == "preparing"
-    assert refused["error"] == provider.PREPARING
-    assert queue.refs == []
+
+def test_a_start_with_no_cached_preview_has_its_columns_checked_by_the_worker(make_app, zenodo, queue, previews, cache, tmp_path):
+    app = make_app(
+        community_datasets=zenodo.datasets,
+        community_record=zenodo.record,
+        community_download=zenodo.download,
+        community_base_url=zenodo.base_url,
+        community_enqueue_preview=previews,
+        enqueue=queue,
+        max_rows=lambda: 300,
+    )
+    app.previews, app.zenodo, app.cache = previews, zenodo, cache
+    client = app.test_client()
+    switch(client)
+    # No preview opened, so nothing is cached: the start can't check the columns, and the worker must.
+    response = client.post("/api/library/imports", json={
+        "provider": "community", "dataset": "101", "taskType": "classification",
+        "textColumn": "nope", "labelColumn": "label", "size": 5,
+    }, headers=ALICE)
+    assert response.status_code == 202, response.get_json()
+
+    finished, sink = work(app, tmp_path, zenodo, response.get_json()["id"])
+
+    assert finished["status"] == "failed"
+    assert finished["code"] == "bad_mapping"
+    assert sink.calls == []
 
 
 # --- What the worker checks, and what a retry keeps (#122, fix 3 of the second rework) --------------

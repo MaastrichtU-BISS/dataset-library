@@ -404,3 +404,27 @@ def test_a_host_with_only_some_of_the_community_seams_does_not_offer_the_source(
 
     assert settings["community"] == {"available": False, "enabled": False}
     assert "needs all five seams" in caplog.text
+
+
+def test_a_job_whose_answer_is_already_cached_reads_nothing_and_releases_its_lock():
+    # A second job for the same key, queued after the first's lock expired in a long queue, finds the first one's answer.
+    class Cache:
+        def __init__(self):
+            self.values, self.released = {"head-key": {"head": {"names": [], "rows": []}}}, []
+
+        def get(self, key):
+            return self.values.get(key)
+
+        def set(self, key, value, ttl):
+            self.values[key] = value
+
+        def delete_if(self, key, token):
+            self.released.append((key, token))
+
+    def download(*args, **kwargs):
+        raise AssertionError("an answer already cached must not be read again")
+
+    cache = Cache()
+    community.run_preview({"key": "head-key", "lock": "head-key:lock", "token": "t"}, cache=cache, download=download)
+
+    assert cache.released == [("head-key:lock", "t")]

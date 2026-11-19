@@ -314,6 +314,9 @@ def run_preview(job, *, cache, download):
     `download` is the Zenodo seam. Only the lock is released when the job ends, however it ends."""
     key, lock, token = job["key"], job["lock"], job["token"]
     try:
+        # A job queued again after its lock expired in a long queue finds the first one's answer: nothing to read again.
+        if cache.get(key) is not None:
+            return
         try:
             value, ttl = _read_preview(job, download), CACHE_SECONDS
         except ProviderError:
