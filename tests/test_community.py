@@ -183,6 +183,13 @@ def test_open_datasets_are_listed_as_community_cards_with_their_license_resolved
     assert ("datasets",) in zenodo.calls
 
 
+def test_no_library_route_takes_an_id_parameter_a_host_would_refuse(app):
+    # A host may refuse any `*_id` URL parameter that is not its own UUID (BAIGLE does), so the library uses `*_ref`.
+    parameters = {argument for rule in app.url_map.iter_rules() for argument in rule.arguments}
+
+    assert not {name for name in parameters if name.endswith("_id")}
+
+
 def test_the_community_source_is_off_until_an_admin_switches_it_on(client):
     everything = client.get("/api/library/search", headers=ALICE).get_json()
     assert all(card["provider"] != "community" for card in everything["results"])

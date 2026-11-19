@@ -161,14 +161,15 @@ def dataset(dataset_ref):
     return jsonify(body)
 
 
-@library_bp.route("/datasets/community/<record_id>", methods=["GET"])
-def community_dataset(record_id):
+# Not `<record_id>`: a host may refuse `*_id` URL parameters that are not its own UUIDs (see the dataset route above).
+@library_bp.route("/datasets/community/<record_ref>", methods=["GET"])
+def community_dataset(record_ref):
     """One Community dataset (#122): its card, whether it can be imported and, if not, why, and the first
     rows of its table file. Zenodo is asked now, so a record closed since it was listed shows as closed."""
-    if not community_provider.RECORD_ID.match(record_id):
-        raise ApiError(400, f"Not a Zenodo record id: {record_id}", "bad_id")
+    if not community_provider.RECORD_ID.match(record_ref):
+        raise ApiError(400, f"Not a Zenodo record id: {record_ref}", "bad_id")
     try:
-        body = community_module.view(_host(), record_id)
+        body = community_module.view(_host(), record_ref)
     except preview_module.NotInLibrary:
         raise ApiError(404, "That dataset is not in the library.", "not_found")
     except ProviderError:
