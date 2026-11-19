@@ -758,6 +758,37 @@ def test_a_building_copy_refreshes_its_updated_at_while_it_runs(make_app, hub, t
     assert copy_row(app, pinned["ref"])["status"] == "ready"
 
 
+def test_a_worker_that_loses_the_claim_leaves_the_work_of_the_worker_that_won(client, app, snapshot_dir, tmp_path, monkeypatch):
+    """Between this worker's look at the copy and its claim, another worker claims it and writes."""
+    pinned = pin_as_admin(client)
+    copy_id = copy_row(app, pinned["ref"])["id"]
+    work = os.path.join(snapshot_dir, snapshots.INCOMING, copy_id)
+    winners_part = os.path.join(work, "winners.part")
+    fetched = []
+
+    def the_other_worker_claims_it(session):
+        os.makedirs(work)
+        with open(winners_part, "wb") as part:
+            part.write(b"the other worker's part")
+        with app.app_context():
+            app.db.session.execute(sa.text("UPDATE library_snapshots SET status = 'building' WHERE id = :id"), {"id": copy_id})
+            app.db.session.commit()
+        return None
+
+    monkeypatch.setattr(snapshots, "download_cap_bytes", the_other_worker_claims_it)
+
+    def fetch_shards(external_id, config, split, max_bytes, dest_dir):
+        fetched.append(external_id)
+        return imports.Fetched(paths=[], revision=SHA)
+
+    with app.app_context():
+        snapshots.run_copy(copy_id, session=app.db.session, fetch_shards=fetch_shards, snapshot_dir=snapshot_dir, max_bytes=10**9, heartbeat_seconds=None)
+
+    assert fetched == []
+    assert os.path.exists(winners_part)
+    assert copy_row(app, pinned["ref"])["status"] == "building"
+
+
 # --- Pins and licenses that change while a copy is made (#121) ------------------------
 
 def test_no_copy_is_queued_for_a_pin_removed_meanwhile(client, app, copies_queue):

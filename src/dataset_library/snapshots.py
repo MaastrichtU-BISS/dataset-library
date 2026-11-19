@@ -143,10 +143,18 @@ def run_copy(copy_ref, *, session, fetch_shards, snapshot_dir, max_bytes, heartb
     max_bytes = download_cap_bytes(session) or max_bytes
     work = _work_dir(snapshot_dir, copy_id)
     name = _file_name(copy_id)
+    # Claimed before anything is written, and only then cleaned up: a second worker
+    # that pops the same copy must not clean up the first one's work.
+    try:
+        claimed = _move(session, copy_id, BUILDING, {QUEUED})
+    except Exception:  # noqa: BLE001 - the copy stays queued, and the sweep fails it if no one takes it
+        logger.exception(f"library.snapshot.claim_failed snapshot={copy_id}")
+        session.rollback()
+        return
+    if not claimed:
+        return
     heartbeat, kept = None, False
     try:
-        if not _move(session, copy_id, BUILDING, {QUEUED}):
-            return
         if heartbeat_seconds:
             heartbeat = _Heartbeat(session.get_bind(), copy_id, heartbeat_seconds)
             heartbeat.__enter__()
