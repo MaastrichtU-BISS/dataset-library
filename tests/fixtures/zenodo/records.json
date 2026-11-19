@@ -1,0 +1,90 @@
+{
+  "101": {
+    "record_id": "101",
+    "access": {
+      "record": "public",
+      "files": "public"
+    },
+    "downloadable": true,
+    "files": [
+      {
+        "key": "data.csv",
+        "size": 973,
+        "checksum": "md5:7fe60087c9c1759e4bce1d34b0813264",
+        "url": "https://zenodo.org/api/records/101/files/data.csv/content"
+      },
+      {
+        "key": "README.txt",
+        "size": 53,
+        "checksum": "md5:89ef4052e7a7ea6c5a8b2869505226b7",
+        "url": "https://zenodo.org/api/records/101/files/README.txt/content"
+      }
+    ]
+  },
+  "102": {
+    "record_id": "102",
+    "access": {
+      "record": "public",
+      "files": "public"
+    },
+    "downloadable": true,
+    "files": [
+      {
+        "key": "data.xlsx",
+        "size": 5110,
+        "checksum": "md5:52f4114987742902a588d722ab60ca1a",
+        "url": "https://zenodo.org/api/records/102/files/data.xlsx/content"
+      }
+    ]
+  },
+  "103": {
+    "record_id": "103",
+    "access": {
+      "record": "public",
+      "files": "public"
+    },
+    "downloadable": true,
+    "files": [
+      {
+        "key": "data.json",
+        "size": 403,
+        "checksum": "md5:b9142b7d97286524dbc599dec943c531",
+        "url": "https://zenodo.org/api/records/103/files/data.json/content"
+      }
+    ]
+  },
+  "104": {
+    "record_id": "104",
+    "access": {
+      "record": "restricted",
+      "files": "restricted"
+    },
+    "downloadable": false,
+    "files": []
+  },
+  "105": {
+    "record_id": "105",
+    "access": {
+      "record": "public",
+      "files": "restricted"
+    },
+    "downloadable": false,
+    "files": []
+  },
+  "107": {
+    "record_id": "107",
+    "access": {
+      "record": "public",
+      "files": "public"
+    },
+    "downloadable": true,
+    "files": [
+      {
+        "key": "notes.txt",
+        "size": 53,
+        "checksum": "md5:89ef4052e7a7ea6c5a8b2869505226b7",
+        "url": "https://zenodo.org/api/records/107/files/notes.txt/content"
+      }
+    ]
+  }
+}

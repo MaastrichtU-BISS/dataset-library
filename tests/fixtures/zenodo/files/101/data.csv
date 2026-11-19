@@ -1,0 +1,13 @@
+text,label,label_source
+"The Supplier may terminate this Agreement by giving thirty days' notice.",Terminations,file
+"Either party may end the contract if the other becomes insolvent.",Terminations,file
+"Termination takes effect on the date stated in the written notice.",Terminations,file
+"The Customer may cancel the subscription at any time before renewal.",Terminations,file
+"This Agreement is governed by the laws of England and Wales.",Governing Laws,file
+"Any dispute under this Contract is subject to the courts of Lisbon.",Governing Laws,file
+"The contract shall be construed under the law of the State of New York.",Governing Laws,file
+"Both parties agree that German law applies to every claim.",Governing Laws,file
+"Notices must be delivered in writing to the registered address.",Notices,file
+"A notice is deemed received two working days after posting.",Notices,file
+"",Notices,file
+"Notice by email is valid once the sender receives no bounce.",Notices,file

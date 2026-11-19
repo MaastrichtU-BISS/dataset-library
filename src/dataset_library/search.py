@@ -8,10 +8,12 @@ import json
 import logging
 import time
 
+from . import community
 from . import policy as policy_module
 from .errors import ProviderRateLimited, ProviderUnavailable
 from .licenses import LICENSES, UNKNOWN
 from .models import LibraryPin, LibrarySource
+from .providers import community as community_provider
 from .providers import huggingface
 
 log = logging.getLogger("dataset_library")
@@ -30,13 +32,29 @@ def enabled_sources(db):
 
 
 def search(host, *, query, task, license_id, source):
-    """`source` must be one of the enabled sources' refs, or empty for all."""
-    authors = [s.ref for s in enabled_sources(host.db)]
-    if source:
-        authors = [source]
+    """`source` must be one of the enabled sources' refs, `community`, or empty for all.
+
+    Community cards are found whatever the Hub is doing: a Hub outage leaves them in place (#122)."""
     policy = policy_module.overrides(host.db)
     if license_id and policy.get(license_id) == "hide":
         return _body("ok", [])
+    results, status = [], "ok"
+    if source != community_provider.SOURCE:
+        results, status = _hugging_face(host, query, task, license_id, source, policy)
+    if source in ("", community_provider.SOURCE):
+        results = results + community.cards(host, query=query, task=task, license_id=license_id)
+    return _body(status, results)
+
+
+def _hugging_face(host, query, task, license_id, source, policy):
+    """The Hub's cards with the policy applied, or the pinned datasets when the Hub cannot be asked, and the status."""
+    authors = [s.ref for s in enabled_sources(host.db)]
+    if source:
+        authors = [source]
+    # With Community on, no organisation and no query, the Hub would list its whole catalogue beside the Community
+    # cards: nothing is asked for (#122). Without Community, the Hub's own answer stands, as it always has.
+    if not authors and not (query or "").strip() and community.enabled(host):
+        return [], "ok"
     # The Hub has no tag for "no license", so those are picked out here.
     hub_license = None if license_id == "unknown" else license_id
     started = time.monotonic()
@@ -67,7 +85,7 @@ def search(host, *, query, task, license_id, source):
         "library.search provider=huggingface query=%r task=%s license=%s status=%s results=%d cache_hit=%s ms=%d",
         query, task, license_id, status, len(results), cache_hit, (time.monotonic() - started) * 1000,
     )
-    return _body(status, results)
+    return results, status
 
 
 def _apply_policy(cards, policy, license_id):

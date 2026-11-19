@@ -1,21 +1,32 @@
-"""Search public legal datasets by license and task, and import a sample."""
+"""Search public legal datasets by license and task, and import a sample as the host's own Dataset."""
+import logging
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
 from .licenses import License, resolve_license
-from .limits import HARD_MAX_ROWS
+from .limits import DEFAULT_MAX_DOWNLOAD_MB, HARD_MAX_ROWS
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"
 
 __all__ = ["Cache", "License", "init_dataset_library", "resolve_license"]
 
 
 class Cache(Protocol):
-    """Where search results are kept for a while (Redis in BAIGLE)."""
+    """Where search results and Community previews are kept for a while (Redis in BAIGLE).
+
+    ``add(key, value, ttl)`` sets the key only if it is not set, for ``ttl`` seconds, and says whether it did: it is the
+    lock that keeps one Community preview job queued per key (#122). ``delete_if(key, value)`` removes the key only while
+    it still holds ``value``, so a lock is released only by the job that took it (#122, fix 1); ``delete(key)`` removes it."""
 
     def get(self, key: str): ...
 
     def set(self, key: str, value, ttl: int) -> None: ...
+
+    def add(self, key: str, value, ttl: int) -> bool: ...
+
+    def delete(self, key: str) -> None: ...
+
+    def delete_if(self, key: str, value) -> None: ...
 
 
 @dataclass
@@ -34,6 +45,10 @@ class _Host:
     # the worker. Without both, no copy is made and a pin is imported only from Hugging Face.
     snapshot_dir: str | None = None
     enqueue_snapshot: Callable[[str], None] | None = None
+    # The Community source's seams (community.Seams), or None: then it is not offered (#122).
+    community: object | None = None
+    # The most an import downloads, when no admin cap is set; the admin's cap never goes above it (#122).
+    max_fetch_bytes: int = DEFAULT_MAX_DOWNLOAD_MB * 1_000_000
 
     def row_cap(self):
         """The cap a new dataset meets: the admin's, else the host's default."""
@@ -57,6 +72,13 @@ def init_dataset_library(
     hard_max_rows=None,
     snapshot_dir=None,
     enqueue_snapshot=None,
+    max_fetch_bytes=None,
+    community_datasets=None,
+    community_record=None,
+    community_download=None,
+    community_base_url=None,
+    community_enqueue_preview=None,
+    community_preview_max_bytes=None,
     url_prefix="/api/library",
 ):
     """Mount the library API on a host Flask app.
@@ -67,8 +89,8 @@ def init_dataset_library(
     every route; ``current_owner`` returns the signed-in user's id.
     ``task_types`` are the host's task type ids (legal-ml-core's TASK_TYPES
     values): the library offers no other. ``cache`` keeps search results
-    (``get(key)``, ``set(key, value, ttl)``, JSON-serialisable values).
-    ``is_admin()`` says whether the signed-in user may change the library's
+    (``get(key)``, ``set(key, value, ttl)``, ``add(key, value, ttl)`` and ``delete(key)``,
+    with JSON-serialisable values). ``is_admin()`` says whether the signed-in user may change the library's
     settings (nobody, by default). ``audit(event, **fields)`` records each
     settings change; fields are counts and license ids, never personal data.
     ``enqueue(import_ref)`` hands a queued import to the host's worker, which
@@ -77,7 +99,9 @@ def init_dataset_library(
     LEGAL_ML_MAX_ROWS) when an admin set none, read once when an import is
     queued. An admin may set a cap from 1 to ``hard_max_rows`` (default
     ``limits.HARD_MAX_ROWS``); ``limits.row_cap(session)`` returns it, so the
-    host's upload check can honour it too.
+    host's upload check can honour it too. ``max_fetch_bytes`` is the host's download
+    limit (the worker's ``LIBRARY_MAX_FETCH_BYTES``): an import downloads at most the
+    admin's cap, and never more than this (default ``limits.DEFAULT_MAX_DOWNLOAD_MB``).
 
     ``snapshot_dir`` is a directory the host keeps on disk (shared with the worker):
     copies of pinned datasets with an Allow license go there, so a pin still imports
@@ -85,8 +109,44 @@ def init_dataset_library(
     worker, which calls ``dataset_library.snapshots.run_copy``. Both are needed; without
     them a pin has no copy. The worker also calls ``snapshots.sweep`` and
     ``snapshots.check_upstream`` from time to time.
+
+    The Community source (datasets published openly to Zenodo) needs five seams, all or
+    nothing, and the library imports none of the repository's client (ADR 0005):
+    ``community_datasets()`` returns the open dataset Publications, as fair-publishing's
+    ``open_datasets`` does, each with the Zenodo origin its record is on under ``origin``;
+    ``community_record(record_id)`` returns the record's files, as ``Zenodo.record_files``
+    does; ``community_download(record_id, key, max_bytes)`` returns one file's bytes, as
+    ``Zenodo.download`` does; ``community_base_url()`` returns the Zenodo base URL the host
+    reads from; ``community_enqueue_preview(job)`` hands a preview job, a JSON string, to the
+    host's worker, which calls ``community.run_preview``. Only a Publication on that origin is
+    listed, previewed or imported. A host maps the repository's ``RecordNotDownloadable`` to
+    ``providers.community.NotDownloadable``, its ``FileTooLarge`` to ``TooLarge``, and any other
+    failure to ``ProviderError``. An admin still switches the source on. ``run_import`` takes the
+    same seams, except the queue.
+
+    A request never downloads or parses a Community file (#122, fix 1). It re-checks the record
+    with Zenodo, a metadata call, and reads the preview from the cache. A preview not cached yet is
+    queued once per cache key, and the request answers "preparing". The worker reads a file of up to
+    ``community_preview_max_bytes`` (default ``community.PREVIEW_MAX_BYTES``); a larger file is shown
+    without its rows and stays importable within the import cap.
     """
     from .routes import library_bp
+
+    community_seams = None
+    given = (community_datasets, community_record, community_download, community_base_url, community_enqueue_preview)
+    if all(seam is not None for seam in given):
+        from .community import PREVIEW_MAX_BYTES, Seams
+
+        community_seams = Seams(
+            datasets=community_datasets,
+            record=community_record,
+            download=community_download,
+            base_url=community_base_url,
+            enqueue_preview=community_enqueue_preview,
+            preview_max_bytes=PREVIEW_MAX_BYTES if community_preview_max_bytes is None else community_preview_max_bytes,
+        )
+    elif any(seam is not None for seam in given):
+        logging.getLogger("dataset_library").warning("library.community not offered: it needs all five seams")
 
     app.extensions["dataset_library"] = _Host(
         db=db,
@@ -101,5 +161,7 @@ def init_dataset_library(
         hard_max_rows=hard_max_rows or HARD_MAX_ROWS,
         snapshot_dir=snapshot_dir,
         enqueue_snapshot=enqueue_snapshot,
+        community=community_seams,
+        max_fetch_bytes=max_fetch_bytes or DEFAULT_MAX_DOWNLOAD_MB * 1_000_000,
     )
     app.register_blueprint(library_bp, url_prefix=url_prefix)

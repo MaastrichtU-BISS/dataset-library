@@ -29,6 +29,14 @@ def download_cap_bytes(session):
     return settings.max_download_mb * 1_000_000
 
 
+def import_cap_bytes(session, host_cap):
+    """The most one import downloads: the admin's cap when they set one, never more than the host's own
+    limit (its LIBRARY_MAX_FETCH_BYTES). The API and the worker both use this, so a file is refused the same
+    way in either (#122)."""
+    admin_cap = download_cap_bytes(session)
+    return min(admin_cap, host_cap) if admin_cap else host_cap
+
+
 def check(limits, hard_max_rows):
     """Field errors for a `limits` body: {maxRows, maxDownloadMb}, each a whole
     number in range or null (back to the default)."""
