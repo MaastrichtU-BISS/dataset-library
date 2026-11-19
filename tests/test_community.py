@@ -56,6 +56,7 @@ def app(make_app, zenodo, queue):
         community_datasets=zenodo.datasets,
         community_record=zenodo.record,
         community_download=zenodo.download,
+        community_base_url=zenodo.base_url,
         enqueue=queue,
         max_rows=lambda: 300,
     )
@@ -260,10 +261,21 @@ def test_a_hub_outage_leaves_the_community_cards_in_place(client, hub):
     switch(client)
     hub.fail = 503
 
-    body = client.get("/api/library/search", query_string={"q": ""}, headers=ALICE).get_json()
+    body = client.get("/api/library/search", query_string={"q": "termination"}, headers=ALICE).get_json()
 
     assert body["status"] == "unavailable"
-    assert sorted(card["externalId"] for card in body["results"] if card["provider"] == "community") == ["101", "102", "103"]
+    assert [card["externalId"] for card in body["results"] if card["provider"] == "community"] == ["101"]
+
+
+def test_with_no_hugging_face_organisation_an_empty_search_asks_the_hub_for_nothing(client, hub):
+    # With no organisation and no query the Hub would list its whole catalogue, so nothing is asked for (#122, fix 9).
+    switch(client)
+
+    body = client.get("/api/library/search", query_string={"q": ""}, headers=ALICE).get_json()
+
+    assert body["status"] == "ok"
+    assert hub.calls == []
+    assert sorted(card["externalId"] for card in body["results"]) == ["101", "102", "103"]
 
 
 def test_a_community_search_never_asks_the_hub(client, hub):
@@ -369,7 +381,7 @@ def test_a_file_over_the_download_cap_is_not_importable(client, zenodo):
 
 def test_a_file_that_is_not_a_table_is_not_importable_with_a_plain_reason(client, zenodo):
     switch(client)
-    zenodo.contents[("101", "data.csv")] = b"\xff\xfe\xfa\xfb"
+    zenodo.contents[("101", "data.csv")] = b"\x81\x8d\x8f\x90"  # not UTF-8, and undefined in Windows-1252 too
 
     body = preview(client)
 
@@ -439,9 +451,11 @@ def test_a_restricted_record_is_refused_before_anything_is_queued(client, zenodo
 
     refused = start(client, status=409)
 
-    assert refused["code"] == "restricted"
-    assert refused["error"] == provider.RESTRICTED
+    # Closed since it was listed: at start it is refused in the worker's words; the preview keeps "restricted" (#122).
+    assert refused["code"] == "not_downloadable"
+    assert refused["error"] == "This record is no longer downloadable"
     assert queue.refs == []
+    assert preview(client)["reasonCode"] == "restricted"
 
 
 def test_a_non_commercial_record_needs_the_students_confirmation(client):
@@ -497,6 +511,8 @@ def work(app, tmp_path, zenodo, ref, *, max_bytes=None):
             data_dir=str(tmp_path / "data"),
             seed=7,
             heartbeat_seconds=None,
+            community_datasets=zenodo.datasets,
+            community_base_url=zenodo.base_url,
             community_record=zenodo.record,
             community_download=zenodo.download,
             **extra,
@@ -520,8 +536,9 @@ def test_a_community_import_samples_the_record_file_and_never_a_hugging_face_sha
     # A labelled classification import keeps the label balance by default, and its description says so.
     assert created["description"] == "A sample that keeps the label balance, from Zenodo: https://doi.org/10.5281/zenodo.101"
     assert all(row["text"] and row["label"] in {"Terminations", "Governing Laws", "Notices"} for row in created["rows"])
-    # The record is asked again, then its one table file is read at the default cap, and nothing else is read.
-    assert [call[:2] for call in zenodo.calls] == [("record", "101"), ("download", "101")]
+    # The import is checked against the listing, the record is asked again, then its one table file is read at the
+    # default cap, and nothing else is read.
+    assert [call[:2] for call in zenodo.calls] == [("datasets",), ("record", "101"), ("download", "101")]
     assert zenodo.downloads()[0][2:] == ("data.csv", 200_000_000)
 
 
@@ -620,7 +637,8 @@ def test_a_finished_community_import_keeps_its_doi_record_and_citation_as_proven
     assert record["doi"] == "10.5281/zenodo.101"
     assert record["source"] == "zenodo"
     assert record["revision"] == checksum_of("101")
-    assert record["citation"]["revision"] == checksum_of("101")
+    # A Community citation names its DOI, not a revision: the checksum is the import's, and only the import's (#122).
+    assert record["citation"]["revision"] is None
     assert record["citation"]["accessedAt"] is not None
     assert record["citation"]["url"] == "https://doi.org/10.5281/zenodo.101"
     assert record["citation"]["bibtex"] is None

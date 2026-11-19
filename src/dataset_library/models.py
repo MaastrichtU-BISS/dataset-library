@@ -149,6 +149,11 @@ class LibraryImport(LibraryBase):
     # Face was down; then `snapshot_id` names the copy and `revision` is its (#121).
     source: Mapped[str] = mapped_column(String(20), default="huggingface", server_default="huggingface")
     snapshot_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # A Community import (#122): the Publication it was started from, the Zenodo origin its record
+    # is on, and the one file (by key) it reads. `revision` holds that file's checksum.
+    publication_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    origin: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    file_key: Mapped[str | None] = mapped_column(String(500), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
     imported_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

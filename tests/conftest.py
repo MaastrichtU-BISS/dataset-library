@@ -4,6 +4,7 @@ import functools
 import json
 import pathlib
 import re
+import threading
 
 import pytest
 import requests
@@ -40,13 +41,30 @@ class MemoryCache:
     def __init__(self):
         self.values = {}
         self.ttls = {}
+        self.guard = threading.Lock()  # a Community preview fetch runs on a helper thread
 
     def get(self, key):
-        return self.values.get(key)
+        with self.guard:
+            return self.values.get(key)
 
     def set(self, key, value, ttl):
-        self.values[key] = value
-        self.ttls[key] = ttl
+        with self.guard:
+            self.values[key] = value
+            self.ttls[key] = ttl
+
+    def add(self, key, value, ttl):
+        """Set the key only when it is not set: the lock a preview fetch takes (dataset_library.Cache)."""
+        with self.guard:
+            if key in self.values:
+                return False
+            self.values[key] = value
+            self.ttls[key] = ttl
+            return True
+
+    def delete(self, key):
+        with self.guard:
+            self.values.pop(key, None)
+            self.ttls.pop(key, None)
 
     def expire(self, prefix):
         """Forget fresh entries, as Redis would once their TTL ran out."""

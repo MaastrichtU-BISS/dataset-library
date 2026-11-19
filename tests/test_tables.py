@@ -119,7 +119,7 @@ def test_a_header_with_no_rows_is_a_table_with_no_rows():
     "data, name",
     [
         (b"", "data.csv"),
-        (b"\xff\xfe\xfa\xfb", "data.csv"),
+        (b"\x81\x8d\x8f\x90", "data.csv"),  # not UTF-8, and undefined in Windows-1252 too
         (b"PK\x03\x04 not really a zip", "data.xlsx"),
         (b"PAR1 not really parquet", "data.parquet"),
         (b"[1, 2, 3]", "data.json"),

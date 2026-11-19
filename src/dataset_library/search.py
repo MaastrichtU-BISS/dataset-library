@@ -51,6 +51,10 @@ def _hugging_face(host, query, task, license_id, source, policy):
     authors = [s.ref for s in enabled_sources(host.db)]
     if source:
         authors = [source]
+    # With Community on, no organisation and no query, the Hub would list its whole catalogue beside the Community
+    # cards: nothing is asked for (#122). Without Community, the Hub's own answer stands, as it always has.
+    if not authors and not (query or "").strip() and community.enabled(host):
+        return [], "ok"
     # The Hub has no tag for "no license", so those are picked out here.
     hub_license = None if license_id == "unknown" else license_id
     started = time.monotonic()

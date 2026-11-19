@@ -23,7 +23,7 @@ def current(db, host):
     return {
         "sources": [s.to_dict() for s in sources],
         # Offered only where the host gave the Community seams (#122); the admin switches it on or off.
-        "community": {"available": host.community is not None, "enabled": community_module.switched_on(db)},
+        "community": {"available": host.community is not None, "enabled": community_module.switched_on(db.session)},
         "licenses": [
             {**lic.at_level(level(lic, policy)), "default": lic.level} for lic in LICENSES.values()
         ],
@@ -125,8 +125,8 @@ def save(db, body, hard_max_rows=limits_module.HARD_MAX_ROWS, community_availabl
                 limits_changed.append(column)
     community_changed = False
     if community_on is not None:
-        community_changed = community_module.switched_on(db) != community_on
-        community_module.set_enabled(db, community_on)
+        community_changed = community_module.switched_on(db.session) != community_on
+        community_module.set_enabled(db.session, community_on)
     db.session.commit()
     after = {lic.id: level(lic, settings.license_policy) for lic in LICENSES.values()}
     changes = {

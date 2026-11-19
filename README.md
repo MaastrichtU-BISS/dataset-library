@@ -18,7 +18,7 @@ init_dataset_library(
     login_required=jwt_required(),  # the host's sign-in decorator
     current_owner=get_jwt_identity,
     task_types=[t["value"] for t in TASK_TYPES],  # legal-ml-core's task types
-    cache=RedisJSONCache(redis),    # get(key) / set(key, value, ttl)
+    cache=RedisJSONCache(redis),    # get / set(key, value, ttl), add (SET NX) and delete
     is_admin=lambda: "baigle-admin" in roles(),   # who may change the settings
     audit=lambda event, **fields: log(event, fields),
     enqueue=lambda ref: redis.lpush("library_import_queue", ref),  # no import without it
@@ -26,9 +26,13 @@ init_dataset_library(
     enqueue_snapshot=lambda ref: redis.lpush("library_snapshot_queue", ref),  # both or neither
     max_rows=lambda: 1000,           # the row cap when an admin set none
     hard_max_rows=5000,              # the most an admin may set (default 5000)
-    community_datasets=lambda: open_datasets(db.session),        # Community source (#122):
-    community_record=lambda rid: Zenodo(zenodo_url()).record_files(rid),  # all three, or none
+    max_fetch_bytes=200_000_000,     # the host's download limit: an admin's cap never goes above it
+    community_datasets=community_listing,    # Community source (#122): all four, or none
+    community_record=lambda rid: Zenodo(zenodo_url()).record_files(rid),
     community_download=lambda rid, key, max_bytes: Zenodo(zenodo_url()).download(rid, key, max_bytes),
+    community_base_url=zenodo_url,   # the Zenodo host this platform reads; other hosts' records are not listed
+    community_preview_seconds=20,    # optional: how long a preview waits for Zenodo (default 20)
+    community_preview_max_bytes=16_000_000,  # optional: the most of a file a preview reads (default 16 MB)
 )
 ```
 
@@ -46,8 +50,8 @@ from dataset_library.providers.parquet import fetch_shards
 
 run_import(ref, session=db.session, fetch_shards=fetch_shards,
            create_dataset=create, data_dir="/app/data",
-           snapshot_dir="/app/library-snapshots",
-           community_record=..., community_download=...)  # the worker's Community seams, as above
+           snapshot_dir="/app/library-snapshots", max_bytes=MAX_FETCH_BYTES,  # the host's download limit
+           community_datasets=..., community_base_url=..., community_record=..., community_download=...)
 ```
 
 The same worker takes copy refs off `library_snapshot_queue` and runs
@@ -79,10 +83,14 @@ label `dataset_library`).
 
 The Community source lists open dataset Publications (datasets published to Zenodo
 through BAIGLE, #122) with the license each one states. It is offered only when the
-host gives all three seams above and an admin switches it on in the settings
+host gives all four seams above and an admin switches it on in the settings
 (`PUT /api/library/admin/settings` with `"community": {"enabled": true}`). The library
 imports none of the repository's client: the host's seams do the Zenodo calls, and
-the host's Zenodo base URL is the only host a Community file is fetched from.
+the host's Zenodo base URL is the only host a Community file is fetched from. A
+Publication whose record is on another Zenodo host (the sandbox, say) is not listed,
+previewed or imported, even when its record id matches: the origin comes from its
+record link, or from its DOI prefix when the link is missing, and a link and a DOI
+that name different hosts count as neither.
 
 A record is importable only while Zenodo says it is open now: public records with
 public files. A restricted or metadata-only record, a record Zenodo no longer
@@ -92,6 +100,19 @@ file BAIGLE publishes as CSV under an `.xlsx` name still reads. An import reads 
 record's own file, never a local Dataset, and fails with "This record is no longer
 downloadable" when Zenodo has closed the record or removed the file. A Community
 dataset carries no task in its publication, so a task filter does not find it.
+
+Previews are kept off the request's critical path. A preview's file is read only
+within `community_preview_max_bytes` (16 MB); a larger one shows its card, files and
+size with "Too large to preview here; it can still be imported" (`preview: "too_large"`)
+and stays importable within the import cap. Zenodo is asked on a helper thread that
+the request waits for up to `community_preview_seconds` (20 s); past that the answer is
+`preparing: true`, and the page asks again. One fetch per cache key runs at a time: a
+request that finds one running also gets `preparing: true` and downloads nothing. The
+record is cached for a minute and the preview for ten, both bound to the Zenodo origin.
+A queued import checks its Publication, the source and the license again before it
+reads, and reads exactly the file it was started on at the checksum it was started
+at. The import's download is capped at the admin's cap, never above the host's
+`max_fetch_bytes`.
 
 ## API
 

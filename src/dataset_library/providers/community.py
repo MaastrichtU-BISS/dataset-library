@@ -1,13 +1,14 @@
 """Datasets BAIGLE users published openly to Zenodo (#122, decision D8).
 
-This package does not import fair-publishing (ADR 0005). The host passes three
-seams: the open dataset Publications, one record's files, and one file's bytes.
-This module turns what they return into library cards and citations, and says
-which file of a record is the table and why a record cannot be imported. It
+This package does not import fair-publishing (ADR 0005). The host passes its seams: the open
+dataset Publications, one record's files, and one file's bytes. This module turns what they
+return into library cards and citations, says which file of a record is the table and why a
+record cannot be imported, and decides which Zenodo host a Publication's record is on. It
 fetches nothing itself.
 """
 import os
 import re
+from urllib.parse import urlsplit
 
 from ..licenses import resolve_license
 
@@ -23,6 +24,9 @@ RECORD_ID = re.compile(r"^[0-9]{1,20}$")
 PREFERRED_STEM = "data"
 TABLE_EXTENSIONS = (".csv", ".tsv", ".json", ".jsonl", ".xlsx", ".parquet")
 SUMMARY_CHARACTERS = 300
+# The DOI prefixes Zenodo issues its records under, for a Publication whose record link is missing.
+DOI_ORIGINS = {"10.5281": "https://zenodo.org", "10.5072": "https://sandbox.zenodo.org"}
+DEFAULT_PORTS = {"http": 80, "https": 443}
 
 # The codes a refusal carries, and the messages a student sees for them.
 NOT_DOWNLOADABLE = "This record is no longer downloadable"
@@ -31,7 +35,17 @@ METADATA_ONLY = "Only this record's description is public on Zenodo, not its fil
 NO_TABLE = "This record has no data file the library can read: CSV, TSV, JSON, JSONL, Parquet or XLSX."
 NO_ROWS = "This record's data file has no rows to import."
 UNREADABLE = "We can't read this record's data file as a table, so it cannot be imported."
+# A host without the [import] extra (pyarrow, openpyxl) cannot read a data file at all.
+NO_READER = "This platform can't read data files here, so this record cannot be imported."
 CHANGED = "This record's data file changed on Zenodo after you opened it. Open it again to import the new version."
+# A preview that is still being prepared, and a file too large to preview within the budget (it may still be imported).
+PREPARING = "The preview is still being prepared. Try again in a moment."
+TOO_LARGE_PREVIEW = "Too large to preview here; it can still be imported"
+# A queued import whose dataset has left the library since it was queued (#122, fix 4).
+SOURCE_OFF = "The Community source is switched off, so this dataset can no longer be imported."
+NOT_LISTED = "This dataset is no longer in the library, so it cannot be imported."
+LICENSE_HIDDEN = "This dataset's license is not allowed on this platform, so it cannot be imported."
+NEEDS_ACK = "Confirm the license terms to import this dataset."
 
 
 class NotDownloadable(Exception):
@@ -50,6 +64,33 @@ def too_large(max_bytes):
 
 def doi_url(doi):
     return f"{DOI_PREFIX}{doi}"
+
+
+def origin_of(url):
+    """`scheme://host[:port]` of an absolute http(s) URL, lower-cased, with a default port left out.
+    None for anything else, including a URL with credentials, since it names no origin a record lives on."""
+    try:
+        parts = urlsplit((url or "").strip())
+        port = parts.port
+    except ValueError:
+        return None
+    scheme = parts.scheme.lower()
+    if scheme not in DEFAULT_PORTS or not parts.hostname or parts.username or parts.password:
+        return None
+    if port is None or port == DEFAULT_PORTS[scheme]:
+        return f"{scheme}://{parts.hostname.lower()}"
+    return f"{scheme}://{parts.hostname.lower()}:{port}"
+
+
+def origin_for(record_url, doi):
+    """The Zenodo origin a Publication's record is on: the origin of its record link, else the one its DOI
+    prefix names. None when neither says, or when the two disagree, so a record of another host is never
+    taken for the configured host's record with the same id (#122)."""
+    found = {origin_of(record_url)} - {None}
+    prefix = str(doi or "").split("/", 1)[0]
+    if prefix in DOI_ORIGINS:
+        found.add(DOI_ORIGINS[prefix])
+    return found.pop() if len(found) == 1 else None
 
 
 def creators_of(publication):
@@ -75,8 +116,9 @@ def year(published_at):
 
 
 def citation(publication):
-    """The fields a Dataset is cited from. Its revision and access date are set when
-    it is imported (imports._pinned); a card only knows what the Publication says."""
+    """The fields a Dataset is cited from. A Community record has no revision of its own: Zenodo gives
+    each version its own DOI, so the citation names the DOI and not a checksum (#122). Its access date is
+    set when it is imported (imports._pinned)."""
     names = [author(creator.get("name")) for creator in creators_of(publication)]
     return {
         "title": publication["title"],
