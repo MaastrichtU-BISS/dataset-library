@@ -65,9 +65,12 @@ label `dataset_library`).
   `stale`: the Hub is limiting requests and these are the last results, up to a
   day old. `unavailable`: the Hub is down or unreadable; nothing is raised.
   Every card carries `pinRef`: the ref of the pin for that dataset, or null.
-  Every card also carries `citation`: `title`, `authors`, `year`, `url`,
-  `revision`, `accessedAt` (null until someone imports it) and `bibtex`, the
-  card's own BibTeX entry exactly as written, or null when it has none.
+  Every card also carries `citation`: `title`, `authors` (a list of
+  `{"family", "given"}` or `{"literal"}`), `year`, `url`, `revision`,
+  `accessedAt` (null until someone imports it) and `bibtex`, the dataset's own
+  BibTeX entry exactly as written, or null when it has none. A search result
+  does not read the dataset's README, so its `bibtex` can be null where the
+  single-dataset card's is not.
 - `GET /api/library/labels?ids=huggingface:org/name,...` → `{"labels": {id: "yes" | "no" | "unclear"}}`,
   from the dataset viewer's column types; up to 30 ids, cached an hour each.
 - `GET /api/library/datasets/huggingface/<org>/<name>?config=&split=` → the

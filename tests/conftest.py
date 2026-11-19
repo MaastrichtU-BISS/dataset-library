@@ -3,6 +3,7 @@ Hugging Face faked at its HTTP boundary from recorded responses."""
 import functools
 import json
 import pathlib
+import re
 
 import pytest
 import requests
@@ -15,8 +16,10 @@ from dataset_library.models import LibraryBase
 FIXTURES = pathlib.Path(__file__).parent / "fixtures" / "huggingface"
 VIEWER = json.loads((pathlib.Path(__file__).parent / "fixtures" / "viewer" / "responses.json").read_text())
 HUB_DATASETS = json.loads((pathlib.Path(__file__).parent / "fixtures" / "hub" / "datasets.json").read_text())
+README_FIXTURES = pathlib.Path(__file__).parent / "fixtures" / "hub" / "readmes"
 VIEWER_URL = "https://datasets-server.huggingface.co/"
 DATASET_URL = "https://huggingface.co/api/datasets/"
+README_PATTERN = re.compile(r"^https://huggingface\.co/datasets/([^/]+/[^/]+)/resolve/([0-9a-f]{40})/README\.md$")
 TASK_TYPES = ["classification", "document_classification", "ner", "named_entity_recognition",
               "summarization", "topic_modeling", "clustering", "judgment_prediction"]
 
@@ -62,6 +65,14 @@ class FakeResponse:
             raise ValueError("not JSON")
         return self._body
 
+    def iter_content(self, chunk_size=1):
+        data = self.text.encode("utf-8")
+        for start in range(0, len(data), chunk_size):
+            yield data[start:start + chunk_size]
+
+    def close(self):
+        pass
+
 
 class FakeHub:
     """Answers GET /api/datasets like the Hub: `search` matches the id, `author`
@@ -92,6 +103,15 @@ class FakeHub:
         if url.startswith(DATASET_URL):
             recorded = HUB_DATASETS.get(url.removeprefix(DATASET_URL), {"status": 404, "body": {"error": "Repository not found"}})
             return FakeResponse(recorded["status"], recorded["body"])
+        readme = README_PATTERN.match(url)
+        if readme:
+            # A README is served only at the revision the dataset's record names, as the Hub does.
+            dataset_id, revision = readme.groups()
+            record = HUB_DATASETS.get(dataset_id, {}).get("body") or {}
+            path = README_FIXTURES / f"{dataset_id.replace('/', '__')}.md"
+            if record.get("sha") == revision and path.exists():
+                return FakeResponse(200, path.read_text(encoding="utf-8"))
+            return FakeResponse(404, "Not found")
         assert url == "https://huggingface.co/api/datasets", url
         found = self.records
         if params.get("search"):

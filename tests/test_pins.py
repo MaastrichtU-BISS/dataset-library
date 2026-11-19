@@ -2,6 +2,7 @@
 import pytest
 
 from tests.conftest import ADMIN, ALICE
+from test_citation import LEX_README_BIBTEX, SHA
 
 
 def pin(client, dataset, status=201, headers=ADMIN):
@@ -360,3 +361,15 @@ def test_a_pin_made_before_a_rename_is_found_by_its_old_id(client, monkeypatch):
     assert again.get_json()["ref"] == first["ref"]
     with client.application.app_context():
         assert client.application.db.session.query(LibraryPin).count() == 1
+
+
+def test_a_featured_card_keeps_the_citation_it_was_pinned_with(client):
+    # LexGLUE's BibTeX is in its README, read when the dataset was pinned (#120).
+    body = pin(client, "coastalcph/lex_glue")
+    featured = patch(client, body["ref"], {"featured": True})
+
+    citation = featured["card"]["citation"]
+    assert citation["title"] == "LexGLUE"
+    assert citation["revision"] == SHA
+    assert citation["bibtex"] == LEX_README_BIBTEX
+    assert [row["card"]["citation"]["bibtex"] for row in client.get("/api/library/featured", headers=ALICE).get_json()["featured"]] == [LEX_README_BIBTEX]

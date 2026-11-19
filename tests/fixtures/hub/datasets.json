@@ -366,5 +366,57 @@
     "license": "cc-by-4.0"
    }
   }
+ },
+ "rcds/swiss_judgment_prediction": {
+  "status": 200,
+  "body": {
+   "id": "rcds/swiss_judgment_prediction",
+   "author": "rcds",
+   "sha": "29806f87bba4f23d0707d3b6d9ea5432afefbe2f",
+   "createdAt": "2022-03-02T23:29:22.000Z",
+   "lastModified": "2023-06-14T11:59:24.000Z",
+   "private": false,
+   "gated": false,
+   "disabled": false,
+   "tags": [
+    "task_categories:text-classification",
+    "annotations_creators:found",
+    "language_creators:found",
+    "multilinguality:multilingual",
+    "source_datasets:original",
+    "language:de",
+    "language:fr",
+    "language:it",
+    "language:en",
+    "license:cc-by-sa-4.0",
+    "size_categories:10K<n<100K",
+    "arxiv:2110.00806",
+    "arxiv:2209.12325",
+    "region:us",
+    "judgement-prediction"
+   ],
+   "downloads": 415,
+   "likes": 19,
+   "description": "Swiss-Judgment-Prediction is a multilingual, diachronic dataset of 85K Swiss Federal Supreme Court (FSCS) cases annotated with the respective binarized judgment outcome (approval/dismissal), posing a challenging text classification task. We also provide additional metadata, i.e., the publication yea",
+   "cardData": {
+    "pretty_name": "Swiss-Judgment-Prediction",
+    "license": [
+     "cc-by-sa-4.0"
+    ],
+    "language": [
+     "de",
+     "fr",
+     "it",
+     "en"
+    ],
+    "size_categories": [
+     "10K<n<100K"
+    ],
+    "task_categories": [
+     "text-classification"
+    ]
+   },
+   "citation": "@InProceedings{niklaus-etal-2021-swiss,\n  author = {Niklaus, Joel\n                and Chalkidis, Ilias\n                and Stürmer, Matthias},\n  title = {Swiss-Court-Predict: A Multilingual Legal Judgment Prediction Benchmark},\n  booktitle = {Proceedings of the 2021 Natural Legal Language Processing Workshop},\n  year = {2021},\n  location = {Punta Cana, Dominican Republic},\n}\n@misc{niklaus2022empirical,\n    title={An Empirical Study on Cross-X Transfer for Legal Judgment Prediction},\n    author={Joel Niklaus and Matthias Stürmer and Ilias Chalkidis},\n    year={2022},\n    eprint={2209.12325},\n    archivePrefix={arXiv},\n    primaryClass={cs.CL}\n}"
+  }
  }
 }

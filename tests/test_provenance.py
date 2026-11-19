@@ -9,15 +9,11 @@ from conftest import ALICE, TASK_TYPES
 from dataset_library import imports
 from dataset_library.models import LibraryImport
 from dataset_library.providers import huggingface
-from test_citation import LEXGLUE_BIBTEX, SHA
+from test_citation import LEX_README_BIBTEX, LEXGLUE_AUTHORS, LEXGLUE_BIBTEX, SHA
 from test_import import FakeCreateDataset, write_shard
 
 BOB = {"X-User": "bob"}
 LEXGLUE = {"dataset": "coastalcph/lex_glue", "config": "ledgar", "split": "train", "textColumn": "text", "labelColumn": "label", "size": 2}
-LEXGLUE_AUTHORS = (
-    "Ilias Chalkidis, Abhik Jana, Dirk Hartung, Michael Bommarito, Ion Androutsopoulos, "
-    "Daniel Martin Katz and Nikolaos Aletras"
-)
 
 
 @pytest.fixture
@@ -214,14 +210,40 @@ def test_an_import_cites_the_card_and_provenance_returns_that_citation(make_app,
     }
 
 
-def test_a_card_without_bibtex_is_cited_with_null_bibtex(make_app, tmp_path):
+def test_a_dataset_cited_only_in_its_readme_is_cited_from_that_bibtex(make_app, tmp_path):
+    # LexGLUE's card has no BibTeX; its README does, at the revision the import read.
     app = make_app(enqueue=lambda import_ref: None)
     body = finish(app, tmp_path, queue_lex_glue(app)["id"])
 
-    assert body["citation"]["title"] == "LexGLUE"
-    assert body["citation"]["authors"] == "coastalcph"
-    assert body["citation"]["bibtex"] is None
-    assert body["citation"]["accessedAt"] == body["importedAt"]
+    assert body["citation"] == {
+        "title": "LexGLUE",
+        "authors": LEXGLUE_AUTHORS,
+        "year": 2022,
+        "url": "https://huggingface.co/datasets/coastalcph/lex_glue",
+        "revision": SHA,
+        "accessedAt": body["importedAt"],
+        "bibtex": LEX_README_BIBTEX,
+    }
+
+
+def test_an_import_whose_fetch_reports_no_revision_keeps_the_one_it_was_queued_at(make_app, tmp_path, cited_lex_glue):
+    app = make_app(enqueue=lambda import_ref: None)
+    started = queue_lex_glue(app)
+    shard = write_shard(tmp_path / "0000.parquet", ["A clause", "Another"], [0, 1])
+    with app.app_context():
+        imports.run_import(
+            started["id"], session=app.db.session,
+            fetch_shards=lambda *_: imports.Fetched(paths=[str(shard)], revision=None),
+            create_dataset=FakeCreateDataset(), data_dir=str(tmp_path / "data"), seed=7,
+        )
+        record = app.db.session.get(LibraryImport, started["id"])
+        assert record.status == "completed"
+        assert record.revision == SHA
+        assert record.citation["revision"] == SHA
+
+    body = app.test_client().get("/api/library/provenance/dataset-1", headers=ALICE).get_json()
+    assert body["revision"] == SHA
+    assert body["citation"]["revision"] == SHA
 
 
 def test_an_import_made_before_citations_existed_has_none(app, tmp_path):

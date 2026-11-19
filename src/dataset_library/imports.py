@@ -284,8 +284,9 @@ def _iso(value):
 
 def _pinned(citation, revision, accessed):
     """A citation as an import holds it: at the revision the import read and the
-    time it read it. None when the card had no citation to pin (a preview cached
-    before citations, or an import made before them)."""
+    time it read it. None when there is no citation to pin, which is an import
+    made before citations existed (a preview cached before them is rebuilt, so a
+    new import always has one)."""
     if not citation:
         return None
     return {**citation, "revision": revision, "accessedAt": _iso(accessed)}
@@ -490,7 +491,8 @@ def run_import(
         fetched = fetch_shards(record.external_id, record.config, record.split, max_bytes, work)
         if record.revision and fetched.revision and fetched.revision != record.revision:
             raise ImportFailed("changed", CHANGED)
-        _advance(session, record, SAMPLING, {"revision": fetched.revision})
+        # A fetch that reports no revision keeps the one the import was queued at (#120).
+        _advance(session, record, SAMPLING, {"revision": fetched.revision or record.revision})
         rows, method, note = _sample(record, fetched.paths, random.Random(seed), open_parquet)
         _advance(session, record, VALIDATING, {"sample_method": method, "sample_note": note})
         _write_csv(path, record, rows)
