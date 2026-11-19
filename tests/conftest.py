@@ -86,6 +86,7 @@ class FakeHub:
         self.records = list(records.values())
         self.calls = []
         self.fail = None  # an HTTP status, "malformed" or "timeout"
+        self.gone_revisions = set()  # (dataset id, sha) pairs the Hub no longer has
 
     def get(self, url, params=None, timeout=None, **kwargs):
         params = dict(params or {})
@@ -100,6 +101,13 @@ class FakeHub:
             query = url.removeprefix(VIEWER_URL) + "?" + "&".join(f"{k}={params[k]}" for k in ("dataset", "config", "split") if k in params)
             recorded = VIEWER.get(query, {"status": 404, "body": {"error": "not recorded"}})
             return FakeResponse(recorded["status"], recorded["body"])
+        if url.startswith(DATASET_URL) and "/revision/" in url:
+            # GET /api/datasets/{id}/revision/{sha}: a revision exists while the Hub keeps it.
+            dataset_id, _, revision = url.removeprefix(DATASET_URL).partition("/revision/")
+            record = HUB_DATASETS.get(dataset_id, {}).get("body") or {}
+            if (dataset_id, revision) not in self.gone_revisions and record.get("sha") == revision:
+                return FakeResponse(200, record)
+            return FakeResponse(404, {"error": "Revision Not Found"})
         if url.startswith(DATASET_URL):
             recorded = HUB_DATASETS.get(url.removeprefix(DATASET_URL), {"status": 404, "body": {"error": "Repository not found"}})
             return FakeResponse(recorded["status"], recorded["body"])

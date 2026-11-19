@@ -73,6 +73,41 @@ class LibraryPin(LibraryBase):
     pinned_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
+class LibrarySnapshot(LibraryBase):
+    """The platform's copy of a pinned dataset's sample-sized part, kept so the pin
+    can still be imported while Hugging Face is down (#121). A copy is made only
+    while the dataset's license is Allow, and has one row per pin. Once its pin is
+    removed a copy still read by a running import stays as `removing` (pin_id
+    null, not served) until those imports finish; there is no foreign key so the
+    row can outlive its pin."""
+
+    __tablename__ = "library_snapshots"
+    __table_args__ = (UniqueConstraint("pin_id", name="uq_library_snapshots_pin"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    pin_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    provider: Mapped[str] = mapped_column(String(40))
+    external_id: Mapped[str] = mapped_column(String(200))
+    # The part of the dataset the copy holds: the config and split the preview chose.
+    config: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    split: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # Set when the copy is ready: the Hub revision it was read at, and what it holds.
+    revision: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    license: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    columns: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # The file's name inside the host's snapshot directory.
+    file_path: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    row_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="queued")
+    error_code: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Set when the Hub no longer has the copy's revision; the copy is kept regardless.
+    upstream_changed: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    upstream_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
 class LibraryImport(LibraryBase):
     """One import of a sample, from queued to completed, failed or cancelled. The
     database, not the queue, says where it is; a completed import is the
@@ -110,6 +145,10 @@ class LibraryImport(LibraryBase):
     # What a Dataset cites (#120): the card's fields, pinned to the revision read
     # and when it was read. Null for imports made before citations existed.
     citation: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Where the sample was read: Hugging Face, or the platform's copy when Hugging
+    # Face was down; then `snapshot_id` names the copy and `revision` is its (#121).
+    source: Mapped[str] = mapped_column(String(20), default="huggingface", server_default="huggingface")
+    snapshot_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
     imported_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -141,6 +180,7 @@ class LibraryImport(LibraryBase):
             "sampleMethod": self.sample_method,
             "sampleNote": self.sample_note,
             "rows": self.rows,
+            "source": self.source,
             "datasetRef": self.dataset_ref,
             "createdAt": self.created_at.isoformat() + "Z" if self.created_at else None,
             "importedAt": self.imported_at.isoformat() + "Z" if self.imported_at else None,

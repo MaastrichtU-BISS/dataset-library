@@ -230,6 +230,27 @@ def remove_pin(pin_ref):
     return "", 204
 
 
+@library_bp.route("/pins/<pin_ref>/snapshot", methods=["POST"])
+def take_snapshot(pin_ref):
+    """Keep a copy of a pin that has none, or whose copy failed (#121). The worker makes it."""
+    _require_admin()
+    try:
+        pin = pins_module.take_copy(_host(), pin_ref)
+    except pins_module.NotFound:
+        raise ApiError(404, "No such pin.", "not_found")
+    except pins_module.NotOffered:
+        raise ApiError(404, "This platform keeps no copies of datasets.", "not_offered")
+    except pins_module.NotAllowed:
+        raise ApiError(409, "Only a dataset whose license is Allow can be copied.", "not_allowed")
+    except (preview_module.NotInLibrary, PrivateDataset):
+        raise ApiError(404, "That dataset is not in the library.", "not_found")
+    except ProviderRateLimited:
+        raise ApiError(503, "Hugging Face is limiting requests. Try again in a few minutes.", "provider_rate_limited")
+    except ProviderUnavailable:
+        raise ApiError(503, "Hugging Face could not be reached. Try again in a few minutes.", "provider_unavailable")
+    return jsonify(pin), 202
+
+
 @library_bp.route("/admin/settings", methods=["GET"])
 def get_settings():
     _require_admin()
@@ -248,6 +269,9 @@ def put_settings():
     except (ProviderRateLimited, ProviderUnavailable):
         host.db.session.rollback()
         raise ApiError(503, "Hugging Face could not check the new sources. Try again in a few minutes.", "provider_unavailable")
+    # A copy is kept only while its license is Allow: a changed level removes the copies it no longer allows (#121).
+    if changes["licenses_changed"]:
+        pins_module.reconcile_copies(host)
     host.audit("library.settings_saved", **changes)
     return jsonify({**admin_module.current(host.db, host), "groups": GROUPS})
 

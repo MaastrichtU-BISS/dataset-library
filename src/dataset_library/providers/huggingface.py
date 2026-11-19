@@ -91,6 +91,25 @@ def dataset(external_id, task_types):
     return _card(record, task_types, readme=lambda: _readme_bibtex(external_id, record.get("sha")))
 
 
+def revision_exists(external_id, revision):
+    """Whether the Hub still has this revision of a dataset: True, or False when it
+    answers 404 (the revision, or the dataset, is gone). Any other answer raises
+    ProviderError, so a check the Hub could not make is never read as a change (#121)."""
+    if not (DATASET_ID_PATTERN.match(external_id) and REVISION_PATTERN.match(revision or "")):
+        raise ProviderUnavailable("Not a dataset revision the Hub can be asked about")
+    try:
+        response = requests.get(f"{API}/{external_id}/revision/{revision}", timeout=TIMEOUT)
+    except requests.RequestException as exc:
+        raise ProviderUnavailable(str(exc)) from exc
+    if response.status_code == 404:
+        return False
+    if response.status_code == 429:
+        raise ProviderRateLimited("Hugging Face is limiting requests")
+    if response.status_code != 200:
+        raise ProviderUnavailable(f"Hugging Face answered {response.status_code}")
+    return True
+
+
 def _get_with_retry(params):
     """One retry when the Hub is down; none when it is limiting requests."""
     try:
