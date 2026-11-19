@@ -56,7 +56,8 @@ While the version is 0.x, minor releases may contain breaking changes.
   - Host seams: `init_dataset_library(snapshot_dir=, enqueue_snapshot=)`, and
     `run_import(snapshot_dir=)`. Without both seams, a pin keeps no copy.
 - `dataset_library.providers.huggingface.revision_exists(external_id, revision)`:
-  True, False on a 404, and `ProviderError` for any other answer.
+  True; False on a 404 (revision gone) or a 401 (dataset gone or no longer public);
+  `ProviderError` for any other answer.
 
 ### Changed
 
@@ -68,6 +69,10 @@ While the version is 0.x, minor releases may contain breaking changes.
   part (`offline: true`), and `POST /imports` reads the copy, as it does when the Hub
   is down. With no copy, the preview is unchanged and the import is refused as
   `not_importable`. A configured part is no longer refused while the viewer is down.
+  Only a real outage counts: no connection, a server error other than 501, or an
+  unreadable answer (`viewer.ViewerDown`). A viewer that says no for good (501, it
+  cannot read the dataset; 404; 401) gives the usual unavailable preview, and a pin
+  of it records `no_rows`. A missing `/info` alone is not an outage.
 - A try at a copy has its own id (a failed copy is tried again as a new row), and its
   files are named by that id: `<id>.parquet`, and the work directory `.incoming/<id>`.
   A try still running after its copy was swept and tried again cannot finish the
@@ -76,7 +81,9 @@ While the version is 0.x, minor releases may contain breaking changes.
 - Unpinning deletes a copy's file and work area by the copy's id, whatever path its row
   holds, so a file left by a crashed build goes too. The sweep fails a stuck build and
   removes its work area and file; it also removes any work area or copy file that no
-  copy still owns.
+  copy still owns. Only names it made (`<uuid>.parquet`, `.incoming/<uuid>`) are
+  touched. A queued copy waits behind imports on the same worker, so the sweep fails
+  it only after 6 hours (a building copy, after 30 minutes without a heartbeat).
 - A copy is kept only while its pin exists and its license is still Allow, checked when
   it is ready. A copy whose pin is removed, or whose license is no longer Allow, while
   it is made is dropped with its file. An import reads a copy, or an offline dataset
@@ -85,7 +92,10 @@ While the version is 0.x, minor releases may contain breaking changes.
 - A request that loses a race to another request for the same pin returns the copy
   that other request queued.
 - `check_upstream` records each answer on its own, so a copy unpinned meanwhile is a
-  no-op, and the round ends at the first check the Hub cannot answer.
+  no-op. A copy whose check fails goes to the back of the order with its flag
+  unchanged, so one dataset the Hub always refuses cannot stop the others being
+  checked. The round ends after two failed checks in a row (the Hub is down), or at
+  once on a rate limit.
 - An offline dataset's columns are typed from the copy's Hugging Face features, as the
   live preview types them (a ClassLabel is a class label), and its proposed task is the
   one the live preview would propose from the same columns (NER and summarization keep

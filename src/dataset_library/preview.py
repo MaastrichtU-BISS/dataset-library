@@ -109,10 +109,13 @@ def _build(host, external_id, config, split):
     body["labels"] = labels_module.for_ids(host.cache, [external_id])[external_id]
     try:
         configs = _configs(viewer.get("splits", dataset=external_id))
-    except viewer.ViewerUnavailable:
+    except viewer.ViewerDown:
         # Not "no rows": the viewer did not answer. A configured part is not refused here either,
         # since a copy of that part may still stand in for the viewer (#121).
         body[VIEWER_DOWN] = True
+        return body
+    except viewer.ViewerUnavailable:
+        # The viewer said no for good (it cannot read this dataset): no preview, and no outage.
         return body
     if not configs:
         return body
@@ -124,14 +127,14 @@ def _build(host, external_id, config, split):
         raise UnknownConfig()
     split = split or ("train" if "train" in chosen["splits"] else chosen["splits"][0])
     body.update(configs=configs, config=chosen["name"], split=split)
-    body["rowCount"], info_down = _row_count(external_id, chosen["name"], split)
+    body["rowCount"] = _row_count(external_id, chosen["name"], split)
     try:
         rows = viewer.get("first-rows", dataset=external_id, config=chosen["name"], split=split)
-    except viewer.ViewerUnavailable:
+    except viewer.ViewerDown:
         body[VIEWER_DOWN] = True
         return body
-    if info_down:
-        body[VIEWER_DOWN] = True
+    except viewer.ViewerUnavailable:
+        return body
     features = [f for f in rows.get("features") or [] if isinstance(f, dict) and isinstance(f.get("name"), str)]
     body["columns"] = [{"name": f["name"], "type": _type(f.get("type"))} for f in features]
     body["rows"] = [
@@ -262,14 +265,14 @@ def _is_class_label(feature):
 
 
 def _row_count(external_id, config, split):
-    """The split's size from the viewer's /info, or None when it does not say; and whether
-    the viewer did not answer at all."""
+    """The split's size from the viewer's /info, or None when it does not say. Only the size:
+    once the first rows answer, a missing /info is not an outage (#121)."""
     try:
         info = viewer.get("info", dataset=external_id, config=config).get("dataset_info") or {}
     except viewer.ViewerUnavailable:
-        return None, True
+        return None
     count = ((info.get("splits") or {}).get(split) or {}).get("num_examples")
-    return (count if isinstance(count, int) else None), False
+    return count if isinstance(count, int) else None
 
 
 def _configs(body):

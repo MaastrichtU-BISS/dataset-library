@@ -14,7 +14,7 @@ import pytest
 import sqlalchemy as sa
 
 from dataset_library import imports, pins, preview as preview_module, snapshots
-from dataset_library.errors import ProviderUnavailable
+from dataset_library.errors import ProviderUnavailable, ProviderRateLimited
 from dataset_library.models import LibraryImport, LibraryPin, LibrarySettings, LibrarySnapshot
 from dataset_library.providers import huggingface
 from test_import import FakeCreateDataset, run, write_ner_shard, write_shard, write_summarization_shard  # noqa: F401 - `run` is a fixture
@@ -411,11 +411,14 @@ def test_the_hub_is_asked_about_each_copy_once_an_hour_and_a_check_it_cannot_mak
         session = app.db.session
         hub.fail = 503
         assert snapshots.check_upstream(session, now=now) == 0
-        assert session.query(LibrarySnapshot).one().upstream_checked_at is None
+        # A check the Hub could not answer goes to the back of the order, its flag unchanged.
+        copy = session.query(LibrarySnapshot).one()
+        assert copy.upstream_changed is False and copy.upstream_checked_at is not None
         hub.fail = None
-        assert snapshots.check_upstream(session, now=now) == 1
         assert snapshots.check_upstream(session, now=now + timedelta(minutes=30)) == 0
         assert snapshots.check_upstream(session, now=now + timedelta(hours=2)) == 1
+        assert snapshots.check_upstream(session, now=now + timedelta(hours=2, minutes=30)) == 0
+        assert snapshots.check_upstream(session, now=now + timedelta(hours=4)) == 1
 
 
 def test_the_hub_says_whether_a_revision_exists(hub):
@@ -625,6 +628,41 @@ def test_a_pin_made_while_the_viewer_is_down_says_its_copy_was_busy_and_a_retry_
     assert resp.status_code == 202, resp.get_json()
     assert resp.get_json()["snapshot"]["status"] == "queued"
     assert copies_queue.refs == [copy_row(app, pinned["ref"])["id"]]
+
+
+@pytest.mark.parametrize("status", [501, 404, 401])
+def test_a_viewer_that_says_no_for_good_is_not_an_outage(client, hub, cache, copies_queue, status):
+    # 501: the viewer cannot read this dataset; 404 and 401: not there, or gated. None is an outage.
+    hub.viewer_fail = status
+    cache.expire("library:")
+    pinned = pin_as_admin(client)
+
+    assert (pinned["snapshot"]["status"], pinned["snapshot"]["error"]) == ("failed", snapshots.NO_ROWS)
+    body = client.get(f"/api/library/datasets/huggingface/{GREEK}", headers=ADMIN).get_json()
+    assert "viewerDown" not in body
+    assert copies_queue.refs == []
+
+
+def test_a_viewer_server_error_is_an_outage():
+    from dataset_library.providers import viewer
+
+    class Answer:
+        def __init__(self, status):
+            self.status_code = status
+
+        def json(self):
+            raise ValueError("not JSON")
+
+    import unittest.mock as mock
+
+    for status, kind in [(503, viewer.ViewerDown), (500, viewer.ViewerDown), (501, viewer.ViewerUnavailable)]:
+        with mock.patch("dataset_library.providers.viewer.requests.get", return_value=Answer(status)):
+            with pytest.raises(viewer.ViewerUnavailable) as raised:
+                viewer.get("splits", dataset=GREEK)
+        assert (type(raised.value) is viewer.ViewerDown) == (kind is viewer.ViewerDown), status
+    with mock.patch("dataset_library.providers.viewer.requests.get", return_value=Answer(200)):
+        with pytest.raises(viewer.ViewerDown):
+            viewer.get("splits", dataset=GREEK)
 
 
 # --- Crashed builds (#121) ------------------------------------------------------------
@@ -918,7 +956,7 @@ def add_ready_copies(app, count):
     return external_ids
 
 
-def test_a_hub_outage_ends_the_upstream_round_at_its_first_failed_check(app):
+def test_a_hub_outage_ends_the_upstream_round_after_two_failed_checks_in_a_row(app):
     add_ready_copies(app, 3)
     asked = []
 
@@ -928,8 +966,42 @@ def test_a_hub_outage_ends_the_upstream_round_at_its_first_failed_check(app):
 
     with app.app_context():
         assert snapshots.check_upstream(app.db.session, revision_exists=hub_down) == 0
-        assert app.db.session.query(LibrarySnapshot).filter(LibrarySnapshot.upstream_checked_at.is_(None)).count() == 3
+        assert app.db.session.query(LibrarySnapshot).filter(LibrarySnapshot.upstream_checked_at.is_(None)).count() == 1
+        assert app.db.session.query(LibrarySnapshot).filter(LibrarySnapshot.upstream_changed.is_(True)).count() == 0
+    assert len(asked) == 2
+
+
+def test_a_rate_limit_ends_the_upstream_round_at_once(app):
+    add_ready_copies(app, 3)
+    asked = []
+
+    def limited(external_id, revision):
+        asked.append(external_id)
+        raise ProviderRateLimited("Hugging Face is limiting requests")
+
+    with app.app_context():
+        assert snapshots.check_upstream(app.db.session, revision_exists=limited) == 0
     assert len(asked) == 1
+
+
+def test_one_copy_the_hub_always_refuses_does_not_stop_the_others_being_checked(app):
+    add_ready_copies(app, 3)
+    with app.app_context():
+        session = app.db.session
+        refused = session.query(LibrarySnapshot).order_by(LibrarySnapshot.id).first().external_id
+
+    def one_refused(external_id, revision):
+        if external_id == refused:
+            raise ProviderUnavailable("Hugging Face answered 403")
+        return True
+
+    with app.app_context():
+        session = app.db.session
+        now = utc_now()
+        for hours in range(5):
+            snapshots.check_upstream(session, revision_exists=one_refused, now=now + timedelta(hours=2 * hours))
+        healthy = session.query(LibrarySnapshot).filter(LibrarySnapshot.external_id != refused).all()
+        assert len(healthy) == 2 and all(copy.upstream_checked_at is not None for copy in healthy)
 
 
 def test_a_copy_unpinned_during_the_upstream_round_is_a_no_op_and_the_rest_are_still_checked(app):
@@ -1015,3 +1087,43 @@ def test_an_offline_search_names_each_pin_by_its_title_then_its_cards_then_its_i
     assert body["status"] == "unavailable"
     titles = {card["externalId"]: card["title"] for card in body["results"]}
     assert titles == {GREEK: "Greek Legal Code", "coastalcph/lex_glue": "Our LexGLUE", NER: "legal_ner"}
+
+
+def test_a_queued_copy_waiting_behind_imports_is_not_failed_until_hours_have_passed(app, snapshot_dir):
+    add_ready_copies(app, 1)
+    with app.app_context():
+        session = app.db.session
+        copy = session.query(LibrarySnapshot).one()
+        copy.status, copy.updated_at = "queued", utc_now() - timedelta(hours=2)
+        session.commit()
+        assert snapshots.sweep(session, snapshot_dir) == []
+        assert session.query(LibrarySnapshot).one().status == "queued"
+        assert snapshots.sweep(session, snapshot_dir, now=utc_now() + timedelta(hours=5)) == [copy.id]
+
+
+def test_the_sweep_leaves_files_it_did_not_name(app, snapshot_dir):
+    os.makedirs(os.path.join(snapshot_dir, snapshots.INCOMING, "someone-elses"), exist_ok=True)
+    foreign = os.path.join(snapshot_dir, "notes.parquet")
+    orphan = os.path.join(snapshot_dir, "0b1d6a3e-8f2c-4c1a-9d7e-5a6b7c8d9e0f.parquet")
+    for path in (foreign, orphan):
+        with open(path, "wb") as handle:
+            handle.write(b"x")
+    with app.app_context():
+        snapshots.sweep(app.db.session, snapshot_dir)
+    assert os.path.exists(foreign)
+    assert os.path.isdir(os.path.join(snapshot_dir, snapshots.INCOMING, "someone-elses"))
+    assert not os.path.exists(orphan)
+
+
+def test_an_offline_open_of_a_copy_whose_pin_just_went_is_not_an_error(app):
+    from dataset_library.preview import LicenseHidden
+
+    add_ready_copies(app, 1)
+    with app.app_context():
+        session = app.db.session
+        copy = session.query(LibrarySnapshot).one()
+        session.delete(session.get(LibraryPin, copy.pin_id))
+        session.commit()
+        host = type("Host", (), {"db": app.db, "snapshot_dir": None})()
+        with pytest.raises(LicenseHidden):
+            snapshots.offline_detail(host, copy)

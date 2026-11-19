@@ -22,6 +22,7 @@ is deleted under a reader.
 import errno
 import logging
 import os
+import re
 import shutil
 import threading
 from datetime import datetime, timedelta, timezone
@@ -30,7 +31,7 @@ import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 
 from . import policy as policy_module
-from .errors import ProviderError
+from .errors import ProviderError, ProviderRateLimited
 from .licenses import LICENSES, UNKNOWN
 from .limits import download_cap_bytes
 from .models import LibraryImport, LibraryPin, LibrarySnapshot
@@ -41,9 +42,13 @@ logger = logging.getLogger("dataset_library")
 
 PROVIDER = "huggingface"
 QUEUED, BUILDING, READY, FAILED, REMOVING = "queued", "building", "ready", "failed", "removing"
-# A copy a worker left queued or building this long is failed by the sweep. A building
-# copy refreshes its updated_at this often, so only a worker that has really stopped is failed.
+# A building copy left this long is failed by the sweep. It refreshes its updated_at every
+# HEARTBEAT_SECONDS, so only a worker that has really stopped is failed. A queued copy waits
+# behind imports on the same worker, so it gets far longer before it counts as lost.
 STALE_AFTER = timedelta(minutes=30)
+QUEUED_AFTER = timedelta(hours=6)
+# Copies and their work areas are named by a row id, a UUID; nothing else in the directory is touched.
+_OWN_NAME = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 HEARTBEAT_SECONDS = 15
 # How often the Hub is asked whether a copy's revision still exists, and how many copies per round.
 CHECK_AFTER = timedelta(hours=1)
@@ -288,6 +293,9 @@ def offline_detail(host, copy, *, rows=True):
     license is the platform's level now, as preview applies it; LicenseHidden when it is
     hidden. `rowCount` is the copy's rows, not the split's."""
     pin = host.db.session.get(LibraryPin, copy.pin_id)
+    if pin is None:
+        # Unpinned since the copy was found: it no longer stands in for anything.
+        raise LicenseHidden()
     license = LICENSES.get(copy.license or "", UNKNOWN)
     level = policy_module.level(license, policy_module.overrides(host.db))
     if level == "hide":
@@ -423,7 +431,7 @@ def reconcile(session, snapshot_dir, policy):
     return len(gone)
 
 
-def sweep(session, snapshot_dir, *, stale_after=STALE_AFTER, now=None):
+def sweep(session, snapshot_dir, *, stale_after=STALE_AFTER, queued_after=QUEUED_AFTER, now=None):
     """Fail copies a worker left queued or building, release removing copies no import
     reads any more, and delete what no kept copy owns: the work directory or file a dead
     build left, and anything of a failed copy. Safe to run anywhere, any number of times;
@@ -433,9 +441,10 @@ def sweep(session, snapshot_dir, *, stale_after=STALE_AFTER, now=None):
     files, work = _listing(snapshot_dir)
     stuck = [
         (copy.id, copy.external_id, copy.status)
-        for copy in session.query(LibrarySnapshot).filter(
-            LibrarySnapshot.status.in_([QUEUED, BUILDING]), LibrarySnapshot.updated_at < now - stale_after
-        )
+        for copy in session.query(LibrarySnapshot).filter(sa.or_(
+            sa.and_(LibrarySnapshot.status == BUILDING, LibrarySnapshot.updated_at < now - stale_after),
+            sa.and_(LibrarySnapshot.status == QUEUED, LibrarySnapshot.updated_at < now - queued_after),
+        ))
     ]
     failed = []
     for copy_id, external_id, status in stuck:
@@ -455,8 +464,10 @@ def check_upstream(session, *, revision_exists=None, now=None, after=CHECK_AFTER
     """Ask the Hub whether each ready copy's revision still exists. One it no longer has
     sets `upstream_changed`; the copy is kept either way. Each answer is saved on its own,
     and a copy unpinned meanwhile is left alone. The round ends at the first check the Hub
-    cannot answer (it is down), and the rest are asked in a later round. Returns how many
-    copies were recorded."""
+    cannot answer twice in a row (it is down), or when it limits requests; the rest are
+    asked in a later round. A copy whose own check fails is put to the back, its flag
+    unchanged, so one dataset the Hub always refuses cannot stop the others being checked.
+    Returns how many copies were recorded."""
     revision_exists = revision_exists or huggingface.revision_exists
     now = now or _now()
     due = [
@@ -469,12 +480,26 @@ def check_upstream(session, *, revision_exists=None, now=None, after=CHECK_AFTER
         .order_by(LibrarySnapshot.upstream_checked_at.is_not(None), LibrarySnapshot.upstream_checked_at)
         .limit(limit)
     ]
-    checked = 0
+    checked, failures = 0, 0
     for copy_id, external_id, revision in due:
         try:
             exists = revision_exists(external_id, revision)
-        except ProviderError:
+        except ProviderRateLimited:
             break
+        except ProviderError:
+            failures += 1
+            # To the back of the order, flag unchanged: asked again in a later round.
+            session.execute(
+                sa.update(LibrarySnapshot)
+                .where(LibrarySnapshot.id == copy_id, LibrarySnapshot.status == READY)
+                .values(upstream_checked_at=now)
+                .execution_options(synchronize_session=False)
+            )
+            session.commit()
+            if failures >= 2:
+                break
+            continue
+        failures = 0
         recorded = session.execute(
             sa.update(LibrarySnapshot)
             .where(LibrarySnapshot.id == copy_id, LibrarySnapshot.status == READY)
@@ -598,9 +623,12 @@ def _listing(snapshot_dir):
     snapshot directory, as their names."""
     if snapshot_dir is None or not os.path.isdir(snapshot_dir):
         return [], []
-    files = [name for name in os.listdir(snapshot_dir) if name.endswith(".parquet") and not name.startswith(".")]
+    files = [
+        name for name in os.listdir(snapshot_dir)
+        if name.endswith(".parquet") and _OWN_NAME.fullmatch(name[: -len(".parquet")])
+    ]
     incoming = os.path.join(snapshot_dir, INCOMING)
-    work = os.listdir(incoming) if os.path.isdir(incoming) else []
+    work = [name for name in os.listdir(incoming) if _OWN_NAME.fullmatch(name)] if os.path.isdir(incoming) else []
     return files, work
 
 
