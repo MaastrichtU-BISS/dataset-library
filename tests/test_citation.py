@@ -353,6 +353,21 @@ def test_the_first_fenced_block_holding_an_entry_is_the_readme_bibtex():
     assert _readme_entry(readme) == "@misc{x, year = {2020}}"
 
 
+def test_the_citation_section_wins_over_an_upstream_entry_quoted_earlier():
+    readme = (
+        "## Source data\n\nBuilt from:\n\n```bibtex\n@article{other2018, year={2018}}\n```\n\n"
+        "## Citation Information\n\n```bibtex\n@misc{mine2024, year={2024}}\n```\n"
+    )
+
+    assert _readme_entry(readme) == "@misc{mine2024, year={2024}}"
+
+
+def test_a_bare_entry_under_a_citation_heading_wins_over_an_earlier_fence():
+    readme = "## Source\n\n```bibtex\n@article{other2018, year={2018}}\n```\n\n## Citation\n\n@misc{mine2024, year={2024}}\n"
+
+    assert _readme_entry(readme) == "@misc{mine2024, year={2024}}"
+
+
 def test_without_a_fence_the_entry_under_a_citation_heading_is_read():
     readme = "## Citation\n\nSee below.\n\n@article{y, title={Z}, year={2019}}\n\n## Notes\n\n@misc{other, year={2001}}\n"
 

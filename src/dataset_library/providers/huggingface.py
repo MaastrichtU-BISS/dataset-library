@@ -236,24 +236,29 @@ def _readme_bibtex(external_id, revision):
 
 
 def _readme_entry(text):
-    """The BibTeX in a README: the first fenced block holding an entry, else the
-    first entry under a heading that says "Citation" (#120)."""
-    fences = [match.span() for match in _FENCE.finditer(text)]
-    for match in _FENCE.finditer(text):
-        if _ENTRY_START.search(match.group(1)):
-            return match.group(1).strip()
+    """The BibTeX in a README (#120): an entry in a section whose heading says
+    "Citation" (a fenced block there, else a bare entry), else the first fenced
+    block anywhere holding one. The Citation section comes first because a README
+    often quotes an upstream dataset's BibTeX elsewhere."""
+    fenced = [(match.span(), match.group(1)) for match in _FENCE.finditer(text)]
     # A "#" line inside a code block is not a heading.
-    headings = [h for h in _HEADING.finditer(text) if not any(a <= h.start() < b for a, b in fences)]
+    headings = [h for h in _HEADING.finditer(text) if not any(a <= h.start() < b for (a, b), _ in fenced)]
     for index, heading in enumerate(headings):
         if "citation" not in heading.group(2).lower():
             continue
         level = len(heading.group(1))
         end = next((h.start() for h in headings[index + 1:] if len(h.group(1)) <= level), len(text))
+        for (a, b), body in fenced:
+            if heading.end() <= a < end and _ENTRY_START.search(body):
+                return body.strip()
         section = text[heading.end():end]
         found = _ENTRY_START.search(section)
         close = _close(section, found.end() - 1) if found else None
         if close is not None:
             return section[found.start():close + 1].strip()
+    for _, body in fenced:
+        if _ENTRY_START.search(body):
+            return body.strip()
     return None
 
 

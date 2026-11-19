@@ -25,7 +25,9 @@ While the version is 0.x, minor releases may contain breaking changes.
     from the Hub's top-level `citation`, else the card's `citation_bibtex`, else
     `citation` (each only when the value starts with `@`), else the dataset's
     README at the card's revision (512 KB at most, with a short timeout; any
-    failure is no BibTeX). Only a single dataset reads its README, so a search
+    failure is no BibTeX). In the README, an entry in a section headed
+    "Citation" comes before a fenced entry elsewhere, which is often an upstream
+    dataset's. Only a single dataset reads its README, so a search
     result's `bibtex` can be null where the dataset's own cannot. A
     plain-text citation, or none at all, gives null.
   - The BibTeX is read by a small scanner: only a top-level field of the first
