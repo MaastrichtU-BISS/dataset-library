@@ -131,6 +131,7 @@ def _card(record, task_types):
         "updated": (record.get("lastModified") or "")[:10] or None,
         "revision": record.get("sha"),
         "downloads": record.get("downloads") or 0,
+        "citation": _citation(record, external_id, card_data),
     }
 
 
@@ -142,6 +143,84 @@ def _title(pretty_name, external_id):
     if isinstance(pretty_name, str) and pretty_name.strip():
         return pretty_name.strip()
     return external_id.split("/")[-1]
+
+
+def _citation(record, external_id, card_data):
+    """The fields a Dataset is cited from (#120). `accessedAt` stays null here:
+    looking at a card is not reading the dataset; an import sets it."""
+    bibtex = _bibtex(card_data)
+    return {
+        "title": _title(card_data.get("pretty_name"), external_id),
+        "authors": _authors(card_data, bibtex, external_id),
+        "year": _year(card_data, bibtex, record.get("createdAt")),
+        "url": DATASET_URL.format(external_id),
+        "revision": record.get("sha"),
+        "accessedAt": None,
+        "bibtex": bibtex,
+    }
+
+
+def _bibtex(card_data):
+    """The card's own BibTeX entry, exactly as written, or None. A plain-text
+    citation in the same field is not an entry, so it is not one here."""
+    for key in ("citation_bibtex", "citation"):
+        value = card_data.get(key)
+        if isinstance(value, str) and value.lstrip().startswith("@"):
+            return value
+    return None
+
+
+def _authors(card_data, bibtex, external_id):
+    """The card's authors, else its BibTeX entry's, else the organisation or
+    person who owns the dataset."""
+    listed = card_data.get("authors")
+    if isinstance(listed, list):
+        listed = ", ".join(name.strip() for name in listed if isinstance(name, str) and name.strip())
+    if isinstance(listed, str) and listed.strip():
+        return listed.strip()
+    written = _bibtex_field(bibtex, "author")
+    if written:
+        return _names(written)
+    return external_id.split("/")[0]
+
+
+def _names(written):
+    """BibTeX's "Last, First and First Last" as a citation reads it: "First Last"
+    for each name, joined with commas and a final "and"."""
+    names = []
+    for name in re.split(r"\s+and\s+", written):
+        last, comma, first = name.partition(",")
+        if name.strip():
+            names.append(f"{first.strip()} {last.strip()}" if comma else name.strip())
+    if len(names) > 1:
+        return ", ".join(names[:-1]) + " and " + names[-1]
+    return names[0] if names else written
+
+
+def _year(card_data, bibtex, created_at):
+    """The publication year: the card's, else its BibTeX entry's, else the year
+    the Hub repository was created."""
+    for value in (card_data.get("year"), _bibtex_field(bibtex, "year"), (created_at or "")[:4]):
+        text = str(value or "").strip()
+        if re.fullmatch(r"\d{4}", text):
+            return int(text)
+    return None
+
+
+def _bibtex_field(bibtex, name):
+    """One field's value from a BibTeX entry with its braces removed, or None.
+    Reads `{...}` with one level of nested braces, `"..."`, and a bare number."""
+    if not bibtex:
+        return None
+    match = re.search(
+        rf'\b{name}\s*=\s*(?:\{{((?:[^{{}}]|\{{[^{{}}]*\}})*)\}}|"([^"]*)"|(\w+))',
+        bibtex,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    value = next(group for group in match.groups() if group is not None)
+    return " ".join(value.replace("{", "").replace("}", "").split()) or None
 
 
 def _number(text):

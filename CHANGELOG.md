@@ -8,6 +8,28 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-19
+
+### Added
+
+- Citing an imported dataset (BAIGLE #120, design DR13).
+  - Every Hugging Face card carries `citation`: `title` (the card's
+    `pretty_name`, else the dataset name), `authors` (the card's `authors`,
+    else its BibTeX entry's, else the organisation that owns the dataset),
+    `year` (the card's `year`, else its BibTeX year, else the year the
+    repository was created), `url`, `revision` (the Hub's `sha`),
+    `accessedAt` (null on a card: looking at it is not reading it) and
+    `bibtex`.
+  - `bibtex` is the card's own entry, kept exactly as written: taken from
+    `citation_bibtex`, else `citation`, and only when the value starts with
+    `@`. A plain-text citation, or no field at all, gives null.
+  - A completed import stores that citation in the new `library_imports.citation`
+    column (JSON, nullable; migration `dl_0007_citation`), set when the import
+    is created and pinned again when it completes: `revision` is the revision
+    the import read and `accessedAt` the time it was imported.
+    `provenance()` returns it as `citation`; imports made before 0.11.0 have
+    none, so it is `null`.
+
 ## [0.10.0] - 2026-11-18
 
 ### Changed

@@ -213,6 +213,7 @@ def start(host, owner_id, body, *, ack_at=None):
         text_column=text_column, label_column=label_column, task_type=task_type,
         sample_size=min(size, cap), max_rows=cap, balance=balance,
         name=name or (dataset["title"] if not earlier else f"{dataset['title']} ({earlier + 1})"),
+        citation=_pinned(dataset.get("citation"), dataset.get("revision"), _now()),
         status=QUEUED,
     )
     session.add(record)
@@ -273,11 +274,21 @@ def provenance(host, owner_id, dataset_ref):
         "balance": record.balance,
         "sampleMethod": record.sample_method,
         "sampleNote": record.sample_note,
+        "citation": record.citation,
     }
 
 
 def _iso(value):
     return value.isoformat() + "Z" if value else None
+
+
+def _pinned(citation, revision, accessed):
+    """A citation as an import holds it: at the revision the import read and the
+    time it read it. None when the card had no citation to pin (a preview cached
+    before citations, or an import made before them)."""
+    if not citation:
+        return None
+    return {**citation, "revision": revision, "accessedAt": _iso(accessed)}
 
 
 def current(host, owner_id, now=None):
@@ -489,7 +500,12 @@ def run_import(
             dataset_ref = create_dataset(record.owner_id, path, record.name, _description(record), record.task_type)
         except ValueError as exc:
             raise ImportFailed("invalid", str(exc)) from exc
-        _advance(session, record, COMPLETED, {"dataset_ref": str(dataset_ref), "rows": len(rows), "imported_at": _now()})
+        imported = _now()
+        _advance(session, record, COMPLETED, {
+            "dataset_ref": str(dataset_ref), "rows": len(rows), "imported_at": imported,
+            # Cited at the revision that was read and the day it was imported.
+            "citation": _pinned(record.citation, record.revision, imported),
+        })
     except _Stopped:
         _remove(path)
     except ImportFailed as exc:

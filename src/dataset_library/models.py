@@ -107,6 +107,9 @@ class LibraryImport(LibraryBase):
     error_message: Mapped[str | None] = mapped_column(String(500), nullable=True)
     dataset_ref: Mapped[str | None] = mapped_column(String(64), nullable=True)
     rows: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # What a Dataset cites (#120): the card's fields, pinned to the revision read
+    # and when it was read. Null for imports made before citations existed.
+    citation: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
     imported_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
