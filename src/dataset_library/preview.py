@@ -8,6 +8,9 @@ from .licenses import LICENSES, UNKNOWN
 from .providers import huggingface, viewer
 
 CACHE_SECONDS = 600
+# Set on a preview built while the viewer did not answer: the card stands, but its rows
+# are not known, so it is not kept, and a copy of the part (#121) may stand in for them.
+VIEWER_DOWN = "viewerDown"
 ROWS = 8
 CELL_CHARACTERS = 400
 # Names that say which column is which, before falling back to the types.
@@ -62,7 +65,9 @@ def preview(host, external_id, config=None, split=None):
     # import started right after the deploy still gets one.
     if not isinstance(body, dict) or "citation" not in body:
         body = _build(host, external_id, config, split)
-        host.cache.set(key, body, CACHE_SECONDS)
+        # A preview built while the viewer was down is not kept: the next open asks again.
+        if not body.get(VIEWER_DOWN):
+            host.cache.set(key, body, CACHE_SECONDS)
     return _apply_library_rules(host, body)
 
 
@@ -104,9 +109,13 @@ def _build(host, external_id, config, split):
     body["labels"] = labels_module.for_ids(host.cache, [external_id])[external_id]
     try:
         configs = _configs(viewer.get("splits", dataset=external_id))
+    except viewer.ViewerDown:
+        # Not "no rows": the viewer did not answer. A configured part is not refused here either,
+        # since a copy of that part may still stand in for the viewer (#121).
+        body[VIEWER_DOWN] = True
+        return body
     except viewer.ViewerUnavailable:
-        if config:
-            raise UnknownConfig()
+        # The viewer said no for good (it cannot read this dataset): no preview, and no outage.
         return body
     if not configs:
         return body
@@ -121,6 +130,9 @@ def _build(host, external_id, config, split):
     body["rowCount"] = _row_count(external_id, chosen["name"], split)
     try:
         rows = viewer.get("first-rows", dataset=external_id, config=chosen["name"], split=split)
+    except viewer.ViewerDown:
+        body[VIEWER_DOWN] = True
+        return body
     except viewer.ViewerUnavailable:
         return body
     features = [f for f in rows.get("features") or [] if isinstance(f, dict) and isinstance(f.get("name"), str)]
@@ -253,7 +265,8 @@ def _is_class_label(feature):
 
 
 def _row_count(external_id, config, split):
-    """The split's size from the viewer's /info, or None when it does not say."""
+    """The split's size from the viewer's /info, or None when it does not say. Only the size:
+    once the first rows answer, a missing /info is not an outage (#121)."""
     try:
         info = viewer.get("info", dataset=external_id, config=config).get("dataset_info") or {}
     except viewer.ViewerUnavailable:

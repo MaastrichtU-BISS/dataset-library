@@ -7,8 +7,9 @@ from . import labels as labels_module
 from . import pins as pins_module
 from . import policy as policy_module
 from . import preview as preview_module
-from .errors import ProviderRateLimited, ProviderUnavailable
+from .errors import ProviderError, ProviderRateLimited, ProviderUnavailable
 from . import search as search_module
+from . import snapshots as snapshots_module
 from .licenses import GROUPS, LICENSES
 from .providers.huggingface import DATASET_ID_PATTERN, PrivateDataset
 from .tasks import hugging_face_filter
@@ -124,23 +125,40 @@ def labels():
 # their own database ids (BAIGLE refuses any that is not a UUID).
 @library_bp.route("/datasets/huggingface/<path:dataset_ref>", methods=["GET"])
 def dataset(dataset_ref):
-    """One dataset's facts, configs and first rows (`?config=&split=`)."""
+    """One dataset's facts, configs and first rows (`?config=&split=`). While Hugging
+    Face cannot be asked, the copy the platform keeps of this part stands in (#121)."""
     if not DATASET_ID_PATTERN.match(dataset_ref):
         raise ApiError(400, f"Not a Hugging Face dataset id: {dataset_ref}", "bad_id")
+    config, split = request.args.get("config") or None, request.args.get("split") or None
     try:
-        return jsonify(
-            preview_module.preview(
-                _host(), dataset_ref, request.args.get("config") or None, request.args.get("split") or None
-            )
-        )
+        body = preview_module.preview(_host(), dataset_ref, config, split)
     except (preview_module.NotInLibrary, PrivateDataset):
         raise ApiError(404, "That dataset is not in the library.", "not_found")
     except preview_module.UnknownConfig:
         raise ApiError(400, "That dataset has no such configuration or split.", "bad_config")
-    except ProviderRateLimited:
-        raise ApiError(503, "Hugging Face is limiting requests. Try again in a few minutes.", "provider_rate_limited")
-    except ProviderUnavailable:
+    except ProviderError as down:
+        view = _copy_view(dataset_ref, config, split)
+        if view is not None:
+            return view
+        if isinstance(down, ProviderRateLimited):
+            raise ApiError(503, "Hugging Face is limiting requests. Try again in a few minutes.", "provider_rate_limited")
         raise ApiError(503, "Hugging Face is unavailable right now. Try again in a few minutes.", "provider_unavailable")
+    if body.get(preview_module.VIEWER_DOWN):
+        # The viewer did not answer: the copy of this part, when there is one, shows the rows (#121).
+        view = _copy_view(dataset_ref, config, split)
+        if view is not None:
+            return view
+    return jsonify(body)
+
+
+def _copy_view(dataset_ref, config, split):
+    """The platform's copy of this part of the dataset as the page shows it, or None when
+    there is no copy to show (#121). A copy whose license is now hidden is not in the library."""
+    try:
+        copy = snapshots_module.copy_for_offline(_host(), dataset_ref, config, split)
+        return None if copy is None else jsonify(snapshots_module.offline_detail(_host(), copy))
+    except preview_module.LicenseHidden:
+        raise ApiError(404, "That dataset is not in the library.", "not_found")
 
 
 @library_bp.route("/provenance/<dataset_ref>", methods=["GET"])
@@ -230,6 +248,27 @@ def remove_pin(pin_ref):
     return "", 204
 
 
+@library_bp.route("/pins/<pin_ref>/snapshot", methods=["POST"])
+def take_snapshot(pin_ref):
+    """Keep a copy of a pin that has none, or whose copy failed (#121). The worker makes it."""
+    _require_admin()
+    try:
+        pin = pins_module.take_copy(_host(), pin_ref)
+    except pins_module.NotFound:
+        raise ApiError(404, "No such pin.", "not_found")
+    except pins_module.NotOffered:
+        raise ApiError(404, "This platform keeps no copies of datasets.", "not_offered")
+    except pins_module.NotAllowed:
+        raise ApiError(409, "Only a dataset whose license is Allow can be copied.", "not_allowed")
+    except (preview_module.NotInLibrary, PrivateDataset):
+        raise ApiError(404, "That dataset is not in the library.", "not_found")
+    except ProviderRateLimited:
+        raise ApiError(503, "Hugging Face is limiting requests. Try again in a few minutes.", "provider_rate_limited")
+    except ProviderUnavailable:
+        raise ApiError(503, "Hugging Face could not be reached. Try again in a few minutes.", "provider_unavailable")
+    return jsonify(pin), 202
+
+
 @library_bp.route("/admin/settings", methods=["GET"])
 def get_settings():
     _require_admin()
@@ -248,6 +287,9 @@ def put_settings():
     except (ProviderRateLimited, ProviderUnavailable):
         host.db.session.rollback()
         raise ApiError(503, "Hugging Face could not check the new sources. Try again in a few minutes.", "provider_unavailable")
+    # A copy is kept only while its license is Allow: a changed level removes the copies it no longer allows (#121).
+    if changes["licenses_changed"]:
+        pins_module.reconcile_copies(host)
     host.audit("library.settings_saved", **changes)
     return jsonify({**admin_module.current(host.db, host), "groups": GROUPS})
 

@@ -5,7 +5,7 @@ from typing import Callable, Protocol
 from .licenses import License, resolve_license
 from .limits import HARD_MAX_ROWS
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"
 
 __all__ = ["Cache", "License", "init_dataset_library", "resolve_license"]
 
@@ -30,6 +30,10 @@ class _Host:
     enqueue: Callable[[str], None] | None = None
     max_rows: Callable[[], int] = lambda: 1000
     hard_max_rows: int = 5000
+    # Where the platform keeps copies of pinned datasets, and how a copy is queued for
+    # the worker. Without both, no copy is made and a pin is imported only from Hugging Face.
+    snapshot_dir: str | None = None
+    enqueue_snapshot: Callable[[str], None] | None = None
 
     def row_cap(self):
         """The cap a new dataset meets: the admin's, else the host's default."""
@@ -51,6 +55,8 @@ def init_dataset_library(
     enqueue=None,
     max_rows=None,
     hard_max_rows=None,
+    snapshot_dir=None,
+    enqueue_snapshot=None,
     url_prefix="/api/library",
 ):
     """Mount the library API on a host Flask app.
@@ -72,6 +78,13 @@ def init_dataset_library(
     queued. An admin may set a cap from 1 to ``hard_max_rows`` (default
     ``limits.HARD_MAX_ROWS``); ``limits.row_cap(session)`` returns it, so the
     host's upload check can honour it too.
+
+    ``snapshot_dir`` is a directory the host keeps on disk (shared with the worker):
+    copies of pinned datasets with an Allow license go there, so a pin still imports
+    while Hugging Face is down. ``enqueue_snapshot(snapshot_ref)`` hands a copy to the
+    worker, which calls ``dataset_library.snapshots.run_copy``. Both are needed; without
+    them a pin has no copy. The worker also calls ``snapshots.sweep`` and
+    ``snapshots.check_upstream`` from time to time.
     """
     from .routes import library_bp
 
@@ -86,5 +99,7 @@ def init_dataset_library(
         enqueue=enqueue,
         max_rows=max_rows or (lambda: 1000),
         hard_max_rows=hard_max_rows or HARD_MAX_ROWS,
+        snapshot_dir=snapshot_dir,
+        enqueue_snapshot=enqueue_snapshot,
     )
     app.register_blueprint(library_bp, url_prefix=url_prefix)

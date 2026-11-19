@@ -8,6 +8,102 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-19
+
+### Added
+
+- Snapshots of pinned datasets (BAIGLE #121, decision D10, design DR14).
+  - A pin whose license level is `allow` gets a copy: the parts of the dataset an
+    import would download, up to the same byte cap, joined into one Parquet file
+    in the host's `snapshot_dir`. A worker makes it from the `enqueue_snapshot`
+    queue, through `dataset_library.snapshots.run_copy`, off the request path. The
+    file is written beside its final name and renamed into place, so a reader never
+    sees a part-written copy; a write that fails, a full disk included, records the
+    copy as `failed`. A copy is made for no other license level, and never for a
+    gated dataset.
+  - `library_snapshots` (migration `dl_0008_snapshots`), one row per pin:
+    `revision`, `row_count`, `license`, `columns` (names and types), `file_path`
+    and `status` (`queued`, `building`, `ready`, `failed` or `removing`), with
+    `error_code` and `error_message`, `upstream_changed` and `upstream_checked_at`.
+  - While Hugging Face cannot be asked, an import of a pinned dataset with a ready
+    copy of the same config and split is queued and read from the copy. The import
+    records `source` (`huggingface` or `snapshot`, new in `library_imports`, with
+    `snapshot_id`), and provenance returns it with the copy's `revision`. A running
+    import whose Hub fetch fails falls back to the copy the same way.
+  - Search: when the Hub is unavailable (after its one retry), `status` is
+    `unavailable` and the results are the pinned datasets, filtered as the search
+    is (query, task, license, source; a hidden license is left out), each with a
+    `snapshot` of `{"status"}`: `ready`, `queued`, `building`, `failed` or `none`.
+    With no pins, the results stay empty, as before.
+  - A dataset opened while Hugging Face cannot be asked (`GET /api/library/datasets/huggingface/<id>`)
+    shows its copy instead: the card, the copy's columns and its first rows, with `offline: true`.
+    A copy whose license is now hidden is not shown. The import takes the same facts.
+  - `GET /api/library/pins` carries each pin's `snapshot` (`status`, `error`,
+    `revision`, `rows`) and `upstreamChanged`. `POST /api/library/pins/<pin_ref>/snapshot`
+    (admins) keeps a copy for a pin that has none or whose copy failed: 202, 409
+    `not_allowed` unless the license is Allow, 404 `not_offered` on a host that
+    keeps no copies.
+  - Upstream changed: the worker's `snapshots.check_upstream` asks the Hub at most
+    once an hour about each ready copy's revision (`huggingface.revision_exists`,
+    `GET /api/datasets/<id>/revision/<sha>`). A 404 flags the pin and keeps the copy;
+    any other answer leaves the flag as it was and is tried again later. The
+    settings page reads the flag, so it makes no Hub call.
+  - Removal: unpinning deletes the pin's copy and its file at once, unless a queued
+    or running import of that dataset may still read it. Then the copy is marked
+    `removing` (not served) and is deleted when those imports finish; the worker's
+    `snapshots.sweep` deletes any such copy no import reads any more. Changing a
+    license level to anything but `allow` removes the copies it no longer allows.
+  - Host seams: `init_dataset_library(snapshot_dir=, enqueue_snapshot=)`, and
+    `run_import(snapshot_dir=)`. Without both seams, a pin keeps no copy.
+- `dataset_library.providers.huggingface.revision_exists(external_id, revision)`:
+  True; False on a 404 (revision gone) or a 401 (dataset gone or no longer public);
+  `ProviderError` for any other answer.
+
+### Changed
+
+- `search()` returns the pinned datasets, not an empty list, when the Hub is
+  unavailable. The status stays `unavailable`, which the page shows as its banner.
+- Copies are kept for a viewer outage too (#121 rework). When the dataset viewer
+  (datasets-server) does not answer but the Hub does, the preview says so with
+  `viewerDown: true` and is not cached. The dataset opens from its copy of the same
+  part (`offline: true`), and `POST /imports` reads the copy, as it does when the Hub
+  is down. With no copy, the preview is unchanged and the import is refused as
+  `not_importable`. A configured part is no longer refused while the viewer is down.
+  Only a real outage counts: no connection, a server error other than 501, or an
+  unreadable answer (`viewer.ViewerDown`). A viewer that says no for good (501, it
+  cannot read the dataset; 404; 401) gives the usual unavailable preview, and a pin
+  of it records `no_rows`. A missing `/info` alone is not an outage.
+- A try at a copy has its own id (a failed copy is tried again as a new row), and its
+  files are named by that id: `<id>.parquet`, and the work directory `.incoming/<id>`.
+  A try still running after its copy was swept and tried again cannot finish the
+  newer copy or delete its files. A building copy refreshes `updated_at` every 15
+  seconds, so the sweep fails only builds that have really stopped.
+- Unpinning deletes a copy's file and work area by the copy's id, whatever path its row
+  holds, so a file left by a crashed build goes too. The sweep fails a stuck build and
+  removes its work area and file; it also removes any work area or copy file that no
+  copy still owns. Only names it made (`<uuid>.parquet`, `.incoming/<uuid>`) are
+  touched. A queued copy waits behind imports on the same worker, so the sweep fails
+  it only after 6 hours (a building copy, after 30 minutes without a heartbeat).
+- A copy is kept only while its pin exists and its license is still Allow, checked when
+  it is ready. A copy whose pin is removed, or whose license is no longer Allow, while
+  it is made is dropped with its file. An import reads a copy, or an offline dataset
+  shows one, only while the pin exists and the license is Allow; a hidden license is
+  not in the library (404, or `license_hidden` for an import).
+- A request that loses a race to another request for the same pin returns the copy
+  that other request queued.
+- `check_upstream` records each answer on its own, so a copy unpinned meanwhile is a
+  no-op. A copy whose check fails goes to the back of the order with its flag
+  unchanged, so one dataset the Hub always refuses cannot stop the others being
+  checked. The round ends after two failed checks in a row (the Hub is down), or at
+  once on a rate limit.
+- An offline dataset's columns are typed from the copy's Hugging Face features, as the
+  live preview types them (a ClassLabel is a class label), and its proposed task is the
+  one the live preview would propose from the same columns (NER and summarization keep
+  theirs). `rowCount` is the copy's rows, not the split's.
+- An offline search result's `title` is the pin's title, else the card's, else the last
+  part of the dataset id, as `pins.to_dict` names a pin.
+- A copy file that cannot be read (corrupt, or missing) opens without rows, never a 500.
+
 ## [0.11.0] - 2026-11-19
 
 ### Added

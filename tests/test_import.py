@@ -124,7 +124,7 @@ def run(app, tmp_path):
     """Queue an import directly and run it, as the host's worker would."""
 
     def go(shards, *, size=4, fail_fetch=None, refuse=None, open_parquet=None, while_fetching=None,
-           while_saving=None, heartbeat_seconds=None, **fields):
+           while_saving=None, heartbeat_seconds=None, snapshot_dir=None, **fields):
         create = FakeCreateDataset(refuse, while_saving and (lambda: while_saving(app)))
 
         def fetch_shards(external_id, config, split, max_bytes, dest_dir):
@@ -138,8 +138,9 @@ def run(app, tmp_path):
         with app.app_context():
             session = app.db.session
             record = LibraryImport(
-                owner_id="alice", provider="huggingface", external_id="coastalcph/lex_glue",
-                config="ledgar", split="train",
+                owner_id="alice", provider="huggingface",
+                external_id=fields.pop("external_id", "coastalcph/lex_glue"),
+                config=fields.pop("config", "ledgar"), split=fields.pop("split", "train"),
                 text_column=fields.pop("text_column", "text"),
                 label_column=fields.pop("label_column", "label"),
                 task_type=fields.pop("task_type", "classification"),
@@ -153,7 +154,7 @@ def run(app, tmp_path):
             imports.run_import(
                 ref, session=session, fetch_shards=fetch_shards,
                 create_dataset=create, data_dir=str(tmp_path / "data"), seed=7, open_parquet=open_parquet,
-                heartbeat_seconds=heartbeat_seconds,
+                heartbeat_seconds=heartbeat_seconds, snapshot_dir=snapshot_dir,
             )
             session.expunge_all()
             found = session.get(LibraryImport, ref)

@@ -22,6 +22,8 @@ init_dataset_library(
     is_admin=lambda: "baigle-admin" in roles(),   # who may change the settings
     audit=lambda event, **fields: log(event, fields),
     enqueue=lambda ref: redis.lpush("library_import_queue", ref),  # no import without it
+    snapshot_dir="/app/library-snapshots",  # copies of Allow-licensed pins, shared with the worker
+    enqueue_snapshot=lambda ref: redis.lpush("library_snapshot_queue", ref),  # both or neither
     max_rows=lambda: 1000,           # the row cap when an admin set none
     hard_max_rows=5000,              # the most an admin may set (default 5000)
 )
@@ -40,8 +42,19 @@ from dataset_library.imports import run_import
 from dataset_library.providers.parquet import fetch_shards
 
 run_import(ref, session=db.session, fetch_shards=fetch_shards,
-           create_dataset=create, data_dir="/app/data")
+           create_dataset=create, data_dir="/app/data",
+           snapshot_dir="/app/library-snapshots")
 ```
+
+The same worker takes copy refs off `library_snapshot_queue` and runs
+`dataset_library.snapshots.run_copy(ref, session=db.session, fetch_shards=fetch_shards,
+snapshot_dir=..., max_bytes=...)`, which makes a pinned dataset's copy: the same
+parts an import would download, up to the same byte cap, in one Parquet file.
+The worker calls `snapshots.sweep(db.session, snapshot_dir)` with the import
+sweep (failing copies a worker left queued or building for thirty minutes, and
+deleting removed copies no import reads), and `snapshots.check_upstream(db.session)`
+about once an hour: it asks the Hub whether each copy's revision still exists, and
+flags the pin "Upstream changed" when it does not. The copy is kept either way.
 
 `create(owner_id, file_path, name, description, task_type)` returns the new
 dataset's id, or raises `ValueError` with a message a student can read
@@ -63,7 +76,10 @@ label `dataset_library`).
 - `GET /api/library/search?q=&task=&license=&source=` →
   `{"status": "ok" | "stale" | "unavailable", "results": [...], "count": n}`.
   `stale`: the Hub is limiting requests and these are the last results, up to a
-  day old. `unavailable`: the Hub is down or unreadable; nothing is raised.
+  day old. `unavailable`: the Hub is down or unreadable; nothing is raised, and
+  the results are the pinned datasets (filtered the same way), each with a
+  `snapshot` of `{"status": "ready" | "queued" | "building" | "failed" | "none"}`.
+  A `ready` one can be imported from its copy while the Hub is down.
   Every card carries `pinRef`: the ref of the pin for that dataset, or null.
   Every card also carries `citation`: `title`, `authors` (a list of
   `{"family", "given"}` or `{"literal"}`), `year`, `url`, `revision`,
@@ -148,6 +164,13 @@ label `dataset_library`).
   `not_retryable`).
 - `POST /api/library/imports/<ref>/dismiss` → puts a finished import away;
   409 `running` while it runs.
+- `GET /api/library/datasets/huggingface/<org>/<name>` while Hugging Face cannot be asked: the copy the
+  platform keeps of that part stands in (`offline: true`, its columns and first rows); 503 without one.
+- Admins only: `POST /api/library/pins/<pin_ref>/snapshot` keeps a copy of a pin
+  that has none, or whose copy failed (202; the worker makes it). 409 `not_allowed`
+  unless the dataset's license is Allow; 404 `not_offered` when the host keeps no
+  copies. Each pin in `GET /api/library/pins` carries `snapshot` (as above) and
+  `upstreamChanged`, true when the Hub no longer has the copy's revision.
 - Admins only (`is_admin()`): `GET` / `PUT /api/library/admin/settings` (sources
   and license levels, saved whole; 400 with `fields` when anything is invalid).
   `limits` is `{"maxRows", "maxDownloadMb"}`, each a whole number from 1 to its
@@ -168,6 +191,12 @@ tag nobody recognises resolves to `unknown`.
 
 Only `https://huggingface.co` (the API and the converted Parquet files) and `https://datasets-server.huggingface.co` are called, with parameters built by
 the package. Descriptions are returned as plain text for the host to escape.
+
+Copies of pinned datasets are kept only while the dataset's license level is
+`allow`: a pin made under another level gets none, and a change to another level
+removes the copies it no longer allows. A copy is deleted when its pin is removed,
+unless a queued or running import still reads it; then it goes once that import
+has finished. Copies hold the dataset's rows and no personal data.
 
 ## Development
 

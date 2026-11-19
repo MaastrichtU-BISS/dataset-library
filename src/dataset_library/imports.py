@@ -34,8 +34,10 @@ from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.orm.exc import ObjectDeletedError
 
 from . import policy as policy_module
+from . import snapshots as snapshots_module
 from .errors import ProviderError
 from .licenses import LICENSES, UNKNOWN
+from .limits import download_cap_bytes
 from .models import LibraryImport
 from .ner import spans, tokens_to_text
 
@@ -47,12 +49,15 @@ TERMINAL = {COMPLETED, FAILED, CANCELLED}
 RUNNING = {QUEUED, FETCHING, SAMPLING, VALIDATING, SAVING}
 # Past these, the Dataset may already be written: too late to cancel.
 CANCELLABLE = {QUEUED, FETCHING, SAMPLING, VALIDATING}
+# Where an import's sample was read: Hugging Face, or the platform's copy (#121).
+HUGGING_FACE, SNAPSHOT = "huggingface", "snapshot"
 
 UNEXPECTED = "The import stopped on our side. Try again, and tell your course staff if it keeps happening."
 BUSY = "Hugging Face is busy. Try again in a few minutes."
 NOT_STARTED = "Import could not start. Try again."
 STOPPED = "Import stopped. Try again."
 CHANGED = "This dataset changed on Hugging Face after you opened it. Open it again to import the new version."
+COPY_GONE = "This dataset's copy is no longer kept here, so it cannot be imported. Try again in a few minutes."
 # Shown when a balanced import falls back to a random one (#115).
 LABEL_MISSING = "The label column was missing, so this is a random sample instead of a balanced one."
 LABEL_EMPTY = "The label column was empty, so this is a random sample instead of a balanced one."
@@ -115,6 +120,27 @@ class Refused(Exception):
         self.status, self.code, self.message = status, code, message
 
 
+def _facts(host, external_id, config, split):
+    """The dataset as an import checks it, and the copy it reads (or None). When Hugging
+    Face cannot be asked, or the viewer did not answer, the platform's copy of this part
+    stands in, if it has one (#121); otherwise the preview is used as it is, and a
+    ProviderError is raised only when there is no copy to fall back on."""
+    from . import preview as preview_module  # lazy, as start() imports it
+
+    try:
+        dataset = preview_module.preview(host, external_id, config, split)
+    except ProviderError:
+        copy = snapshots_module.copy_for_offline(host, external_id, config, split)
+        if copy is None:
+            raise
+        return snapshots_module.offline_detail(host, copy, rows=False), copy
+    if dataset.get(preview_module.VIEWER_DOWN):
+        copy = snapshots_module.copy_for_offline(host, external_id, config, split)
+        if copy is not None:
+            return snapshots_module.offline_detail(host, copy, rows=False), copy
+    return dataset, None
+
+
 def start(host, owner_id, body, *, ack_at=None):
     """Check the request against the dataset as previewed, store the import as
     queued, then hand it to the host's queue. Returns the import as JSON, and
@@ -142,7 +168,7 @@ def start(host, owner_id, body, *, ack_at=None):
     if isinstance(size, bool) or not isinstance(size, int) or size < 1:
         raise Refused(400, "bad_size", "Say how many rows to import, as a whole number above 0.")
     try:
-        dataset = preview_module.preview(host, external_id, body.get("config") or None, body.get("split") or None)
+        dataset, copy = _facts(host, external_id, body.get("config") or None, body.get("split") or None)
     except preview_module.LicenseHidden:
         raise Refused(403, "license_hidden", "This dataset's license is not allowed on this platform, so it cannot be imported.")
     except preview_module.NotInLibrary:
@@ -214,6 +240,8 @@ def start(host, owner_id, body, *, ack_at=None):
         sample_size=min(size, cap), max_rows=cap, balance=balance,
         name=name or (dataset["title"] if not earlier else f"{dataset['title']} ({earlier + 1})"),
         citation=_pinned(dataset.get("citation"), dataset.get("revision"), _now()),
+        source=HUGGING_FACE if copy is None else SNAPSHOT,
+        snapshot_id=None if copy is None else copy.id,
         status=QUEUED,
     )
     session.add(record)
@@ -267,6 +295,8 @@ def provenance(host, owner_id, dataset_ref):
         "config": record.config,
         "split": record.split,
         "revision": record.revision,
+        # "snapshot" when the platform's copy was read, at the copy's revision (#121).
+        "source": record.source,
         "url": record.url,
         "importedAt": _iso(record.imported_at),
         "licenseAckAt": _iso(record.license_ack_at),
@@ -471,16 +501,17 @@ def run_import(
     seed=None,
     open_parquet=None,
     heartbeat_seconds=HEARTBEAT_SECONDS,
+    snapshot_dir=None,
 ):
     """Drive one queued import to completed or failed. Safe to call twice.
     ``max_bytes`` is the worker's download cap; an admin's cap replaces it.
-    ``heartbeat_seconds`` is how often the import says it is alive (None: never)."""
-    from .limits import download_cap_bytes
-
+    ``heartbeat_seconds`` is how often the import says it is alive (None: never).
+    ``snapshot_dir`` is where the platform's copies live; without it, no copy is read."""
     record = session.get(LibraryImport, import_ref)
     if record is None or record.status != QUEUED:
         return
     max_bytes = download_cap_bytes(session) or max_bytes
+    provider, external_id = record.provider, record.external_id
     work = os.path.join(data_dir, "library-imports", record.id)
     path = os.path.join(data_dir, f"library-{record.id}.csv")
     heartbeat = _Heartbeat(session.get_bind(), record.id, heartbeat_seconds) if heartbeat_seconds else None
@@ -488,11 +519,9 @@ def run_import(
         if heartbeat:
             heartbeat.__enter__()
         _advance(session, record, FETCHING)
-        fetched = fetch_shards(record.external_id, record.config, record.split, max_bytes, work)
-        if record.revision and fetched.revision and fetched.revision != record.revision:
-            raise ImportFailed("changed", CHANGED)
+        fetched, copy_updates = _fetch(session, record, fetch_shards, max_bytes, work, snapshot_dir)
         # A fetch that reports no revision keeps the one the import was queued at (#120).
-        _advance(session, record, SAMPLING, {"revision": fetched.revision or record.revision})
+        _advance(session, record, SAMPLING, {"revision": fetched.revision or record.revision, **copy_updates})
         rows, method, note = _sample(record, fetched.paths, random.Random(seed), open_parquet)
         _advance(session, record, VALIDATING, {"sample_method": method, "sample_note": note})
         _write_csv(path, record, rows)
@@ -523,6 +552,45 @@ def run_import(
         if heartbeat:
             heartbeat.__exit__(None, None, None)
         shutil.rmtree(work, ignore_errors=True)
+        if snapshot_dir is not None:
+            _release_copies(session, snapshot_dir, provider, external_id)
+
+
+def _fetch(session, record, fetch_shards, max_bytes, work, snapshot_dir):
+    """The sample's Parquet files, and what to record about where they came from.
+
+    An import queued from a copy reads that copy. Otherwise Hugging Face is asked,
+    and when it cannot be, a copy of the same part of the dataset stands in, at the
+    copy's revision; the import then says it came from the copy (#121)."""
+    if record.source == SNAPSHOT:
+        copy = snapshots_module.reading(session, record.snapshot_id)
+        if copy is None or snapshot_dir is None:
+            raise ImportFailed("copy_gone", COPY_GONE)
+        return _from_copy(snapshot_dir, copy), {}
+    try:
+        fetched = fetch_shards(record.external_id, record.config, record.split, max_bytes, work)
+    except ProviderError:
+        copy = snapshots_module.fallback_for(session, record, snapshot_dir)
+        if copy is None:
+            raise
+        return _from_copy(snapshot_dir, copy), {"source": SNAPSHOT, "snapshot_id": copy.id, "revision": copy.revision}
+    if record.revision and fetched.revision and fetched.revision != record.revision:
+        raise ImportFailed("changed", CHANGED)
+    return fetched, {}
+
+
+def _from_copy(snapshot_dir, copy):
+    return Fetched(paths=[snapshots_module.file_of(snapshot_dir, copy)], revision=copy.revision)
+
+
+def _release_copies(session, snapshot_dir, provider, external_id):
+    """Once an import ends, delete its dataset's removed copy if no other import still
+    reads it. Never raises: the import has already ended, and a sweep retries."""
+    try:
+        session.rollback()
+        snapshots_module.release(session, snapshot_dir, provider, external_id)
+    except Exception:  # noqa: BLE001 - a copy left behind is removed by the sweep
+        logger.exception(f"library.snapshot.release_failed dataset={external_id}")
 
 
 def _remove(path):

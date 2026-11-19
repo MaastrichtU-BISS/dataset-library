@@ -49,15 +49,20 @@ def search(host, *, query, task, license_id, source):
         except ProviderRateLimited:
             cards, status = host.cache.get(f"library:last:{key}"), "stale"
             if cards is None:
-                cards, status = [], "unavailable"
+                status = "unavailable"
         except ProviderUnavailable as exc:
             log.warning("library.search.provider_error provider=huggingface error=%s", exc)
-            cards, status = [], "unavailable"
+            status = "unavailable"
         else:
             host.cache.set(f"library:search:{key}", cards, FRESH_SECONDS)
             host.cache.set(f"library:last:{key}", cards, LAST_GOOD_SECONDS)
-    results = _apply_policy(cards, policy, license_id)
-    results = _with_pin_refs(host.db, results)
+    if status == "unavailable":
+        # Hugging Face cannot be asked: the pinned datasets stand in, each with its copy (#121).
+        from . import pins as pins_module  # lazy: pins imports this module
+
+        results = pins_module.offline(host, query=query, task=task, license_id=license_id, source=source)
+    else:
+        results = _with_pin_refs(host.db, _apply_policy(cards, policy, license_id))
     log.info(
         "library.search provider=huggingface query=%r task=%s license=%s status=%s results=%d cache_hit=%s ms=%d",
         query, task, license_id, status, len(results), cache_hit, (time.monotonic() - started) * 1000,
