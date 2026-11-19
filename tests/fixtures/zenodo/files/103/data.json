@@ -1,0 +1,18 @@
+[
+  {
+    "text": "The tenant shall pay rent on the first day of each month.",
+    "label": 1
+  },
+  {
+    "text": "The landlord may enter the premises with reasonable notice.",
+    "label": 0
+  },
+  {
+    "text": "Deposits are returned within thirty days of the tenancy ending.",
+    "label": 1
+  },
+  {
+    "text": "The lease may be renewed by written agreement of both parties.",
+    "label": 0
+  }
+]

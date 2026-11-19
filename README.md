@@ -26,6 +26,9 @@ init_dataset_library(
     enqueue_snapshot=lambda ref: redis.lpush("library_snapshot_queue", ref),  # both or neither
     max_rows=lambda: 1000,           # the row cap when an admin set none
     hard_max_rows=5000,              # the most an admin may set (default 5000)
+    community_datasets=lambda: open_datasets(db.session),        # Community source (#122):
+    community_record=lambda rid: Zenodo(zenodo_url()).record_files(rid),  # all three, or none
+    community_download=lambda rid, key, max_bytes: Zenodo(zenodo_url()).download(rid, key, max_bytes),
 )
 ```
 
@@ -43,7 +46,8 @@ from dataset_library.providers.parquet import fetch_shards
 
 run_import(ref, session=db.session, fetch_shards=fetch_shards,
            create_dataset=create, data_dir="/app/data",
-           snapshot_dir="/app/library-snapshots")
+           snapshot_dir="/app/library-snapshots",
+           community_record=..., community_download=...)  # the worker's Community seams, as above
 ```
 
 The same worker takes copy refs off `library_snapshot_queue` and runs
@@ -71,6 +75,24 @@ Create the tables from `dataset_library.models.LibraryBase.metadata`, or add
 `dataset_library/migrations/versions` to Alembic's `version_locations` (branch
 label `dataset_library`).
 
+## Community datasets
+
+The Community source lists open dataset Publications (datasets published to Zenodo
+through BAIGLE, #122) with the license each one states. It is offered only when the
+host gives all three seams above and an admin switches it on in the settings
+(`PUT /api/library/admin/settings` with `"community": {"enabled": true}`). The library
+imports none of the repository's client: the host's seams do the Zenodo calls, and
+the host's Zenodo base URL is the only host a Community file is fetched from.
+
+A record is importable only while Zenodo says it is open now: public records with
+public files. A restricted or metadata-only record, a record Zenodo no longer
+serves, and a record with no table file (CSV, TSV, JSON, JSONL, Parquet or XLSX) are
+shown with their reason. A file is read by its bytes, not its name, so a labelled
+file BAIGLE publishes as CSV under an `.xlsx` name still reads. An import reads the
+record's own file, never a local Dataset, and fails with "This record is no longer
+downloadable" when Zenodo has closed the record or removed the file. A Community
+dataset carries no task in its publication, so a task filter does not find it.
+
 ## API
 
 - `GET /api/library/search?q=&task=&license=&source=` →
@@ -87,6 +109,10 @@ label `dataset_library`).
   BibTeX entry exactly as written, or null when it has none. A search result
   does not read the dataset's README, so its `bibtex` can be null where the
   single-dataset card's is not.
+- `GET /api/library/datasets/community/<record_id>` (#122) → a Community dataset's card, `importable`
+  and `reasonCode`/`reason` when it is not, `columns`, `rows` and `rowCount` read from its table file,
+  `proposed` columns, `citation`, and `revision` (the file's checksum). 404 when it is not listed;
+  503 while Zenodo cannot be asked.
 - `GET /api/library/labels?ids=huggingface:org/name,...` → `{"labels": {id: "yes" | "no" | "unclear"}}`,
   from the dataset viewer's column types; up to 30 ids, cached an hour each.
 - `GET /api/library/datasets/huggingface/<org>/<name>?config=&split=` → the

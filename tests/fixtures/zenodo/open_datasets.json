@@ -1,0 +1,49 @@
+[
+  {
+    "id": "5b1e8a6c-3f0d-4a7e-9c11-000000000102",
+    "title": "Court decisions: granted or dismissed",
+    "description": "Short outcome sentences from first-instance decisions. For non-commercial study only.",
+    "license": "cc-by-nc-4.0",
+    "doi": "10.5281/zenodo.102",
+    "record_id": "102",
+    "creators": [
+      {
+        "name": "de la Cruz, Ana",
+        "affiliation": null,
+        "orcid": null
+      }
+    ],
+    "published_at": "2026-11-12T16:05:00+00:00"
+  },
+  {
+    "id": "5b1e8a6c-3f0d-4a7e-9c11-000000000101",
+    "title": "Termination and governing-law clauses",
+    "description": "Labelled sentences from English and German commercial contracts, prepared for a course on contract law.",
+    "license": "cc-by-4.0",
+    "doi": "10.5281/zenodo.101",
+    "record_id": "101",
+    "creators": [
+      {
+        "name": "Chakravarthy, Shashank",
+        "affiliation": "Maastricht University",
+        "orcid": null
+      },
+      {
+        "name": "Legal Blocks Lab",
+        "affiliation": null,
+        "orcid": null
+      }
+    ],
+    "published_at": "2026-11-10T09:30:00+00:00"
+  },
+  {
+    "id": "5b1e8a6c-3f0d-4a7e-9c11-000000000103",
+    "title": "Tenancy sentences (JSON)",
+    "description": "",
+    "license": "cc0-1.0",
+    "doi": "10.5281/zenodo.103",
+    "record_id": "103",
+    "creators": [],
+    "published_at": "2026-09-01T08:00:00+00:00"
+  }
+]

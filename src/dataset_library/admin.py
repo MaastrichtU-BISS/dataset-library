@@ -1,10 +1,12 @@
 """What a course admin controls: the sources search looks in, and each
 license's level (design review DR14). Saved whole, validated whole: one bad
 field and nothing changes."""
+from . import community as community_module
 from . import limits as limits_module
 from .licenses import LEVELS, LICENSES
 from .models import LibrarySettings, LibrarySource
 from .policy import level, overrides
+from .providers import community as community_provider
 from .providers import huggingface
 
 
@@ -20,6 +22,8 @@ def current(db, host):
     sources = db.session.query(LibrarySource).filter_by(provider="huggingface").order_by(LibrarySource.ref).all()
     return {
         "sources": [s.to_dict() for s in sources],
+        # Offered only where the host gave the Community seams (#122); the admin switches it on or off.
+        "community": {"available": host.community is not None, "enabled": community_module.switched_on(db)},
         "licenses": [
             {**lic.at_level(level(lic, policy)), "default": lic.level} for lic in LICENSES.values()
         ],
@@ -44,9 +48,9 @@ def check_source(ref):
     return None
 
 
-def save(db, body, hard_max_rows=limits_module.HARD_MAX_ROWS):
-    """Replace the sources, the license policy and (when given) the limits.
-    Returns what changed, for the audit."""
+def save(db, body, hard_max_rows=limits_module.HARD_MAX_ROWS, community_available=False):
+    """Replace the sources, the license policy and (when given) the limits, and switch the Community
+    source on or off when the body says so. Returns what changed, for the audit."""
     sources = body.get("sources")
     policy = body.get("license_policy")
     fields = {}
@@ -66,11 +70,25 @@ def save(db, body, hard_max_rows=limits_module.HARD_MAX_ROWS):
     if limits is not None:
         fields.update(limits_module.check(limits, hard_max_rows))
 
+    community_body = body.get("community")
+    community_on = None
+    if community_body is not None:
+        if not isinstance(community_body, dict) or not isinstance(community_body.get("enabled"), bool):
+            fields["community"] = "Say whether the Community source is on or off."
+        elif community_body["enabled"] and not community_available:
+            fields["community"] = "The Community source is not set up on this platform."
+        else:
+            community_on = community_body["enabled"]
+
     existing = {s.ref: s for s in db.session.query(LibrarySource).filter_by(provider="huggingface")}
     seen = set()
     wanted = []
     for index, source in enumerate(sources):
         ref = (source or {}).get("ref", "").strip() if isinstance(source, dict) else ""
+        # The search filter names the Community source as "community", so no organisation may take that name.
+        if ref == community_provider.SOURCE:
+            fields[f"sources.{index}"] = "That name belongs to the Community source, so it cannot be an organisation."
+            continue
         if ref in seen:
             fields[f"sources.{index}"] = "This source is already listed."
             continue
@@ -105,11 +123,19 @@ def save(db, body, hard_max_rows=limits_module.HARD_MAX_ROWS):
             if getattr(settings, column) != limits.get(key):
                 setattr(settings, column, limits.get(key))
                 limits_changed.append(column)
+    community_changed = False
+    if community_on is not None:
+        community_changed = community_module.switched_on(db) != community_on
+        community_module.set_enabled(db, community_on)
     db.session.commit()
     after = {lic.id: level(lic, settings.license_policy) for lic in LICENSES.values()}
-    return {
+    changes = {
         "sources_added": len([ref for ref, _ in wanted if ref not in existing]),
         "sources_removed": len([ref for ref in existing if ref not in seen]),
         "licenses_changed": sorted(lid for lid in LICENSES if before[lid] != after[lid]),
         "limits_changed": sorted(limits_changed),
     }
+    # Only a save that sets the Community switch says so, so other saves audit as they always have.
+    if community_on is not None:
+        changes["community_changed"] = community_changed
+    return changes

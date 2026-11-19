@@ -2,6 +2,7 @@
 from flask import Blueprint, current_app, jsonify, request
 
 from . import admin as admin_module
+from . import community as community_module
 from . import imports as imports_module
 from . import labels as labels_module
 from . import pins as pins_module
@@ -11,6 +12,7 @@ from .errors import ProviderError, ProviderRateLimited, ProviderUnavailable
 from . import search as search_module
 from . import snapshots as snapshots_module
 from .licenses import GROUPS, LICENSES
+from .providers import community as community_provider
 from .providers.huggingface import DATASET_ID_PATTERN, PrivateDataset
 from .tasks import hugging_face_filter
 
@@ -49,7 +51,10 @@ def search():
     if license_id and license_id not in LICENSES:
         raise ApiError(400, f"Unknown license: {license_id}", "bad_filter")
     source = args.get("source", "").strip()
-    if source and source not in {s.ref for s in search_module.enabled_sources(_host().db)}:
+    sources = {s.ref for s in search_module.enabled_sources(_host().db)}
+    if community_module.enabled(_host()):
+        sources.add(community_provider.SOURCE)
+    if source and source not in sources:
         raise ApiError(400, f"Not a library source: {source}", "bad_filter")
     return jsonify(
         search_module.search(
@@ -88,12 +93,17 @@ def options():
             "admin": bool(host.is_admin()),
             "importable": host.enqueue is not None,
             "maxRows": host.row_cap(),
-            "sources": [
-                {"value": s.ref, "label": s.ref, "provider": s.provider}
-                for s in search_module.enabled_sources(host.db)
-            ],
+            "sources": _source_choices(host),
         }
     )
+
+
+def _source_choices(host):
+    """The sources a search can be limited to: the enabled Hugging Face organisations, then Community when on."""
+    choices = [{"value": s.ref, "label": s.ref, "provider": s.provider} for s in search_module.enabled_sources(host.db)]
+    if community_module.enabled(host):
+        choices.append({"value": community_provider.SOURCE, "label": "Community", "provider": community_provider.PROVIDER})
+    return choices
 
 
 MAX_LABEL_IDS = 30
@@ -148,6 +158,21 @@ def dataset(dataset_ref):
         view = _copy_view(dataset_ref, config, split)
         if view is not None:
             return view
+    return jsonify(body)
+
+
+@library_bp.route("/datasets/community/<record_id>", methods=["GET"])
+def community_dataset(record_id):
+    """One Community dataset (#122): its card, whether it can be imported and, if not, why, and the first
+    rows of its table file. Zenodo is asked now, so a record closed since it was listed shows as closed."""
+    if not community_provider.RECORD_ID.match(record_id):
+        raise ApiError(400, f"Not a Zenodo record id: {record_id}", "bad_id")
+    try:
+        body = community_module.view(_host(), record_id)
+    except preview_module.NotInLibrary:
+        raise ApiError(404, "That dataset is not in the library.", "not_found")
+    except ProviderError:
+        raise ApiError(503, "Zenodo is unavailable right now. Try again in a few minutes.", "provider_unavailable")
     return jsonify(body)
 
 
@@ -280,7 +305,12 @@ def put_settings():
     _require_admin()
     host = _host()
     try:
-        changes = admin_module.save(host.db, request.get_json(silent=True) or {}, host.hard_max_rows)
+        changes = admin_module.save(
+            host.db,
+            request.get_json(silent=True) or {},
+            host.hard_max_rows,
+            community_available=host.community is not None,
+        )
     except admin_module.Invalid as invalid:
         host.db.session.rollback()
         raise ApiError(400, "Some settings need fixing.", "invalid", fields=invalid.fields)

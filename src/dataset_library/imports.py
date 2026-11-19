@@ -33,13 +33,16 @@ import sqlalchemy as sa
 from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.orm.exc import ObjectDeletedError
 
+from . import community
 from . import policy as policy_module
 from . import snapshots as snapshots_module
+from . import tables
 from .errors import ProviderError
 from .licenses import LICENSES, UNKNOWN
 from .limits import download_cap_bytes
 from .models import LibraryImport
 from .ner import spans, tokens_to_text
+from .providers import community as community_provider
 
 logger = logging.getLogger("dataset_library")
 
@@ -49,11 +52,14 @@ TERMINAL = {COMPLETED, FAILED, CANCELLED}
 RUNNING = {QUEUED, FETCHING, SAMPLING, VALIDATING, SAVING}
 # Past these, the Dataset may already be written: too late to cancel.
 CANCELLABLE = {QUEUED, FETCHING, SAMPLING, VALIDATING}
-# Where an import's sample was read: Hugging Face, or the platform's copy (#121).
-HUGGING_FACE, SNAPSHOT = "huggingface", "snapshot"
+# Where an import's sample was read: Hugging Face, the platform's copy (#121), or a Zenodo record's file (#122).
+HUGGING_FACE, SNAPSHOT, ZENODO = "huggingface", "snapshot", "zenodo"
+COMMUNITY = community_provider.PROVIDER
 
 UNEXPECTED = "The import stopped on our side. Try again, and tell your course staff if it keeps happening."
 BUSY = "Hugging Face is busy. Try again in a few minutes."
+COMMUNITY_BUSY = "Zenodo is busy. Try again in a few minutes."
+COMMUNITY_NOT_OFFERED = "Importing from Zenodo is not set up on this platform."
 NOT_STARTED = "Import could not start. Try again."
 STOPPED = "Import stopped. Try again."
 CHANGED = "This dataset changed on Hugging Face after you opened it. Open it again to import the new version."
@@ -120,11 +126,19 @@ class Refused(Exception):
         self.status, self.code, self.message = status, code, message
 
 
-def _facts(host, external_id, config, split):
+def _facts(host, provider, external_id, config, split):
     """The dataset as an import checks it, and the copy it reads (or None). When Hugging
     Face cannot be asked, or the viewer did not answer, the platform's copy of this part
     stands in, if it has one (#121); otherwise the preview is used as it is, and a
-    ProviderError is raised only when there is no copy to fall back on."""
+    ProviderError is raised only when there is no copy to fall back on.
+
+    A Community record has no copy: it is read from its own file on Zenodo, and one that
+    is not importable is refused with its reason (#122)."""
+    if provider == COMMUNITY:
+        body = community.view(host, external_id)
+        if not body["importable"]:
+            raise Refused(409, body["reasonCode"], body["reason"])
+        return body, None
     from . import preview as preview_module  # lazy, as start() imports it
 
     try:
@@ -154,8 +168,14 @@ def start(host, owner_id, body, *, ack_at=None):
     from . import preview as preview_module
     from .providers.huggingface import DATASET_ID_PATTERN, PrivateDataset
 
+    provider = body.get("provider") or HUGGING_FACE
     external_id = body.get("dataset")
-    if not isinstance(external_id, str) or not DATASET_ID_PATTERN.match(external_id):
+    if provider == COMMUNITY:
+        if not isinstance(external_id, str) or not community_provider.RECORD_ID.match(external_id):
+            raise Refused(400, "bad_id", "Pick a Zenodo record to import.")
+    elif provider != HUGGING_FACE:
+        raise Refused(400, "bad_provider", f"Unknown library source: {provider}")
+    elif not isinstance(external_id, str) or not DATASET_ID_PATTERN.match(external_id):
         raise Refused(400, "bad_id", "Pick a Hugging Face dataset to import.")
     task_type = body.get("taskType") or "classification"
     if task_type not in host.task_types:
@@ -168,7 +188,7 @@ def start(host, owner_id, body, *, ack_at=None):
     if isinstance(size, bool) or not isinstance(size, int) or size < 1:
         raise Refused(400, "bad_size", "Say how many rows to import, as a whole number above 0.")
     try:
-        dataset, copy = _facts(host, external_id, body.get("config") or None, body.get("split") or None)
+        dataset, copy = _facts(host, provider, external_id, body.get("config") or None, body.get("split") or None)
     except preview_module.LicenseHidden:
         raise Refused(403, "license_hidden", "This dataset's license is not allowed on this platform, so it cannot be imported.")
     except preview_module.NotInLibrary:
@@ -213,7 +233,7 @@ def start(host, owner_id, body, *, ack_at=None):
         session.query(LibraryImport)
         .filter(
             LibraryImport.owner_id == owner_id,
-            LibraryImport.provider == "huggingface",
+            LibraryImport.provider == provider,
             LibraryImport.external_id == external_id,
             LibraryImport.config.is_(None) if dataset["config"] is None else LibraryImport.config == dataset["config"],
             LibraryImport.split.is_(None) if dataset["split"] is None else LibraryImport.split == dataset["split"],
@@ -231,16 +251,16 @@ def start(host, owner_id, body, *, ack_at=None):
     if running is not None:
         _log(running, "repeated")
         return running.to_dict(), False
-    earlier = session.query(LibraryImport).filter_by(owner_id=owner_id, provider="huggingface", external_id=external_id).count()
+    earlier = session.query(LibraryImport).filter_by(owner_id=owner_id, provider=provider, external_id=external_id).count()
     record = LibraryImport(
-        owner_id=owner_id, provider="huggingface", external_id=external_id,
+        owner_id=owner_id, provider=provider, external_id=external_id,
         config=dataset["config"], split=dataset["split"], revision=dataset.get("revision"), url=dataset["url"],
         license=dataset["license"]["id"], license_ack_at=license_ack_at,
         text_column=text_column, label_column=label_column, task_type=task_type,
         sample_size=min(size, cap), max_rows=cap, balance=balance,
         name=name or (dataset["title"] if not earlier else f"{dataset['title']} ({earlier + 1})"),
         citation=_pinned(dataset.get("citation"), dataset.get("revision"), _now()),
-        source=HUGGING_FACE if copy is None else SNAPSHOT,
+        source=_source(provider, copy),
         snapshot_id=None if copy is None else copy.id,
         status=QUEUED,
     )
@@ -255,6 +275,12 @@ def start(host, owner_id, body, *, ack_at=None):
         session.commit()
         raise Refused(503, "not_started", NOT_STARTED)
     return record.to_dict(), True
+
+
+def _source(provider, copy):
+    if provider == COMMUNITY:
+        return ZENODO
+    return HUGGING_FACE if copy is None else SNAPSHOT
 
 
 def _owned(host, owner_id, import_ref):
@@ -289,13 +315,13 @@ def provenance(host, owner_id, dataset_ref):
         return None
     license = LICENSES.get(record.license, UNKNOWN)
     level = policy_module.level(license, policy_module.overrides(host.db))
-    return {
+    found = {
         "provider": record.provider,
         "externalId": record.external_id,
         "config": record.config,
         "split": record.split,
         "revision": record.revision,
-        # "snapshot" when the platform's copy was read, at the copy's revision (#121).
+        # "snapshot" when the platform's copy was read, at the copy's revision (#121); "zenodo" for a Community record.
         "source": record.source,
         "url": record.url,
         "importedAt": _iso(record.imported_at),
@@ -306,6 +332,10 @@ def provenance(host, owner_id, dataset_ref):
         "sampleNote": record.sample_note,
         "citation": record.citation,
     }
+    if record.provider == COMMUNITY:
+        # The DOI is the record's URL, so it is not stored twice.
+        found["doi"] = (record.url or "").removeprefix(community_provider.DOI_PREFIX) or None
+    return found
 
 
 def _iso(value):
@@ -387,6 +417,7 @@ def retry(host, owner_id, import_ref):
     if record.status not in (FAILED, CANCELLED):
         raise Refused(409, "not_retryable", "Only a failed or cancelled import can be tried again.")
     body = {
+        "provider": record.provider,
         "dataset": record.external_id,
         "config": record.config,
         "split": record.split,
@@ -502,11 +533,15 @@ def run_import(
     open_parquet=None,
     heartbeat_seconds=HEARTBEAT_SECONDS,
     snapshot_dir=None,
+    community_record=None,
+    community_download=None,
 ):
     """Drive one queued import to completed or failed. Safe to call twice.
     ``max_bytes`` is the worker's download cap; an admin's cap replaces it.
     ``heartbeat_seconds`` is how often the import says it is alive (None: never).
-    ``snapshot_dir`` is where the platform's copies live; without it, no copy is read."""
+    ``snapshot_dir`` is where the platform's copies live; without it, no copy is read.
+    ``community_record`` and ``community_download`` are the Community seams (see
+    ``init_dataset_library``); a Community import needs both."""
     record = session.get(LibraryImport, import_ref)
     if record is None or record.status != QUEUED:
         return
@@ -519,7 +554,10 @@ def run_import(
         if heartbeat:
             heartbeat.__enter__()
         _advance(session, record, FETCHING)
-        fetched, copy_updates = _fetch(session, record, fetch_shards, max_bytes, work, snapshot_dir)
+        if provider == COMMUNITY:
+            fetched, copy_updates = _fetch_community(record, community_record, community_download, max_bytes, work), {}
+        else:
+            fetched, copy_updates = _fetch(session, record, fetch_shards, max_bytes, work, snapshot_dir)
         # A fetch that reports no revision keeps the one the import was queued at (#120).
         _advance(session, record, SAMPLING, {"revision": fetched.revision or record.revision, **copy_updates})
         rows, method, note = _sample(record, fetched.paths, random.Random(seed), open_parquet)
@@ -543,7 +581,7 @@ def run_import(
         _remove(path)
         _fail(session, record, exc.code, exc.message)
     except ProviderError:
-        _fail(session, record, "provider_busy", BUSY)
+        _fail(session, record, "provider_busy", BUSY if provider == HUGGING_FACE else COMMUNITY_BUSY)
     except Exception:  # noqa: BLE001 - an import must end, whatever broke
         logger.exception(f"library.import.error import={record.id}")
         _remove(path)
@@ -552,7 +590,7 @@ def run_import(
         if heartbeat:
             heartbeat.__exit__(None, None, None)
         shutil.rmtree(work, ignore_errors=True)
-        if snapshot_dir is not None:
+        if snapshot_dir is not None and provider == HUGGING_FACE:
             _release_copies(session, snapshot_dir, provider, external_id)
 
 
@@ -577,6 +615,44 @@ def _fetch(session, record, fetch_shards, max_bytes, work, snapshot_dir):
     if record.revision and fetched.revision and fetched.revision != record.revision:
         raise ImportFailed("changed", CHANGED)
     return fetched, {}
+
+
+def _fetch_community(record, community_record, community_download, max_bytes, work):
+    """The sample's table as one Parquet file, read from the record's own file on Zenodo (#122).
+
+    Never read from the local Dataset. The record is asked again first, so a record closed
+    since the student opened it fails with the same words as a file that is gone, and a file
+    that changed since then is not read."""
+    if community_record is None or community_download is None:
+        raise ImportFailed("not_offered", COMMUNITY_NOT_OFFERED)
+    try:
+        listing = community_record(record.external_id)
+    except community_provider.NotDownloadable as gone:
+        raise ImportFailed("not_downloadable", community_provider.NOT_DOWNLOADABLE) from gone
+    problem = community_provider.refusal(listing)
+    if problem is not None:
+        code, message = problem
+        if code == "no_table":
+            raise ImportFailed(code, message)
+        raise ImportFailed("not_downloadable", community_provider.NOT_DOWNLOADABLE)
+    entry = community_provider.table_file(listing["files"])
+    if record.revision and entry.get("checksum") and entry["checksum"] != record.revision:
+        raise ImportFailed("changed", community_provider.CHANGED)
+    if entry.get("size") is not None and entry["size"] > max_bytes:
+        raise ImportFailed("too_large", community_provider.too_large(max_bytes))
+    try:
+        data = community_download(record.external_id, entry["key"], max_bytes)
+    except community_provider.NotDownloadable as gone:
+        raise ImportFailed("not_downloadable", community_provider.NOT_DOWNLOADABLE) from gone
+    except community_provider.TooLarge as big:
+        raise ImportFailed("too_large", community_provider.too_large(max_bytes)) from big
+    os.makedirs(work, exist_ok=True)
+    path = os.path.join(work, "sample.parquet")
+    try:
+        tables.write_parquet(data, entry["key"], path)
+    except tables.Unreadable as unreadable:
+        raise ImportFailed("unreadable", unreadable.message) from unreadable
+    return Fetched(paths=[path], revision=entry.get("checksum") or record.revision)
 
 
 def _from_copy(snapshot_dir, copy):
@@ -1017,6 +1093,9 @@ def _write_csv(path, record, rows):
 
 
 def _description(record):
+    if record.provider == COMMUNITY:
+        method = "A sample that keeps the label balance" if record.sample_method == "stratified" else "A random sample"
+        return f"{method}, from Zenodo: {record.url or record.external_id}"
     where = f"{record.config}/{record.split}" if record.config else record.split or ""
     if record.sample_method == "stratified":
         return f"A sample that keeps the label balance, from Hugging Face: {record.external_id} {where}".strip()

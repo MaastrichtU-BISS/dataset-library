@@ -1,11 +1,12 @@
 """Search public legal datasets by license and task, and import a sample."""
+import logging
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
 from .licenses import License, resolve_license
 from .limits import HARD_MAX_ROWS
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"
 
 __all__ = ["Cache", "License", "init_dataset_library", "resolve_license"]
 
@@ -34,6 +35,8 @@ class _Host:
     # the worker. Without both, no copy is made and a pin is imported only from Hugging Face.
     snapshot_dir: str | None = None
     enqueue_snapshot: Callable[[str], None] | None = None
+    # The Community source's seams (community.Seams), or None: then it is not offered (#122).
+    community: object | None = None
 
     def row_cap(self):
         """The cap a new dataset meets: the admin's, else the host's default."""
@@ -57,6 +60,9 @@ def init_dataset_library(
     hard_max_rows=None,
     snapshot_dir=None,
     enqueue_snapshot=None,
+    community_datasets=None,
+    community_record=None,
+    community_download=None,
     url_prefix="/api/library",
 ):
     """Mount the library API on a host Flask app.
@@ -85,8 +91,27 @@ def init_dataset_library(
     worker, which calls ``dataset_library.snapshots.run_copy``. Both are needed; without
     them a pin has no copy. The worker also calls ``snapshots.sweep`` and
     ``snapshots.check_upstream`` from time to time.
+
+    The Community source (datasets published openly to Zenodo) needs three seams, all or
+    nothing, and the library imports none of the repository's client (ADR 0005):
+    ``community_datasets()`` returns the open dataset Publications, as fair-publishing's
+    ``open_datasets`` does; ``community_record(record_id)`` returns the record's files, as
+    ``Zenodo.record_files`` does; ``community_download(record_id, key, max_bytes)`` returns
+    one file's bytes, as ``Zenodo.download`` does. A host maps the repository's
+    ``RecordNotDownloadable`` to ``providers.community.NotDownloadable`` and its
+    ``FileTooLarge`` to ``TooLarge``, and any other failure to ``ProviderError``. An admin
+    still switches the source on. ``run_import`` takes the same two record and download seams.
     """
     from .routes import library_bp
+
+    community_seams = None
+    given = (community_datasets, community_record, community_download)
+    if all(given):
+        from .community import Seams
+
+        community_seams = Seams(datasets=community_datasets, record=community_record, download=community_download)
+    elif any(given):
+        logging.getLogger("dataset_library").warning("library.community not offered: it needs all three seams")
 
     app.extensions["dataset_library"] = _Host(
         db=db,
@@ -101,5 +126,6 @@ def init_dataset_library(
         hard_max_rows=hard_max_rows or HARD_MAX_ROWS,
         snapshot_dir=snapshot_dir,
         enqueue_snapshot=enqueue_snapshot,
+        community=community_seams,
     )
     app.register_blueprint(library_bp, url_prefix=url_prefix)
