@@ -416,6 +416,8 @@ def test_the_hub_is_asked_about_each_copy_once_an_hour_and_a_check_it_cannot_mak
 def test_the_hub_says_whether_a_revision_exists(hub):
     assert huggingface.revision_exists(GREEK, SHA) is True
     assert huggingface.revision_exists(GREEK, "0" * 40) is False
+    # A dataset that is gone or no longer public: the Hub answers 401, not 404.
+    assert huggingface.revision_exists("someone/deleted-dataset", SHA) is False
     hub.fail = 503
     with pytest.raises(ProviderUnavailable):
         huggingface.revision_exists(GREEK, SHA)

@@ -104,6 +104,9 @@ class FakeHub:
         if url.startswith(DATASET_URL) and "/revision/" in url:
             # GET /api/datasets/{id}/revision/{sha}: a revision exists while the Hub keeps it.
             dataset_id, _, revision = url.removeprefix(DATASET_URL).partition("/revision/")
+            if dataset_id not in HUB_DATASETS:
+                # As the live Hub does for a dataset that is gone or not public (checked 2026-11-19).
+                return FakeResponse(401, {"error": "Invalid credentials in Authorization header"})
             record = HUB_DATASETS.get(dataset_id, {}).get("body") or {}
             if (dataset_id, revision) not in self.gone_revisions and record.get("sha") == revision:
                 return FakeResponse(200, record)
