@@ -8,6 +8,65 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-19
+
+### Added
+
+- The Community source: datasets BAIGLE users published openly to Zenodo (#122, decision D8).
+  - Host seams, all three or none: `init_dataset_library(community_datasets=, community_record=,
+    community_download=)`. `community_datasets()` returns the open dataset Publications as
+    fair-publishing 0.2.0's `open_datasets` does; `community_record(record_id)` returns
+    `Zenodo.record_files`; `community_download(record_id, key, max_bytes)` returns one file's bytes.
+    A host maps the repository's `RecordNotDownloadable` to `providers.community.NotDownloadable`,
+    its `FileTooLarge` to `TooLarge`, and any other failure to `ProviderError`. The package imports
+    no repository client (ADR 0005). Without all three seams the source is not offered, and a partial
+    set is logged as a warning.
+  - Off until an admin switches it on: `GET` / `PUT /api/library/admin/settings` carries
+    `community: {available, enabled}`, and a save with `"community": {"enabled": bool}` sets it. A
+    save that does not name it audits as before; one that does adds `community_changed`. The source is
+    the `library_sources` row `provider="community"`, `kind="community"`, `ref="zenodo"`; no migration.
+  - Search: the Community cards that match the query, license filter and license policy are listed
+    with the Hugging Face results, and `source=community` lists only them. A Hub outage keeps them. A
+    Publication has no task, so a task filter finds none. `GET /api/library/options` offers
+    `{"value": "community", "label": "Community"}` when the source is on.
+  - Cards: `id` `community:<record id>`, `provider: "community"`, `externalId` the record id, `url` and
+    `doi` the DOI URL, the license resolved through the license table, and a citation in #120's shape:
+    creators as `{family, given}` (Zenodo's "Family, Given") or `{literal}`, the year from the
+    publication date, the DOI URL, and `bibtex: null`.
+  - Preview: `GET /api/library/datasets/community/<record_id>` asks Zenodo now. It returns `importable`,
+    and `reasonCode`/`reason` when not: `restricted`, `metadata_only`, `not_downloadable` ("This record
+    is no longer downloadable"), `no_table`, `too_large`, `unreadable`, `no_rows`. When importable it
+    returns the table's `columns`, first `rows`, `rowCount`, `proposed` columns and the file's
+    `revision`. The first rows are cached for ten minutes by file checksum and download cap. A hidden
+    license is refused before anything is downloaded.
+  - Import: `POST /api/library/imports` with `provider: "community"` and the record id as `dataset`.
+    The same license confirmation as Hugging Face applies: a warn license needs `licenseAck`, a hide
+    license is refused with 403. A record that is not importable is refused with 409 and its reason.
+    Retries keep the provider.
+  - The worker: `run_import(community_record=, community_download=)` asks the record again, picks its
+    table file (`data<ext>` when there is one, else the first table), refuses a file whose checksum
+    changed since the preview, downloads it under the cap, and converts it to a Parquet file that the
+    existing sampler reads. A record that is closed or whose file is gone fails with "This record is no
+    longer downloadable"; a file over the cap fails with "Too large to sample here (limit N MB)"; Zenodo
+    busy fails with "Zenodo is busy. Try again in a few minutes.". The local Dataset is never read.
+  - Formats: CSV, TSV, JSON (array or lines), XLSX and Parquet, read by their bytes rather than their
+    names, so a labelled file BAIGLE publishes as CSV under an `.xlsx` name reads as CSV. Every cell is
+    read as text, so a label `01` stays `01`. Columns named "text" and "label" are proposed.
+  - Provenance: `provider: "community"`, `externalId` the record id, `doi`, `url` the DOI URL,
+    `revision` the file's checksum, `source: "zenodo"`, and the citation pinned at that revision and the
+    import's day. A Community dataset's description says "from Zenodo".
+  - `dataset_library.tables` (the table reader) and `dataset_library.community` (the host-aware source).
+    `dataset_library.providers.community` holds the card, citation, table choice and refusal rules.
+- `openpyxl>=3.1,<4` in the `[import]` extra, for reading XLSX.
+
+### Changed
+
+- `search()` finds the Hugging Face results and the Community cards separately. A Hub outage with no
+  pins still lists the Community cards, and the Hub's status is unchanged.
+- An organisation named `community` is refused as a library source, since the search filter names the
+  Community source that way.
+- `run_import` skips the copy release for Community imports, as they have no copy.
+
 ## [0.12.0] - 2026-11-19
 
 ### Added
