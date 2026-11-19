@@ -305,6 +305,29 @@ def test_a_file_between_the_host_limit_and_the_admin_cap_is_refused_by_the_api_a
     assert sink.calls == []
 
 
+def test_a_file_too_large_to_preview_is_checked_for_its_columns_by_the_worker(make_app, zenodo, queue, tmp_path):
+    # Too large to preview, so no columns were seen at start: the names the student typed are checked when the file is read.
+    app = make_app(
+        community_datasets=zenodo.datasets,
+        community_record=zenodo.record,
+        community_download=zenodo.download,
+        community_base_url=zenodo.base_url,
+        community_preview_max_bytes=500,
+        enqueue=queue,
+        max_rows=lambda: 300,
+    )
+    client = app.test_client()
+    switch(client)
+    ref = start(client, textColumn="nope")["id"]
+
+    finished, sink = work(app, tmp_path, zenodo, ref)
+
+    assert finished["status"] == "failed"
+    assert finished["code"] == "bad_mapping"
+    assert finished["error"] == "This file has no column named nope, so it cannot be imported."
+    assert sink.calls == []
+
+
 def test_the_admin_cap_lowers_the_limit_and_never_raises_it(capped, zenodo, tmp_path):
     client = capped.test_client()
     switch(client, limits={"maxDownloadMb": 1})
