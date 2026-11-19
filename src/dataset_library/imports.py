@@ -37,7 +37,7 @@ from . import community
 from . import policy as policy_module
 from . import snapshots as snapshots_module
 from .errors import ProviderError
-from .licenses import LICENSES, UNKNOWN
+from .licenses import LICENSES, UNKNOWN, resolve_license
 from .limits import import_cap_bytes
 from .models import LibraryImport
 from .ner import spans, tokens_to_text
@@ -125,17 +125,18 @@ class Refused(Exception):
         self.status, self.code, self.message = status, code, message
 
 
-def _facts(host, provider, external_id, config, split):
+def _facts(host, provider, external_id, config, split, binding=None):
     """The dataset as an import checks it, and the copy it reads (or None). When Hugging
     Face cannot be asked, or the viewer did not answer, the platform's copy of this part
     stands in, if it has one (#121); otherwise the preview is used as it is, and a
     ProviderError is raised only when there is no copy to fall back on.
 
     A Community record has no copy: it is read from its own file on Zenodo, and one that
-    is not importable is refused with its reason (#122)."""
+    is not importable is refused with its reason (#122). Its eligibility is decided on a live
+    record, and its Publication and file are the ``binding`` the import is bound to (#122, fix 3)."""
     if provider == COMMUNITY:
         try:
-            body = community.view(host, external_id)
+            body = community.view(host, external_id, pin=binding, fresh=True)
         except ProviderError as down:
             raise Refused(503, "provider_busy", COMMUNITY_BUSY) from down
         if body["preparing"]:
@@ -163,7 +164,7 @@ def _facts(host, provider, external_id, config, split):
     return dataset, None
 
 
-def start(host, owner_id, body, *, ack_at=None):
+def start(host, owner_id, body, *, ack_at=None, pin=None):
     """Check the request against the dataset as previewed, store the import as
     queued, then hand it to the host's queue. Returns the import as JSON, and
     whether it is new: the same import (dataset, revision, mapping and size),
@@ -172,7 +173,9 @@ def start(host, owner_id, body, *, ack_at=None):
     ``body.revision``, when given, is the revision the student saw; an import
     of anything newer is refused. ``ack_at`` is the confirmation time a retry
     carries from the import it repeats, so a retry keeps when the student
-    actually agreed rather than claiming they agreed again now."""
+    actually agreed rather than claiming they agreed again now. ``pin`` is the
+    Publication, origin and file a retry keeps from its import (#122, fix 3); a
+    new Community import takes them as the library lists them now."""
     from . import preview as preview_module
     from .providers.huggingface import DATASET_ID_PATTERN, PrivateDataset
 
@@ -195,8 +198,11 @@ def start(host, owner_id, body, *, ack_at=None):
     size = body.get("size")
     if isinstance(size, bool) or not isinstance(size, int) or size < 1:
         raise Refused(400, "bad_size", "Say how many rows to import, as a whole number above 0.")
+    binding = None
     try:
-        dataset, copy = _facts(host, provider, external_id, body.get("config") or None, body.get("split") or None)
+        if provider == COMMUNITY:
+            binding = community.bind(host, external_id, pin)
+        dataset, copy = _facts(host, provider, external_id, body.get("config") or None, body.get("split") or None, binding)
     except preview_module.LicenseHidden:
         raise Refused(403, "license_hidden", "This dataset's license is not allowed on this platform, so it cannot be imported.")
     except preview_module.NotInLibrary:
@@ -244,8 +250,6 @@ def start(host, owner_id, body, *, ack_at=None):
         raise Refused(409, "changed", community_provider.CHANGED if provider == COMMUNITY else CHANGED)
 
     session = host.db.session
-    # The Publication and the Zenodo origin this import is bound to, so a queued import checks them again (#122).
-    binding = community.bound(host, external_id) if provider == COMMUNITY else (None, None)
     cap = host.row_cap()
     running = (
         session.query(LibraryImport)
@@ -281,8 +285,9 @@ def start(host, owner_id, body, *, ack_at=None):
         citation=_pinned(dataset.get("citation"), None if provider == COMMUNITY else dataset.get("revision"), _now()),
         source=_source(provider, copy),
         snapshot_id=None if copy is None else copy.id,
-        publication_id=binding[0],
-        origin=binding[1],
+        # The Publication, origin and file this import is bound to, so a queued import checks them again (#122).
+        publication_id=binding.publication_id if binding else None,
+        origin=binding.origin if binding else None,
         file_key=dataset["file"]["key"] if provider == COMMUNITY else None,
         status=QUEUED,
     )
@@ -452,7 +457,9 @@ def retry(host, owner_id, import_ref):
         "name": record.name,
         "licenseAck": record.license_ack_at is not None,
     }
-    started, _ = start(host, owner_id, body, ack_at=record.license_ack_at)
+    # A Community retry keeps the Publication, origin and file its import was started on, never a record id's other Publication (#122, fix 3).
+    pin = community.Pin(record.publication_id, record.origin, record.file_key) if record.provider == COMMUNITY else None
+    started, _ = start(host, owner_id, body, ack_at=record.license_ack_at, pin=pin)
     if record.dismissed_at is None:
         record.dismissed_at = _now()
         host.db.session.commit()
@@ -650,11 +657,11 @@ def _fetch(session, record, fetch_shards, max_bytes, work, snapshot_dir):
 def _fetch_community(session, record, seams, max_bytes, work):
     """The sample's table as one Parquet file, read from the record's own file on Zenodo (#122).
 
-    Never read from the local Dataset. The queued import is checked first, against what the student
-    agreed to: its Publication is still listed on this Zenodo host, the source is still on, its license is
-    not now hidden, and a license that warns was confirmed. Then the record is asked again, and exactly the
-    file the import was started on is read, at its checksum. A record closed or gone, or a file missing from
-    it, fails with the same words as a file that is gone; the worker never picks another table."""
+    Never read from the local Dataset. The queued import is checked first, against what the student agreed to: its
+    Publication is still listed on this Zenodo host, the source is still on, its license is the one it started on, is
+    not now hidden, and a license that warns was confirmed. Then the record is asked again, and exactly the file the
+    import was started on is read. A record closed or gone, or one left without that file, fails with the same words as a
+    file that is gone; the worker never picks another table. The bytes must match the checksum the import was started on."""
     if seams is None:
         raise ImportFailed("not_offered", COMMUNITY_NOT_OFFERED)
     _still_offered(session, record, seams)
@@ -662,12 +669,8 @@ def _fetch_community(session, record, seams, max_bytes, work):
         listing = seams.record(record.external_id)
     except community_provider.NotDownloadable as gone:
         raise ImportFailed("not_downloadable", community_provider.NOT_DOWNLOADABLE) from gone
-    problem = community_provider.refusal(listing)
-    if problem is not None:
-        if problem[0] == "no_table":
-            raise ImportFailed(*problem)
-        raise ImportFailed("not_downloadable", community_provider.NOT_DOWNLOADABLE)
-    entry = next((f for f in listing["files"] if record.file_key and f.get("key") == record.file_key), None)
+    # The pinned file is looked for first: a record with only a README left has no file to read (#122, fix 3).
+    entry = community_provider.pinned_file(listing, record.file_key)
     if entry is None:
         raise ImportFailed("not_downloadable", community_provider.NOT_DOWNLOADABLE)
     if record.revision and entry.get("checksum") != record.revision:
@@ -685,6 +688,8 @@ def _fetch_community(session, record, seams, max_bytes, work):
         raise ImportFailed("not_downloadable", community_provider.NOT_DOWNLOADABLE) from gone
     except community_provider.TooLarge as big:
         raise ImportFailed("too_large", community_provider.too_large(max_bytes)) from big
+    if record.revision and not community_provider.checksum_matches(data, record.revision):
+        raise ImportFailed("changed", community_provider.CHANGED)
     os.makedirs(work, exist_ok=True)
     path = os.path.join(work, "sample.parquet")
     try:
@@ -699,22 +704,26 @@ def _fetch_community(session, record, seams, max_bytes, work):
 
 
 def _still_offered(session, record, seams):
-    """Refuse a queued Community import whose dataset has left the library since it was queued (#122): the
-    source is switched off, its Publication is no longer listed on the configured Zenodo host, its license is
-    now hidden, or its license warns and no confirmation is on record. Reads the database and the listing, never
-    the local Dataset."""
+    """Refuse a queued Community import whose dataset has changed, or left the library, since it was started (#122, fix 3):
+    the source is switched off; its Publication is no longer listed on the configured Zenodo host, or not on the origin it
+    was started on; its license is now hidden, is not the license it was started on (the student must start it again), or
+    warns with no confirmation on record. The license is the Publication's current one, as the library resolves it. Reads the
+    database and the listing, never the local Dataset."""
     if not community.switched_on(session):
         raise ImportFailed("source_off", community_provider.SOURCE_OFF)
     configured = community_provider.origin_of(seams.base_url())
-    listed = configured is not None and any(
-        publication.get("id") == record.publication_id
-        and publication.get("record_id") == record.external_id
-        and community_provider.origin_of(publication.get("origin")) == configured
-        for publication in seams.datasets()
-    )
-    if not listed:
+    publication = next((listed for listed in seams.datasets() if listed.get("id") == record.publication_id), None)
+    if (
+        publication is None
+        or publication.get("record_id") != record.external_id
+        or configured is None
+        or community_provider.origin_of(publication.get("origin")) != configured
+        or community_provider.origin_of(record.origin) != configured
+    ):
         raise ImportFailed("not_in_library", community_provider.NOT_LISTED)
-    license = LICENSES.get(record.license, UNKNOWN)
+    license = resolve_license(publication.get("license"))
+    if license.id != record.license:
+        raise ImportFailed("license_changed", community_provider.LICENSE_CHANGED)
     level = policy_module.level(license, policy_module.for_session(session))
     if level == "hide":
         raise ImportFailed("license_hidden", community_provider.LICENSE_HIDDEN)

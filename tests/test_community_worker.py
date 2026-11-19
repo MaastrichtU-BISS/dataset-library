@@ -3,7 +3,6 @@ again before it reads, reads exactly the file it was started on, keeps to the ho
 says Zenodo's words when Zenodo is the trouble."""
 import copy
 import csv
-import threading
 
 import pytest
 
@@ -11,7 +10,7 @@ from conftest import ADMIN, ALICE
 from dataset_library import imports
 from dataset_library.models import LibraryImport
 from dataset_library.providers import community as provider
-from fake_zenodo import FakeZenodo, ORIGIN
+from fake_zenodo import FakeZenodo, PreviewQueue, ORIGIN
 
 SANDBOX = "https://sandbox.zenodo.org"
 PUBLICATION_101 = "5b1e8a6c-3f0d-4a7e-9c11-000000000101"
@@ -53,15 +52,29 @@ def queue():
 
 
 @pytest.fixture
-def app(make_app, zenodo, queue):
-    return make_app(
+def previews():
+    return PreviewQueue()
+
+
+@pytest.fixture
+def app(make_app, zenodo, queue, previews, cache):
+    app = make_app(
         community_datasets=zenodo.datasets,
         community_record=zenodo.record,
         community_download=zenodo.download,
         community_base_url=zenodo.base_url,
+        community_enqueue_preview=previews,
         enqueue=queue,
         max_rows=lambda: 300,
     )
+    app.previews, app.zenodo, app.cache = previews, zenodo, cache
+    return app
+
+
+def settle(client):
+    """Run the preview jobs the page has queued, as the worker does, so the next request finds the previews cached."""
+    app = client.application
+    app.previews.run(app.cache, app.zenodo)
 
 
 def switch(client, enabled=True, policy=None, limits=None):
@@ -73,6 +86,7 @@ def switch(client, enabled=True, policy=None, limits=None):
 
 
 def start(client, record="101", status=202, **body):
+    open_preview(client, record)  # the page opens the preview before it starts, so its head is cached
     payload = {"provider": "community", "dataset": record, "taskType": "classification",
                "textColumn": "text", "labelColumn": "label", "size": 5, **body}
     response = client.post("/api/library/imports", json=payload, headers=ALICE)
@@ -80,9 +94,21 @@ def start(client, record="101", status=202, **body):
     return response.get_json()
 
 
+def open_preview(client, record="101"):
+    """What the page does before it imports: it opens the dataset, and the worker reads the preview meanwhile."""
+    response = client.get(f"/api/library/datasets/community/{record}", headers=ALICE)
+    if response.status_code == 200 and response.get_json()["preparing"]:
+        settle(client)
+
+
 def preview(client, record="101", status=200):
+    """The dataset as the page shows it: asked again once the worker has read its preview, as the page's polling does."""
     response = client.get(f"/api/library/datasets/community/{record}", headers=ALICE)
     assert response.status_code == status, response.get_json()
+    if status == 200 and response.get_json()["preparing"]:
+        settle(client)
+        response = client.get(f"/api/library/datasets/community/{record}", headers=ALICE)
+        assert response.status_code == status, response.get_json()
     return response.get_json()
 
 
@@ -276,17 +302,20 @@ def test_a_changed_file_at_start_says_the_community_words(client):
 # --- The caps are the same in the API and the worker (fix 6) -------------------------------------
 
 @pytest.fixture
-def capped(make_app, zenodo, queue):
+def capped(make_app, zenodo, queue, previews, cache):
     """A host whose download limit is 4 MB, with the admin's cap at 8 MB: the lower one holds."""
-    return make_app(
+    app = make_app(
         community_datasets=zenodo.datasets,
         community_record=zenodo.record,
         community_download=zenodo.download,
         community_base_url=zenodo.base_url,
+        community_enqueue_preview=previews,
         enqueue=queue,
         max_rows=lambda: 300,
         max_fetch_bytes=4_000_000,
     )
+    app.previews, app.zenodo, app.cache = previews, zenodo, cache
+    return app
 
 
 def test_a_file_between_the_host_limit_and_the_admin_cap_is_refused_by_the_api_and_the_worker_alike(capped, zenodo, tmp_path, cache):
@@ -305,17 +334,19 @@ def test_a_file_between_the_host_limit_and_the_admin_cap_is_refused_by_the_api_a
     assert sink.calls == []
 
 
-def test_a_file_too_large_to_preview_is_checked_for_its_columns_by_the_worker(make_app, zenodo, queue, tmp_path):
+def test_a_file_too_large_to_preview_is_checked_for_its_columns_by_the_worker(make_app, zenodo, queue, previews, cache, tmp_path):
     # Too large to preview, so no columns were seen at start: the names the student typed are checked when the file is read.
     app = make_app(
         community_datasets=zenodo.datasets,
         community_record=zenodo.record,
         community_download=zenodo.download,
         community_base_url=zenodo.base_url,
+        community_enqueue_preview=previews,
         community_preview_max_bytes=500,
         enqueue=queue,
         max_rows=lambda: 300,
     )
+    app.previews, app.zenodo, app.cache = previews, zenodo, cache
     client = app.test_client()
     switch(client)
     ref = start(client, textColumn="nope")["id"]
@@ -376,23 +407,136 @@ def test_a_community_citation_has_no_revision_when_it_is_started(client, app):
     assert row_of(app, ref)["revision"] is not None  # the checksum stays on the import, for the change check
 
 
-def test_a_start_while_the_preview_is_still_being_prepared_asks_for_a_retry(make_app, zenodo, queue):
-    zenodo.hold = threading.Event()  # Zenodo is slow: the preview has not answered when the student starts
-    client = make_app(
+def test_a_start_while_the_preview_is_still_being_prepared_asks_for_a_retry(make_app, zenodo, queue, previews, cache):
+    app = make_app(
         community_datasets=zenodo.datasets,
         community_record=zenodo.record,
         community_download=zenodo.download,
         community_base_url=zenodo.base_url,
-        community_preview_seconds=0.05,
+        community_enqueue_preview=previews,
         enqueue=queue,
         max_rows=lambda: 300,
-    ).test_client()
+    )
+    app.previews, app.zenodo, app.cache = previews, zenodo, cache
+    client = app.test_client()
     switch(client)
-    try:
-        refused = start(client, status=503)
-    finally:
-        zenodo.hold.set()
+    # The student starts without the worker having read the preview: nothing is cached, so the start asks for a retry
+    # and queues the preview, once (#122, fix 1).
+    response = client.post("/api/library/imports", json={
+        "provider": "community", "dataset": "101", "taskType": "classification",
+        "textColumn": "text", "labelColumn": "label", "size": 5,
+    }, headers=ALICE)
+    refused = response.get_json()
+    assert response.status_code == 503
+    assert len(previews.jobs) == 1
 
     assert refused["code"] == "preparing"
     assert refused["error"] == provider.PREPARING
     assert queue.refs == []
+
+
+# --- What the worker checks, and what a retry keeps (#122, fix 3 of the second rework) --------------
+
+def test_a_stored_origin_that_is_no_longer_the_configured_origin_fails_the_import(client, app, zenodo, tmp_path):
+    switch(client)
+    ref = start(client)["id"]
+    with app.app_context():
+        session = app.db.session
+        session.get(LibraryImport, ref).origin = SANDBOX  # the import was started on the sandbox; the platform reads production now
+        session.commit()
+    clear_reads(zenodo)
+
+    finished, sink = work(app, tmp_path, zenodo, ref)
+
+    assert finished["code"] == "not_in_library"
+    assert reads(zenodo) == [] and sink.calls == []
+
+
+def test_a_license_that_now_differs_from_the_one_started_on_fails_and_asks_for_a_fresh_import(client, app, zenodo, tmp_path):
+    switch(client)
+    ref = start(client)["id"]
+    zenodo.listed[1]["license"] = "cc-by-nc-4.0"  # record 101 was cc-by-4.0 when the student started
+    clear_reads(zenodo)
+
+    finished, sink = work(app, tmp_path, zenodo, ref)
+
+    assert finished["status"] == "failed"
+    assert finished["code"] == "license_changed"
+    assert finished["error"] == provider.LICENSE_CHANGED
+    assert reads(zenodo) == [] and sink.calls == []
+
+
+def test_the_license_checked_is_the_publications_current_one_not_the_one_stored(client, app, zenodo, tmp_path):
+    # A Publication whose license Zenodo's listing now resolves to Hide: the stored license is Allow, and the import fails.
+    switch(client)
+    ref = start(client)["id"]
+    zenodo.listed[1]["license"] = "cc-by-nc-4.0"
+    switch(client, policy={"cc-by-nc-4.0": "hide"})
+    clear_reads(zenodo)
+
+    finished, _ = work(app, tmp_path, zenodo, ref)
+
+    assert finished["code"] == "license_changed"  # the license changed first: it is named as changed, never reused
+
+
+def test_a_file_whose_bytes_do_not_match_the_checksum_it_was_started_on_fails_as_changed(client, app, zenodo, tmp_path):
+    switch(client)
+    ref = start(client)["id"]
+    # Zenodo still lists the checksum the import started on, but serves other bytes: the bytes are checked, not trusted.
+    zenodo.contents[("101", "data.csv")] = b"text,label\nA,x\n"
+    clear_reads(zenodo)
+
+    finished, sink = work(app, tmp_path, zenodo, ref)
+
+    assert finished["status"] == "failed"
+    assert finished["code"] == "changed"
+    assert finished["error"] == provider.CHANGED
+    assert sink.calls == []
+
+
+def test_a_retry_keeps_its_publication_origin_and_file_and_never_takes_another_publication_for_the_record(client, app, zenodo, tmp_path):
+    switch(client)
+    first = start(client)["id"]
+    with app.app_context():
+        session = app.db.session
+        session.get(LibraryImport, first).status = imports.FAILED
+        session.commit()
+    # Another Publication now lists the same record id, first in the listing: a retry must not reselect it by record id.
+    zenodo.listed.insert(0, {**zenodo.listed[1], "id": "5b1e8a6c-3f0d-4a7e-9c11-00000000dead", "title": "Another deposit"})
+
+    response = client.post(f"/api/library/imports/{first}/retry", headers=ALICE)
+
+    assert response.status_code == 202, response.get_json()
+    retried = response.get_json()["id"]
+    assert row_of(app, retried)["publication_id"] == PUBLICATION_101
+    assert row_of(app, retried)["origin"] == ORIGIN
+    assert row_of(app, retried)["file_key"] == "data.csv"
+    finished, sink = work(app, tmp_path, zenodo, retried)
+    assert finished["status"] == "completed", finished
+    assert {call[2] for call in zenodo.downloads()} == {"data.csv"}  # the retry reads the file it started on, and no other
+
+
+def test_a_record_left_with_only_its_readme_is_no_longer_downloadable_before_any_table_is_read(client, app, zenodo, tmp_path):
+    switch(client)
+    ref = start(client)["id"]
+    zenodo.records["101"]["files"] = [zenodo.records["101"]["files"][1]]  # README.txt is all that is left
+    clear_reads(zenodo)
+
+    finished, sink = work(app, tmp_path, zenodo, ref)
+
+    assert finished["status"] == "failed"
+    assert finished["code"] == "not_downloadable"
+    assert finished["error"] == "This record is no longer downloadable"
+    assert zenodo.downloads() == [] and sink.calls == []
+
+
+def test_a_start_asks_zenodo_for_the_record_now_not_from_the_cached_open_record(client, app, zenodo):
+    switch(client)
+    preview(client)  # the record is cached as open for a minute
+    zenodo.records["101"]["access"] = {"record": "restricted", "files": "restricted"}
+    zenodo.records["101"]["downloadable"] = False
+
+    refused = start(client, status=409)
+
+    assert refused["code"] == "not_downloadable"
+    assert refused["error"] == "This record is no longer downloadable"

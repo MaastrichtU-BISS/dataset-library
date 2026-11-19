@@ -3,9 +3,10 @@
 This package does not import fair-publishing (ADR 0005). The host passes its seams: the open
 dataset Publications, one record's files, and one file's bytes. This module turns what they
 return into library cards and citations, says which file of a record is the table and why a
-record cannot be imported, and decides which Zenodo host a Publication's record is on. It
-fetches nothing itself.
+record cannot be imported, checks a file's bytes against the checksum Zenodo gives them, and
+decides which Zenodo host a Publication's record is on. It fetches nothing itself.
 """
+import hashlib
 import os
 import re
 from urllib.parse import urlsplit
@@ -45,6 +46,10 @@ TOO_LARGE_PREVIEW = "Too large to preview here; it can still be imported"
 SOURCE_OFF = "The Community source is switched off, so this dataset can no longer be imported."
 NOT_LISTED = "This dataset is no longer in the library, so it cannot be imported."
 LICENSE_HIDDEN = "This dataset's license is not allowed on this platform, so it cannot be imported."
+LICENSE_CHANGED = (
+    "This dataset's license changed on Zenodo after you started the import, so it cannot be imported as started. "
+    "Start the import again to confirm its current terms."
+)
 NEEDS_ACK = "Confirm the license terms to import this dataset."
 
 
@@ -197,9 +202,9 @@ def table_file(files):
     return tables[0] if tables else None
 
 
-def refusal(record):
-    """Why a record cannot be imported, as (code, message), or None when it can. `record`
-    is what the repository says now: its access levels, whether it is downloadable, and its files."""
+def access_refusal(record):
+    """Why a record is not open to everyone to read, as (code, message), or None when it is. `record` is what the
+    repository says now: its access levels and whether it is downloadable."""
     access = record.get("access") if isinstance(record.get("access"), dict) else {}
     if access.get("record") != "public":
         return "restricted", RESTRICTED
@@ -207,6 +212,35 @@ def refusal(record):
         return "metadata_only", METADATA_ONLY
     if not record.get("downloadable"):
         return "not_downloadable", NOT_DOWNLOADABLE
+    return None
+
+
+def refusal(record):
+    """Why a record cannot be imported, as (code, message), or None when it can: it is open, and it has a table file."""
+    problem = access_refusal(record)
+    if problem is not None:
+        return problem
     if table_file(record.get("files")) is None:
         return "no_table", NO_TABLE
     return None
+
+
+def pinned_file(record, key):
+    """The file an import was started on, as the record lists it now, or None when the record is no longer open to
+    everyone or is no longer downloadable, or it no longer has that file. This is checked before any table is
+    classified, so a record left with only a README is not read as its table (#122, fix 3)."""
+    if access_refusal(record) is not None or not key:
+        return None
+    return next((entry for entry in record.get("files") or [] if entry.get("key") == key), None)
+
+
+def checksum_matches(data, checksum):
+    """Whether `data` is the file `checksum` names: Zenodo's `md5:<hex>`, or the bare md5 hex of its legacy records.
+    Another algorithm is named the same way (`sha256:<hex>`). One the platform does not know matches nothing (#122, fix 3)."""
+    algorithm, colon, digest = str(checksum or "").partition(":")
+    if not colon:
+        algorithm, digest = "md5", algorithm
+    try:
+        return hashlib.new(algorithm.lower(), data).hexdigest() == digest.lower()
+    except ValueError:
+        return False

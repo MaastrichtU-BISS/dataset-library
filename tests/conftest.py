@@ -41,7 +41,7 @@ class MemoryCache:
     def __init__(self):
         self.values = {}
         self.ttls = {}
-        self.guard = threading.Lock()  # a Community preview fetch runs on a helper thread
+        self.guard = threading.Lock()
 
     def get(self, key):
         with self.guard:
@@ -65,6 +65,13 @@ class MemoryCache:
         with self.guard:
             self.values.pop(key, None)
             self.ttls.pop(key, None)
+
+    def delete_if(self, key, value):
+        """Remove the key only while it holds `value`: a lock is released only by the job that took it (dataset_library.Cache)."""
+        with self.guard:
+            if self.values.get(key) == value:
+                del self.values[key]
+                self.ttls.pop(key, None)
 
     def expire(self, prefix):
         """Forget fresh entries, as Redis would once their TTL ran out."""

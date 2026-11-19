@@ -1,15 +1,17 @@
 """Read a Community dataset's data file as a table (#122).
 
-BAIGLE publishes an uploaded dataset as `data<ext>`: CSV, XLSX or JSON. A labelled one is
-published as CSV whatever its name says, so a file is read by what its bytes are. A name
-says only what the bytes cannot: `.tsv` asks for tabs, `.csv` and `.tsv` are never read as
-JSON, and a JSON name is read as JSON. Every column is read as text, so a label such as "01"
-stays "01" as it was written.
+BAIGLE publishes an uploaded dataset as `data<ext>`: CSV, XLSX or JSON. A labelled one is published as CSV
+whatever its name says, so a file is read by what its bytes are. A name says only what the bytes cannot:
+`.tsv` asks for tabs, and `.csv` and `.tsv` are never read as JSON. A JSON name is read as JSON when the bytes
+open like JSON. Bytes that do not, such as the labelled CSV BAIGLE published under `data.json` before #171, are
+read as CSV when they parse as CSV with the same header rules. Every column is read as text, so a label such as
+"01" stays "01" as it was written.
 
-Each reader checks the file's size, rows, columns, cells, JSON nesting and XLSX zip ratio
-before it allocates them, and raises `Unreadable` with the limit it hit. pyarrow and openpyxl
-are imported only when this module loads, which the Community paths do lazily, so a host without
-the `[import]` extra can still serve its routes.
+Each reader checks the file's size, rows, columns, cells, JSON nesting, JSON size and XLSX zip ratio before it
+allocates them, and raises `Unreadable` with the limit it hit. A sheet's rows are counted as they are scanned,
+blank ones included, so a row far down a sheet is refused rather than walked. pyarrow and openpyxl are imported
+only when this module loads, which the Community paths do lazily, so a host without the `[import]` extra can
+still serve its routes.
 """
 import csv
 import datetime
@@ -36,16 +38,21 @@ UTF8_BOM = b"\xef\xbb\xbf"
 MAX_ROWS = 200_000
 MAX_COLUMNS = 1_000
 MAX_CELLS = 2_000_000
-# The most text a file may expand to once read: a CSV's or JSON's bytes, an XLSX's or Parquet's declared size.
+# The most text a file may expand to once read: a CSV's bytes, an XLSX's or Parquet's declared size.
 MAX_EXPANDED_BYTES = 500_000_000
+# JSON expands roughly five to ten times once parsed, so a JSON file is refused at a far lower size (#122, fix 3).
+MAX_JSON_BYTES = 64_000_000
 MAX_JSON_DEPTH = 8
 MAX_ZIP_ENTRIES = 5_000
 # An XLSX that expands more than this many times over its compressed size is refused as a zip bomb.
 XLSX_MAX_RATIO = 100
+# Every row a sheet yields, blank ones included, as far as Excel's own sheet goes (#122, fix 2).
+MAX_SHEET_ROWS = 1_048_576
 # How much of a CSV's text the header is read from; a header longer than this is refused.
 HEADER_CHARACTERS = 1_000_000
-# Strings of JSON, one token at a time: a quoted string, or a bracket that opens or closes a level.
-_JSON_TOKEN = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"|[\[\]{}]')
+# One token of JSON: a quoted string, or a bracket that opens or closes a level. A string that is never closed
+# runs to the end of the text in one token, so the scan takes time linear in the text (#122, fix 1).
+_JSON_TOKEN = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"?|[\[\]{}]', re.DOTALL)
 
 
 class Unreadable(Exception):
@@ -57,7 +64,11 @@ class Unreadable(Exception):
 
 
 class _NotJson(Exception):
-    """The text does not parse as JSON. A name-less file that opens like JSON is then read as CSV."""
+    """The text does not parse as JSON (a document, or one JSON object per line)."""
+
+
+class _JsonTooLarge(Unreadable):
+    """A JSON file over MAX_JSON_BYTES. It is refused before it is parsed, and is never read as CSV."""
 
 
 def read(data, name=""):
@@ -70,15 +81,12 @@ def read(data, name=""):
     if lowered.endswith((".csv", ".tsv")):
         return _delimited(data, "\t" if lowered.endswith(".tsv") else ",")
     if lowered.endswith((".json", ".jsonl")):
-        try:
-            return _json(data, lines=lowered.endswith(".jsonl"))
-        except _NotJson as exc:
-            raise Unreadable() from exc
-    if data.removeprefix(UTF8_BOM).lstrip()[:1] in (b"[", b"{"):
+        return _named_json(data, lines=lowered.endswith(".jsonl"))
+    if _opens_like_json(data):
         try:
             return _json(data, lines=False)
-        except (_NotJson, Unreadable):
-            pass  # A CSV whose first header starts with a bracket is CSV, not JSON.
+        except _NotJson:
+            pass  # A CSV whose first header starts with a bracket is CSV, not JSON. JSON that parses but is refused stays refused.
     return _delimited(data, ",")
 
 
@@ -101,6 +109,12 @@ def _refuse(what, limit):
 def _expanded():
     return Unreadable(
         f"This file is more than {MAX_EXPANDED_BYTES // 1_000_000} MB once it is read, which is more than this platform reads."
+    )
+
+
+def _json_too_large():
+    return _JsonTooLarge(
+        f"This JSON file is more than {MAX_JSON_BYTES // 1_000_000} MB, which is more than this platform reads."
     )
 
 
@@ -133,9 +147,10 @@ def _delimited(data, delimiter):
         text = _text(body)
         encoded = text.encode("utf-8")
         prefix = text[:HEADER_CHARACTERS]
-    # The header is one CSV record, which may span lines inside quotes, so a real CSV parser reads it.
+    # The header is one CSV record, which may span lines inside quotes, so a real CSV parser reads it. The text keeps
+    # its own line ends (newline=""): a file whose lines end in a bare \r is then read as its records, as pyarrow reads it.
     try:
-        header = next(csv.reader(io.StringIO(prefix), delimiter=delimiter), None)
+        header = next(csv.reader(io.StringIO(prefix, newline=""), delimiter=delimiter), None)
     except csv.Error as exc:
         raise Unreadable() from exc
     if not header:
@@ -167,7 +182,23 @@ def _delimited(data, delimiter):
         table = pa.Table.from_batches(batches, schema=reader.schema)
     except (pa.ArrowException, ValueError) as exc:
         raise Unreadable() from exc
-    return table.rename_columns(_unique(table.column_names))
+    return table.rename_columns(_names(table.column_names))
+
+
+def _named_json(data, lines):
+    """A file named JSON or JSON Lines. Bytes that open like JSON are read as JSON, and any failure is unreadable.
+    Bytes that do not open like JSON are read as CSV when they parse as CSV with the same header rules: BAIGLE
+    published a labelled CSV under a JSON name until #171 fixed its publisher (#122, fix 7)."""
+    if not _opens_like_json(data):
+        return _delimited(data, ",")
+    try:
+        return _json(data, lines=lines)
+    except _NotJson as exc:
+        raise Unreadable() from exc
+
+
+def _opens_like_json(data):
+    return data.removeprefix(UTF8_BOM).lstrip()[:1] in (b"[", b"{")
 
 
 def _json(data, lines):
@@ -175,8 +206,8 @@ def _json(data, lines):
 
     The layouts BAIGLE's upload reads with pandas' read_json are an array of objects and an object of
     columns. Those are read as they are, and so is one object on its own, as a single row."""
-    if len(data) > MAX_EXPANDED_BYTES:
-        raise _expanded()
+    if len(data) > MAX_JSON_BYTES:
+        raise _json_too_large()
     text = _text(data.removeprefix(UTF8_BOM))
     _check_depth(text)
     if lines:
@@ -225,13 +256,14 @@ def _check_depth(text):
 
 
 def _json_lines(text):
+    """One JSON object per non-blank line. Each row is counted as it is read, so the row limit stops it there."""
     rows = []
-    for line in text.splitlines():
+    for line in text.split("\n"):
         if not line.strip():
             continue
         row = _parse(line)
         if not isinstance(row, dict):
-            raise Unreadable()
+            raise _NotJson()
         rows.append(row)
         if len(rows) > MAX_ROWS:
             raise _refuse("rows", MAX_ROWS)
@@ -252,7 +284,7 @@ def _columns(document):
                     index.append(key)
                     if len(index) > MAX_ROWS:
                         raise _refuse("rows", MAX_ROWS)
-        _check_cells(len(index), len(names))
+            _check_cells(len(index), len(names))
         columns = [[_text_value(document[name].get(key)) for key in index] for name in names]
     else:
         lists = [document[name] for name in names]
@@ -267,18 +299,19 @@ def _columns(document):
 
 
 def _records(rows):
-    """JSON objects as a table: the columns are the keys, in the order first seen. Keys are bounded as they are found."""
+    """JSON objects as a table: the columns are the keys, in the order first seen. Rows, columns and cells are
+    counted as each row is read, so a file past a limit is refused at that row, before the table is built (#122)."""
     if len(rows) > MAX_ROWS:
         raise _refuse("rows", MAX_ROWS)
     names, seen = [], set()
-    for row in rows:
+    for count, row in enumerate(rows, start=1):
         for name in row:
             if name not in seen:
                 seen.add(name)
                 names.append(name)
                 if len(names) > MAX_COLUMNS:
                     raise _refuse("columns", MAX_COLUMNS)
-    _check_cells(len(rows), len(names))
+        _check_cells(count, len(names))
     return _table(names, [[_text_value(row.get(name)) for row in rows] for name in names])
 
 
@@ -322,6 +355,15 @@ def _check_archive(data):
         )
 
 
+def _scanned(rows):
+    """The rows a sheet yields, counted as they are read, blank ones included. openpyxl yields an empty row for each row
+    number a sheet skips, so a cell far down a sheet is a run of empty rows: the scan stops at the sheet's own row limit (#122)."""
+    for count, row in enumerate(rows, start=1):
+        if count > MAX_SHEET_ROWS:
+            raise _refuse("rows", MAX_SHEET_ROWS)
+        yield row
+
+
 def _sheet(workbook):
     """The first sheet's first row as names and the rest as rows, blank rows skipped. Limits are checked
     as the rows are read, so a sheet cannot run on past them."""
@@ -330,7 +372,7 @@ def _sheet(workbook):
     sheet = workbook.worksheets[0]
     # The sheet may declare a range far bigger than its cells (A1:XFD1048576): read the cells there are.
     sheet.reset_dimensions()
-    rows = sheet.iter_rows(values_only=True)
+    rows = _scanned(sheet.iter_rows(values_only=True))
     header = next(rows, None)
     if header is None:
         return _table([], [])
@@ -362,6 +404,7 @@ def _parquet(data):
         metadata = reader.metadata
     except Exception as exc:  # noqa: BLE001 - corrupt bytes of any kind are unreadable
         raise Unreadable() from exc
+    # Refused from the metadata, before any column is read: the rows, the columns, their cells, and the bytes they decode to.
     if metadata.num_rows > MAX_ROWS:
         raise _refuse("rows", MAX_ROWS)
     if metadata.num_columns > MAX_COLUMNS:
@@ -375,8 +418,8 @@ def _parquet(data):
         raise Unreadable() from exc
     columns = [_as_text(table.column(index)) for index in range(table.num_columns)]
     try:
-        return pa.Table.from_arrays(columns, names=_unique(table.column_names))
-    except (pa.ArrowException, ValueError) as exc:
+        return pa.Table.from_arrays(columns, names=_names(table.column_names))
+    except (pa.ArrowException, ValueError, UnicodeEncodeError) as exc:
         raise Unreadable() from exc
 
 
@@ -395,9 +438,28 @@ def _table(names, columns):
         raise _expanded()
     try:
         arrays = [pa.array(values, type=pa.string()) for values in columns]
-    except (UnicodeEncodeError, UnicodeDecodeError, pa.ArrowException) as exc:
+        return pa.Table.from_arrays(arrays, names=_names(names))
+    except (UnicodeEncodeError, UnicodeDecodeError, pa.ArrowException, ValueError) as exc:
         raise Unreadable() from exc
-    return pa.Table.from_arrays(arrays, names=_unique(names))
+
+
+def _names(names):
+    """Column names as pandas makes them: an empty name is `Unnamed: N` for its column, and a repeated name gets
+    ".1", ".2"... A name that cannot be written as UTF-8, such as a lone surrogate from a JSON key, is unreadable (#122)."""
+    taken, out = set(), []
+    for index, name in enumerate(names):
+        name = name if name != "" else f"Unnamed: {index}"
+        try:
+            name.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise Unreadable() from exc
+        candidate, number = name, 0
+        while candidate in taken:
+            number += 1
+            candidate = f"{name}.{number}"
+        taken.add(candidate)
+        out.append(candidate)
+    return out
 
 
 def _text_value(value):
@@ -421,17 +483,3 @@ def _text_value(value):
         except (TypeError, ValueError):
             return str(value)
     return str(value)
-
-
-def _unique(names):
-    """Column names made distinct, as pandas does: a repeated name gets ".1", ".2"..."""
-    taken = set()
-    out = []
-    for name in names:
-        candidate, number = name, 0
-        while candidate in taken:
-            number += 1
-            candidate = f"{name}.{number}"
-        taken.add(candidate)
-        out.append(candidate)
-    return out

@@ -4,6 +4,7 @@ The host's three seams are faked from recorded Zenodo answers (fake_zenodo.py). 
 and a Community import never reads a Hugging Face shard or a local Dataset."""
 import copy
 import csv
+import hashlib
 
 import pytest
 
@@ -12,7 +13,7 @@ from dataset_library import imports
 from dataset_library.licenses import resolve_license
 from dataset_library.models import LibraryImport
 from dataset_library.providers import community as provider
-from fake_zenodo import RECORDS, FakeZenodo
+from fake_zenodo import RECORDS, FakeZenodo, PreviewQueue
 
 
 class Queue:
@@ -51,15 +52,29 @@ def queue():
 
 
 @pytest.fixture
-def app(make_app, zenodo, queue):
-    return make_app(
+def previews():
+    return PreviewQueue()
+
+
+@pytest.fixture
+def app(make_app, zenodo, queue, previews, cache):
+    app = make_app(
         community_datasets=zenodo.datasets,
         community_record=zenodo.record,
         community_download=zenodo.download,
         community_base_url=zenodo.base_url,
+        community_enqueue_preview=previews,
         enqueue=queue,
         max_rows=lambda: 300,
     )
+    app.previews, app.zenodo, app.cache = previews, zenodo, cache  # so a helper can run the worker's preview jobs
+    return app
+
+
+def settle(client):
+    """Run the preview jobs the page has queued, as the worker does, so the next request finds the previews cached."""
+    app = client.application
+    app.previews.run(app.cache, app.zenodo)
 
 
 def switch(client, enabled=True, policy=None):
@@ -76,6 +91,7 @@ def cards(client, **params):
 
 
 def start(client, record="101", status=202, **body):
+    open_preview(client, record)  # the page opens the preview before it starts, so its head is cached
     payload = {"provider": "community", "dataset": record, "taskType": "classification",
                "textColumn": "text", "labelColumn": "label", "size": 5, **body}
     response = client.post("/api/library/imports", json=payload, headers=ALICE)
@@ -83,9 +99,21 @@ def start(client, record="101", status=202, **body):
     return response.get_json()
 
 
+def open_preview(client, record="101"):
+    """What the page does before it imports: it opens the dataset, and the worker reads the preview meanwhile."""
+    response = client.get(f"/api/library/datasets/community/{record}", headers=ALICE)
+    if response.status_code == 200 and response.get_json()["preparing"]:
+        settle(client)
+
+
 def preview(client, record="101", status=200):
+    """The dataset as the page shows it: asked again once the worker has read its preview, as the page's polling does."""
     response = client.get(f"/api/library/datasets/community/{record}", headers=ALICE)
     assert response.status_code == status, response.get_json()
+    if status == 200 and response.get_json()["preparing"]:
+        settle(client)
+        response = client.get(f"/api/library/datasets/community/{record}", headers=ALICE)
+        assert response.status_code == status, response.get_json()
     return response.get_json()
 
 
@@ -97,6 +125,8 @@ def answer(zenodo, record_id, like):
 
 def checksum_of(record_id):
     return RECORDS[record_id]["files"][0]["checksum"]
+
+
 
 
 # --- The provider, as pure functions ---------------------------------------------------------
@@ -121,6 +151,31 @@ def test_the_table_file_is_the_data_file_BAIGLE_publishes_or_else_the_first_tabl
     assert provider.table_file([{"key": "notes.csv"}, {"key": "data.xlsx"}])["key"] == "data.xlsx"
     assert provider.table_file([{"key": "notes.csv"}])["key"] == "notes.csv"
     assert provider.table_file([{"key": "README.txt"}]) is None
+
+
+def test_a_checksum_is_checked_as_zenodo_gives_it_md5_prefixed_or_as_a_legacy_record_bare_hex():
+    data = b"text,label\nA,x\n"
+    digest = hashlib.md5(data).hexdigest()
+
+    assert provider.checksum_matches(data, f"md5:{digest}")
+    assert provider.checksum_matches(data, digest)
+    assert provider.checksum_matches(data, f"md5:{digest.upper()}")
+    assert provider.checksum_matches(data, f"sha256:{hashlib.sha256(data).hexdigest()}")
+    assert not provider.checksum_matches(data + b"!", f"md5:{digest}")
+    assert not provider.checksum_matches(data, "nonsense:1234")  # an algorithm the platform does not know matches nothing
+    assert not provider.checksum_matches(data, "")
+
+
+def test_a_pinned_file_is_found_only_while_the_record_is_open_and_still_lists_it():
+    record = copy.deepcopy(RECORDS["101"])
+    assert provider.pinned_file(record, "data.csv")["key"] == "data.csv"
+    assert provider.pinned_file(record, "notes.csv") is None  # a table that was not pinned is never read instead
+    readme_only = {**record, "files": [record["files"][1]]}
+    assert provider.pinned_file(readme_only, "data.csv") is None  # the pinned file is checked before any table is classified
+    closed = {**record, "access": {"record": "restricted", "files": "restricted"}, "downloadable": False, "files": []}
+    assert provider.pinned_file(closed, "data.csv") is None
+    assert provider.access_refusal(record) is None
+    assert provider.access_refusal(closed)[0] == "restricted"
 
 
 def test_a_record_that_cannot_be_imported_says_why():
@@ -320,7 +375,8 @@ def test_an_open_record_is_importable_with_its_table_and_a_proposal(client, zeno
     assert body["rowCount"] == 12
     assert len(body["rows"]) == 8
     assert body["rows"][0][0] == "The Supplier may terminate this Agreement by giving thirty days' notice."
-    assert body["proposed"] == {"taskType": "classification", "textColumn": "text", "labelColumn": "label"}
+    # The columns are proposed, and no task: a Publication carries none, and a text column is no reason to claim one (#122, fix 5).
+    assert body["proposed"] == {"taskType": None, "textColumn": "text", "labelColumn": "label"}
     assert body["file"] == {"key": "data.csv", "size": RECORDS["101"]["files"][0]["size"]}
     assert body["revision"] == checksum_of("101")
     assert body["url"] == "https://doi.org/10.5281/zenodo.101"
@@ -381,7 +437,7 @@ def test_a_file_over_the_download_cap_is_not_importable(client, zenodo):
 
 def test_a_file_that_is_not_a_table_is_not_importable_with_a_plain_reason(client, zenodo):
     switch(client)
-    zenodo.contents[("101", "data.csv")] = b"\x81\x8d\x8f\x90"  # not UTF-8, and undefined in Windows-1252 too
+    zenodo.replace_file("101", "data.csv", b"\x81\x8d\x8f\x90")  # not UTF-8, and undefined in Windows-1252 too
 
     body = preview(client)
 

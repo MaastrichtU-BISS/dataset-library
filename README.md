@@ -27,11 +27,11 @@ init_dataset_library(
     max_rows=lambda: 1000,           # the row cap when an admin set none
     hard_max_rows=5000,              # the most an admin may set (default 5000)
     max_fetch_bytes=200_000_000,     # the host's download limit: an admin's cap never goes above it
-    community_datasets=community_listing,    # Community source (#122): all four, or none
+    community_datasets=community_listing,    # Community source (#122): all five, or none
     community_record=lambda rid: Zenodo(zenodo_url()).record_files(rid),
     community_download=lambda rid, key, max_bytes: Zenodo(zenodo_url()).download(rid, key, max_bytes),
     community_base_url=zenodo_url,   # the Zenodo host this platform reads; other hosts' records are not listed
-    community_preview_seconds=20,    # optional: how long a preview waits for Zenodo (default 20)
+    community_enqueue_preview=lambda job: redis.lpush("library_preview_queue", job),  # the worker reads previews
     community_preview_max_bytes=16_000_000,  # optional: the most of a file a preview reads (default 16 MB)
 )
 ```
@@ -83,7 +83,7 @@ label `dataset_library`).
 
 The Community source lists open dataset Publications (datasets published to Zenodo
 through BAIGLE, #122) with the license each one states. It is offered only when the
-host gives all four seams above and an admin switches it on in the settings
+host gives all five seams above and an admin switches it on in the settings
 (`PUT /api/library/admin/settings` with `"community": {"enabled": true}`). The library
 imports none of the repository's client: the host's seams do the Zenodo calls, and
 the host's Zenodo base URL is the only host a Community file is fetched from. A
@@ -101,18 +101,27 @@ record's own file, never a local Dataset, and fails with "This record is no long
 downloadable" when Zenodo has closed the record or removed the file. A Community
 dataset carries no task in its publication, so a task filter does not find it.
 
-Previews are kept off the request's critical path. A preview's file is read only
-within `community_preview_max_bytes` (16 MB); a larger one shows its card, files and
-size with "Too large to preview here; it can still be imported" (`preview: "too_large"`)
-and stays importable within the import cap. Zenodo is asked on a helper thread that
-the request waits for up to `community_preview_seconds` (20 s); past that the answer is
-`preparing: true`, and the page asks again. One fetch per cache key runs at a time: a
-request that finds one running also gets `preparing: true` and downloads nothing. The
-record is cached for a minute and the preview for ten, both bound to the Zenodo origin.
-A queued import checks its Publication, the source and the license again before it
-reads, and reads exactly the file it was started on at the checksum it was started
-at. The import's download is capped at the admin's cap, never above the host's
-`max_fetch_bytes`.
+A request never downloads or parses a Community file. It re-checks the record with
+Zenodo (one metadata call, kept for a minute for display) and answers from the
+preview's cache. A preview that is not cached yet is queued once per cache key on
+`community_enqueue_preview`, and the answer is `preparing: true` until the worker has
+read it: the worker calls `dataset_library.community.run_preview(job, cache=, download=)`,
+which reads the file's head under the same parser limits as an import, checks its bytes
+against the checksum Zenodo lists, and caches what it found. A file's preview is read only
+within `community_preview_max_bytes` (16 MB); a larger one shows its card, files and size
+with "Too large to preview here; it can still be imported" (`preview: "too_large"`) and
+stays importable within the import cap. A refusal is cached for ten minutes, so a bad file
+is not fetched again on every open; Zenodo's own failure is cached for a minute. The
+preview lock is random and lasts 660 s, longer than Zenodo's read deadline, and only the
+job that took it releases it. The record and the preview are bound to the Zenodo origin.
+
+Start and retry decide eligibility on a live record, not the cached preview. A queued
+import checks its Publication, the origin it started on, the source and the license
+again before it reads: the license must be the Publication's current one, and the one
+the import started on (otherwise it fails and asks for a fresh import). Then it checks
+the file it started on first, and reads exactly that file, at the checksum it started
+on. A retry keeps the Publication, origin and file of the import it repeats. The
+import's download is capped at the admin's cap, never above the host's `max_fetch_bytes`.
 
 ## API
 

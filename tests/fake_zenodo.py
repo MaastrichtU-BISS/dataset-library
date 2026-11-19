@@ -6,9 +6,11 @@ Zenodo.download. Each listed Publication carries the Zenodo origin BAIGLE's seam
 network. A test changes what Zenodo says by editing `records`, `listed`, `gone` or `busy`, and holds a call open
 (as a slow repository would) by setting `hold` to a threading.Event."""
 import copy
+import hashlib
 import json
 import pathlib
 
+from dataset_library import community
 from dataset_library.errors import ProviderUnavailable
 from dataset_library.providers.community import NotDownloadable, TooLarge
 
@@ -17,6 +19,21 @@ FILES = FIXTURES / "files"
 LISTING = json.loads((FIXTURES / "open_datasets.json").read_text(encoding="utf-8"))
 RECORDS = json.loads((FIXTURES / "records.json").read_text(encoding="utf-8"))
 ORIGIN = "https://zenodo.org"
+
+
+class PreviewQueue:
+    """The host's preview queue (`enqueue_preview`). A test runs the queued jobs as the ML worker does, with `run`."""
+
+    def __init__(self):
+        self.jobs = []
+
+    def __call__(self, job):
+        self.jobs.append(job)
+
+    def run(self, cache, zenodo):
+        """Run every queued job against `cache`, reading Zenodo through `zenodo.download`, as the worker's loop does."""
+        while self.jobs:
+            community.run_preview(json.loads(self.jobs.pop(0)), cache=cache, download=zenodo.download)
 
 
 class FakeZenodo:
@@ -58,6 +75,14 @@ class FakeZenodo:
 
     def downloads(self):
         return [call for call in self.calls if call[0] == "download"]
+
+    def replace_file(self, record_id, key, data):
+        """Zenodo serves `data` as the file `key` of the record, and lists its checksum and size, as a re-published file would."""
+        self.contents[(record_id, key)] = data
+        for entry in self.records[record_id]["files"]:
+            if entry["key"] == key:
+                entry["checksum"] = "md5:" + hashlib.md5(data).hexdigest()
+                entry["size"] = len(data)
 
     def _answer(self, record_id):
         if self.hold is not None:

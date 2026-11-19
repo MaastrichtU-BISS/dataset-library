@@ -12,11 +12,11 @@ __all__ = ["Cache", "License", "init_dataset_library", "resolve_license"]
 
 
 class Cache(Protocol):
-    """Where search results are kept for a while (Redis in BAIGLE).
+    """Where search results and Community previews are kept for a while (Redis in BAIGLE).
 
-    ``add(key, value, ttl)`` sets the key only if it is not set, for ``ttl`` seconds, and says whether it
-    did; it is the lock that keeps one Community preview fetch running per key (#122). ``delete(key)``
-    removes a key, so a lock is released as soon as its work ends."""
+    ``add(key, value, ttl)`` sets the key only if it is not set, for ``ttl`` seconds, and says whether it did: it is the
+    lock that keeps one Community preview job queued per key (#122). ``delete_if(key, value)`` removes the key only while
+    it still holds ``value``, so a lock is released only by the job that took it (#122, fix 1); ``delete(key)`` removes it."""
 
     def get(self, key: str): ...
 
@@ -25,6 +25,8 @@ class Cache(Protocol):
     def add(self, key: str, value, ttl: int) -> bool: ...
 
     def delete(self, key: str) -> None: ...
+
+    def delete_if(self, key: str, value) -> None: ...
 
 
 @dataclass
@@ -75,7 +77,7 @@ def init_dataset_library(
     community_record=None,
     community_download=None,
     community_base_url=None,
-    community_preview_seconds=None,
+    community_enqueue_preview=None,
     community_preview_max_bytes=None,
     url_prefix="/api/library",
 ):
@@ -108,40 +110,43 @@ def init_dataset_library(
     them a pin has no copy. The worker also calls ``snapshots.sweep`` and
     ``snapshots.check_upstream`` from time to time.
 
-    The Community source (datasets published openly to Zenodo) needs four seams, all or
+    The Community source (datasets published openly to Zenodo) needs five seams, all or
     nothing, and the library imports none of the repository's client (ADR 0005):
     ``community_datasets()`` returns the open dataset Publications, as fair-publishing's
     ``open_datasets`` does, each with the Zenodo origin its record is on under ``origin``;
     ``community_record(record_id)`` returns the record's files, as ``Zenodo.record_files``
     does; ``community_download(record_id, key, max_bytes)`` returns one file's bytes, as
     ``Zenodo.download`` does; ``community_base_url()`` returns the Zenodo base URL the host
-    reads from. Only a Publication on that origin is listed, previewed or imported. A host maps
-    the repository's ``RecordNotDownloadable`` to ``providers.community.NotDownloadable``, its
-    ``FileTooLarge`` to ``TooLarge``, and any other failure to ``ProviderError``. An admin
-    still switches the source on. ``run_import`` takes the same seams.
+    reads from; ``community_enqueue_preview(job)`` hands a preview job, a JSON string, to the
+    host's worker, which calls ``community.run_preview``. Only a Publication on that origin is
+    listed, previewed or imported. A host maps the repository's ``RecordNotDownloadable`` to
+    ``providers.community.NotDownloadable``, its ``FileTooLarge`` to ``TooLarge``, and any other
+    failure to ``ProviderError``. An admin still switches the source on. ``run_import`` takes the
+    same seams, except the queue.
 
-    A preview fetches from Zenodo on a helper thread that the request waits for up to
-    ``community_preview_seconds`` (default ``community.PREVIEW_SECONDS``), and reads a file of up to
+    A request never downloads or parses a Community file (#122, fix 1). It re-checks the record
+    with Zenodo, a metadata call, and reads the preview from the cache. A preview not cached yet is
+    queued once per cache key, and the request answers "preparing". The worker reads a file of up to
     ``community_preview_max_bytes`` (default ``community.PREVIEW_MAX_BYTES``); a larger file is shown
     without its rows and stays importable within the import cap.
     """
     from .routes import library_bp
 
     community_seams = None
-    given = (community_datasets, community_record, community_download, community_base_url)
+    given = (community_datasets, community_record, community_download, community_base_url, community_enqueue_preview)
     if all(seam is not None for seam in given):
-        from .community import PREVIEW_MAX_BYTES, PREVIEW_SECONDS, Seams
+        from .community import PREVIEW_MAX_BYTES, Seams
 
         community_seams = Seams(
             datasets=community_datasets,
             record=community_record,
             download=community_download,
             base_url=community_base_url,
-            preview_seconds=PREVIEW_SECONDS if community_preview_seconds is None else community_preview_seconds,
+            enqueue_preview=community_enqueue_preview,
             preview_max_bytes=PREVIEW_MAX_BYTES if community_preview_max_bytes is None else community_preview_max_bytes,
         )
     elif any(seam is not None for seam in given):
-        logging.getLogger("dataset_library").warning("library.community not offered: it needs all four seams")
+        logging.getLogger("dataset_library").warning("library.community not offered: it needs all five seams")
 
     app.extensions["dataset_library"] = _Host(
         db=db,

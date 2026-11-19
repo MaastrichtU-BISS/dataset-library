@@ -65,9 +65,30 @@ def test_a_windows_1252_csv_keeps_its_accents_and_a_utf8_byte_order_mark_is_drop
     assert as_rows(tables.read(b"\xef\xbb\xbftext\nA\n", "data.csv")) == (["text"], [{"text": "A"}])
 
 
-def test_a_json_name_is_never_read_as_a_csv():
+# What publishing_host._dataset_bytes writes for a labelled Dataset: pandas' to_csv(index=False), named data.json
+# when the upload was JSON (#122, fix 7; #171 fixes the publisher's name). Generated with pandas 2.3.3.
+BAIGLE_LABELLED_UNDER_JSON_NAME = (
+    b'text,label,label_source\n"The Supplier may terminate, on notice.",Terminations,file\n'
+    b'"A paragraph.\n\nAnother paragraph.",01,file\n"Unlabelled text, with a comma.",,\n'
+)
+
+
+def test_a_labelled_csv_published_under_a_json_name_is_read_as_the_csv_it_is():
+    assert as_rows(tables.read(BAIGLE_LABELLED_UNDER_JSON_NAME, "data.json")) == (
+        ["text", "label", "label_source"],
+        [
+            {"text": "The Supplier may terminate, on notice.", "label": "Terminations", "label_source": "file"},
+            {"text": "A paragraph.\n\nAnother paragraph.", "label": "01", "label_source": "file"},
+            {"text": "Unlabelled text, with a comma.", "label": "", "label_source": ""},
+        ],
+    )
+
+
+def test_a_json_name_on_bytes_that_open_like_json_is_read_as_json_and_never_as_csv():
     with pytest.raises(tables.Unreadable):
-        tables.read(b"text,label\nA,x\n", "data.json")
+        tables.read(b'[{"text": "a", "label": "x"},', "data.json")
+    with pytest.raises(tables.Unreadable):
+        tables.read(b'{"text": "a"', "data.jsonl")
 
 
 # --- JSON layouts BAIGLE's upload reads (fix 12) --------------------------------------------------
