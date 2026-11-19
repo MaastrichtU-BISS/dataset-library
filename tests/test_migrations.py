@@ -22,7 +22,8 @@ def _schema(engine):
     }
 
 
-def test_the_revisions_match_the_models():
+def _migrated():
+    """A scratch database with every shipped revision applied, in name order."""
     migrated = sa.create_engine("sqlite://")
     for path in sorted(VERSIONS.glob("dl_*.py")):
         spec = importlib.util.spec_from_file_location(path.stem, path)
@@ -31,7 +32,15 @@ def test_the_revisions_match_the_models():
         with migrated.begin() as connection:
             revision.op = Operations(MigrationContext.configure(connection))
             revision.upgrade()
+    return migrated
+
+
+def test_the_revisions_match_the_models():
     modelled = sa.create_engine("sqlite://")
     LibraryBase.metadata.create_all(modelled)
 
-    assert _schema(migrated) == _schema(modelled)
+    assert _schema(_migrated()) == _schema(modelled)
+
+
+def test_an_import_keeps_its_citation_as_nullable_json():
+    assert _schema(_migrated())["library_imports"][0]["citation"] == ("JSON", True)

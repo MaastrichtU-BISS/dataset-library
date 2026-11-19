@@ -4,13 +4,56 @@ from datetime import datetime
 
 import pytest
 
-from conftest import ALICE
+from conftest import ALICE, TASK_TYPES
 
 from dataset_library import imports
 from dataset_library.models import LibraryImport
+from dataset_library.providers import huggingface
+from test_citation import LEX_README_BIBTEX, LEXGLUE_AUTHORS, LEXGLUE_BIBTEX, SHA
 from test_import import FakeCreateDataset, write_shard
 
 BOB = {"X-User": "bob"}
+LEXGLUE = {"dataset": "coastalcph/lex_glue", "config": "ledgar", "split": "train", "textColumn": "text", "labelColumn": "label", "size": 2}
+
+
+@pytest.fixture
+def cited_lex_glue(monkeypatch):
+    """LexGLUE as the Hub answers for it, with its own BibTeX and a creation date."""
+    card = huggingface._card(
+        {
+            "id": "coastalcph/lex_glue", "sha": SHA, "createdAt": "2021-10-17T11:42:31.000Z",
+            "lastModified": "2024-01-04T14:25:27.000Z",
+            "tags": ["license:cc-by-4.0", "task_categories:text-classification"],
+            "cardData": {"pretty_name": "LexGLUE", "citation_bibtex": LEXGLUE_BIBTEX},
+            "downloads": 1, "description": "",
+        },
+        TASK_TYPES,
+    )
+    real = huggingface.dataset
+    monkeypatch.setattr(
+        huggingface, "dataset",
+        lambda external_id, task_types: card if external_id == "coastalcph/lex_glue" else real(external_id, task_types),
+    )
+    return card
+
+
+def queue_lex_glue(app):
+    """Queue LexGLUE through the route, as the student's Import button does."""
+    response = app.test_client().post("/api/library/imports", json=LEXGLUE, headers=ALICE)
+    assert response.status_code == 202, response.get_json()
+    return response.get_json()
+
+
+def finish(app, tmp_path, import_ref):
+    """Run a queued import as the worker would; returns the dataset's provenance."""
+    shard = write_shard(tmp_path / "0000.parquet", ["A clause", "Another"], [0, 1])
+    with app.app_context():
+        imports.run_import(
+            import_ref, session=app.db.session,
+            fetch_shards=lambda *_: imports.Fetched(paths=[str(shard)], revision=SHA),
+            create_dataset=FakeCreateDataset(), data_dir=str(tmp_path / "data"), seed=7,
+        )
+    return app.test_client().get("/api/library/provenance/dataset-1", headers=ALICE).get_json()
 
 
 def complete(app, tmp_path, *, license, license_ack_at=None, balance=False):
@@ -144,3 +187,68 @@ def test_a_license_set_to_warn_without_its_own_words_gets_the_default_in_provena
 
     assert body["license"]["level"] == "warn"
     assert body["license"]["ack"] == "I have read the MIT license and will follow its terms."
+
+
+def test_an_import_cites_the_card_and_provenance_returns_that_citation(make_app, tmp_path, cited_lex_glue):
+    app = make_app(enqueue=lambda import_ref: None)
+    started = queue_lex_glue(app)
+    with app.app_context():
+        pinned = app.db.session.get(LibraryImport, started["id"]).citation
+    assert pinned["revision"] == SHA and pinned["bibtex"] == LEXGLUE_BIBTEX and pinned["accessedAt"]
+
+    body = finish(app, tmp_path, started["id"])
+
+    assert body["citation"] == {
+        "title": "LexGLUE",
+        "authors": LEXGLUE_AUTHORS,
+        "year": 2022,
+        "url": "https://huggingface.co/datasets/coastalcph/lex_glue",
+        "revision": SHA,
+        # Re-pinned when the import completed: the day it was imported.
+        "accessedAt": body["importedAt"],
+        "bibtex": LEXGLUE_BIBTEX,
+    }
+
+
+def test_a_dataset_cited_only_in_its_readme_is_cited_from_that_bibtex(make_app, tmp_path):
+    # LexGLUE's card has no BibTeX; its README does, at the revision the import read.
+    app = make_app(enqueue=lambda import_ref: None)
+    body = finish(app, tmp_path, queue_lex_glue(app)["id"])
+
+    assert body["citation"] == {
+        "title": "LexGLUE",
+        "authors": LEXGLUE_AUTHORS,
+        "year": 2022,
+        "url": "https://huggingface.co/datasets/coastalcph/lex_glue",
+        "revision": SHA,
+        "accessedAt": body["importedAt"],
+        "bibtex": LEX_README_BIBTEX,
+    }
+
+
+def test_an_import_whose_fetch_reports_no_revision_keeps_the_one_it_was_queued_at(make_app, tmp_path, cited_lex_glue):
+    app = make_app(enqueue=lambda import_ref: None)
+    started = queue_lex_glue(app)
+    shard = write_shard(tmp_path / "0000.parquet", ["A clause", "Another"], [0, 1])
+    with app.app_context():
+        imports.run_import(
+            started["id"], session=app.db.session,
+            fetch_shards=lambda *_: imports.Fetched(paths=[str(shard)], revision=None),
+            create_dataset=FakeCreateDataset(), data_dir=str(tmp_path / "data"), seed=7,
+        )
+        record = app.db.session.get(LibraryImport, started["id"])
+        assert record.status == "completed"
+        assert record.revision == SHA
+        assert record.citation["revision"] == SHA
+
+    body = app.test_client().get("/api/library/provenance/dataset-1", headers=ALICE).get_json()
+    assert body["revision"] == SHA
+    assert body["citation"]["revision"] == SHA
+
+
+def test_an_import_made_before_citations_existed_has_none(app, tmp_path):
+    complete(app, tmp_path, license="cc-by-4.0")
+
+    body = app.test_client().get("/api/library/provenance/dataset-1", headers=ALICE).get_json()
+
+    assert body["citation"] is None

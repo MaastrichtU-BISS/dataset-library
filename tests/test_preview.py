@@ -106,6 +106,20 @@ def test_previews_are_cached_for_ten_minutes(client, hub):
     assert len(hub.calls) == calls
 
 
+def test_a_preview_cached_before_citations_is_rebuilt_with_one(client, hub, cache):
+    # A body cached by 0.10.x has no citation: it is a miss, so an import started now still gets one (#120).
+    preview(client, "AI-team-UoA/greek_legal_code")
+    key = "library:preview:AI-team-UoA/greek_legal_code::"
+    cache.set(key, {k: v for k, v in cache.get(key).items() if k != "citation"}, 600)
+    calls = len(hub.calls)
+
+    body = preview(client, "AI-team-UoA/greek_legal_code")
+
+    assert len(hub.calls) > calls
+    assert body["citation"]["revision"] == "de0fdb34424f07d1ac6f0ede23ee0ed44bd9f5d1"
+    assert cache.get(key)["citation"]["revision"] == "de0fdb34424f07d1ac6f0ede23ee0ed44bd9f5d1"
+
+
 def test_an_ner_card_proposes_its_tokens_and_tag_columns(client):
     body = preview(client, "coastalcph/legal_ner")
 

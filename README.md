@@ -65,6 +65,12 @@ label `dataset_library`).
   `stale`: the Hub is limiting requests and these are the last results, up to a
   day old. `unavailable`: the Hub is down or unreadable; nothing is raised.
   Every card carries `pinRef`: the ref of the pin for that dataset, or null.
+  Every card also carries `citation`: `title`, `authors` (a list of
+  `{"family", "given"}` or `{"literal"}`), `year`, `url`, `revision`,
+  `accessedAt` (null until someone imports it) and `bibtex`, the dataset's own
+  BibTeX entry exactly as written, or null when it has none. A search result
+  does not read the dataset's README, so its `bibtex` can be null where the
+  single-dataset card's is not.
 - `GET /api/library/labels?ids=huggingface:org/name,...` → `{"labels": {id: "yes" | "no" | "unclear"}}`,
   from the dataset viewer's column types; up to 30 ids, cached an hour each.
 - `GET /api/library/datasets/huggingface/<org>/<name>?config=&split=` → the
@@ -128,8 +134,11 @@ label `dataset_library`).
   `revision`, `url`, `importedAt`, `licenseAckAt` (when the license was
   confirmed), `license` (the license table entry, at the platform's current
   level, which an admin may have changed since the import), plus `balance`,
-  `sampleMethod` and `sampleNote`. 404 when this user
-  has no completed import of it; works without an import queue.
+  `sampleMethod` and `sampleNote`. `citation` is what the Dataset is cited
+  from: the card's fields as the import read them, with `revision` the
+  revision it read and `accessedAt` the time it was imported; `null` for
+  imports made before 0.11.0. 404 when this user has no completed import of
+  it; works without an import queue.
 - `POST /api/library/imports/<ref>/cancel` → the import, `cancelled`; once it is
   `saving` or `completed`, 409 `too_late` (cancel and finishing never both win).
   A failed or cancelled import comes back as it is.

@@ -184,3 +184,18 @@ def test_options_list_the_filters_and_the_license_table(app, client):
     assert licenses["unknown"]["group"] == "Unknown"
     assert body["groups"] == ["Open", "Share-alike", "Non-commercial", "No-derivatives", "Unknown"]
     assert body["sources"] == [{"value": "coastalcph", "label": "coastalcph", "provider": "huggingface"}]
+
+
+def test_a_card_carries_the_citation_its_dataset_is_cited_from(client):
+    # The fixture card has no BibTeX, and a search result never reads a README: the citation says so rather than inventing one (#120).
+    citation = by_id(search(client, q="lex_glue"))["coastalcph/lex_glue"]["citation"]
+
+    assert citation == {
+        "title": "LexGLUE",
+        "authors": [{"literal": "coastalcph"}],
+        "year": None,
+        "url": "https://huggingface.co/datasets/coastalcph/lex_glue",
+        "revision": "c23fdff1a6bf74e0e1a71cb86f1e781d37da888c",
+        "accessedAt": None,
+        "bibtex": None,
+    }

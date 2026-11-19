@@ -19,10 +19,11 @@ PROVIDER = "huggingface"
 MAX_FEATURED = 3
 MAX_TITLE = 120
 
-# The card fields a search result carries (`providers/huggingface._card`).
+# The card fields a search result carries (`providers/huggingface._card`). The
+# citation is kept too, so a featured card can still be cited (#120).
 CARD_FIELDS = (
     "id", "provider", "externalId", "author", "title", "url", "tasks", "license",
-    "size", "gated", "description", "updated", "revision", "downloads",
+    "size", "gated", "description", "updated", "revision", "downloads", "citation",
 )
 
 

@@ -58,7 +58,9 @@ def preview(host, external_id, config=None, split=None):
         raise NotInLibrary()
     key = f"library:preview:{external_id}:{config or ''}:{split or ''}"
     body = host.cache.get(key)
-    if body is None:
+    # A body cached before citations (#120) has no citation: rebuild it, so an
+    # import started right after the deploy still gets one.
+    if not isinstance(body, dict) or "citation" not in body:
         body = _build(host, external_id, config, split)
         host.cache.set(key, body, CACHE_SECONDS)
     return _apply_library_rules(host, body)

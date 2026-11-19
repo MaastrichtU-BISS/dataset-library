@@ -8,6 +8,43 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-19
+
+### Added
+
+- Citing an imported dataset (BAIGLE #120, design DR13).
+  - Every Hugging Face card carries `citation`: `title` (the card's
+    `pretty_name`, else the dataset name), `authors` (a list, each
+    `{"family", "given"}` for a person or `{"literal"}` for an organisation or
+    anything that is not a person's name: the card's `authors`, else the BibTeX
+    `author` field, else the owning organisation), `year` (the BibTeX `year`,
+    else the card's `year`, else null: never the repository's creation date),
+    `url`, `revision` (the Hub's `sha`), `accessedAt` (null on a card: looking
+    at it is not reading it) and `bibtex`.
+  - `bibtex` is the dataset's own BibTeX, kept exactly as written. It is read
+    from the Hub's top-level `citation`, else the card's `citation_bibtex`, else
+    `citation` (each only when the value starts with `@`), else the dataset's
+    README at the card's revision (512 KB at most, with a short timeout; any
+    failure is no BibTeX). In the README, an entry in a section headed
+    "Citation" comes before a fenced entry elsewhere, which is often an upstream
+    dataset's. Only a single dataset reads its README, so a search
+    result's `bibtex` can be null where the dataset's own cannot. A
+    plain-text citation, or none at all, gives null.
+  - The BibTeX is read by a small scanner: only a top-level field of the first
+    entry counts, so a `year` inside another field is not the year; braces,
+    quotes and `#` joins are read; authors split on `and` outside braces, and
+    LaTeX accents decode to letters.
+  - A completed import stores that citation in the new `library_imports.citation`
+    column (JSON, nullable; migration `dl_0007_citation`), set when the import
+    is created and pinned again when it completes: `revision` is the revision
+    the import read and `accessedAt` the time it was imported. A fetch that
+    reports no revision keeps the one the import was queued at. `provenance()`
+    returns it as `citation`; imports made before 0.11.0 have none, so it is
+    `null`.
+  - A featured pin keeps its card's citation, and a preview cached before
+    citations existed is read again, so an import started right after the
+    upgrade is cited too.
+
 ## [0.10.0] - 2026-11-18
 
 ### Changed
