@@ -21,11 +21,13 @@ While the version is 0.x, minor releases may contain breaking changes.
     When the Hub's head is still the queued revision, the conversion has not caught up, and the import
     fails as `conversion_behind` ("Hugging Face hasn't converted this dataset's latest version yet…
     Try again later."), not as `changed`, whose "open it again" would never help. `Fetched.head`
-    carries that head; it is never recorded.
+    carries that head: it is never recorded, asked only when the listing names a revision, and a Hub
+    that cannot answer gives None rather than failing the fetch.
   - Every shard is downloaded from the commit `refs/convert/parquet` points at (`GET
     /api/datasets/<id>/refs`), not from the moving branch. The branch is read on both sides of a second
-    listing, and every chosen shard must be in the pinned build at the listed size (`GET
-    /api/datasets/<id>/tree/<commit>/<folder>`), which catches a listing cached while the branch moved.
+    listing, and every chosen shard must be in the pinned build at the listed size (one `POST
+    /api/datasets/<id>/paths-info/<commit>` for exactly those files, so no paging), which catches a
+    listing cached while the branch moved.
     A commit or source revision that moves, a size that differs, a missing or malformed convert commit,
     or a shard URL that does not name the convert branch raises `ProviderUnavailable`; the import fails
     as `provider_busy` (unless a copy stands in) and can be retried.

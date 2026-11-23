@@ -13,7 +13,7 @@ with backoff, then the provider is unavailable."""
 import os
 import re
 import time
-from urllib.parse import quote, unquote
+from urllib.parse import unquote
 
 import requests
 
@@ -40,9 +40,17 @@ REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 
 def _get(url, sleep, **kwargs):
+    return _ask(requests.get, url, sleep, **kwargs)
+
+
+def _post(url, sleep, **kwargs):
+    return _ask(requests.post, url, sleep, **kwargs)
+
+
+def _ask(method, url, sleep, **kwargs):
     for attempt in range(RETRIES + 1):
         try:
-            response = requests.get(url, timeout=TIMEOUT, **kwargs)
+            response = method(url, timeout=TIMEOUT, **kwargs)
         except requests.RequestException as exc:
             error = exc
         else:
@@ -89,7 +97,7 @@ def fetch_shards(external_id, config, split, max_bytes, dest_dir, *, sleep=time.
     # must be in the pinned build at the size the listing gives, or the listing
     # describes another build.
     _check_build(external_id, commit, chosen, sleep)
-    head = _head(external_id, sleep)
+    head = _head(external_id, sleep) if revision else None
 
     os.makedirs(dest_dir, exist_ok=True)
     paths = []
@@ -126,24 +134,28 @@ def _convert_commit(external_id, sleep):
 
 def _check_build(external_id, commit, chosen, sleep):
     """Every chosen shard is in the build at `commit`, at the size the listing
-    gave; otherwise the listing describes a different build (#168)."""
-    sizes = {}
-    for folder in dict.fromkeys(_in_build(shard["url"]).rsplit("/", 1)[0] for shard in chosen):
-        tree = _get(f"{HUB}{external_id}/tree/{commit}/{quote(folder)}", sleep)
-        if tree.status_code != 200:
-            raise ProviderUnavailable(REBUILDING)
-        try:
-            sizes.update({entry["path"]: entry["size"] for entry in tree.json() if entry.get("type") == "file"})
-        except (AttributeError, KeyError, TypeError, ValueError) as broken:
-            raise ProviderUnavailable(REBUILDING) from broken
-    if any(sizes.get(_in_build(shard["url"])) != shard["size"] for shard in chosen):
+    gave; otherwise the listing describes a different build (#168). One
+    paths-info call answers for exactly these files, with no paging."""
+    paths = [_in_build(shard["url"]) for shard in chosen]
+    found = _post(f"{HUB}{external_id}/paths-info/{commit}", sleep, data={"paths": paths})
+    if found.status_code != 200:
+        raise ProviderUnavailable(REBUILDING)
+    try:
+        sizes = {entry["path"]: entry["size"] for entry in found.json() if entry.get("type") == "file"}
+    except (AttributeError, KeyError, TypeError, ValueError) as broken:
+        raise ProviderUnavailable(REBUILDING) from broken
+    if any(sizes.get(path) != shard["size"] for path, shard in zip(paths, chosen)):
         raise ProviderUnavailable(REBUILDING)
 
 
 def _head(external_id, sleep):
     """The dataset's current commit, only to tell a conversion that lags it from
-    a dataset that changed after it was opened. Never recorded as read."""
-    hub = _get(HUB + external_id, sleep)
+    a dataset that changed after it was opened. Never recorded as read, and
+    never a reason to fail: a Hub that cannot say gives None."""
+    try:
+        hub = _get(HUB + external_id, sleep)
+    except ProviderUnavailable:
+        return None
     if hub.status_code != 200:
         return None
     try:

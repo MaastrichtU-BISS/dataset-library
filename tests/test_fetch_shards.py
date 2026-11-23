@@ -47,8 +47,24 @@ class FakeHuggingFace:
         self.no_revision = False  # the listing answers without X-Revision
         self.listing_revisions = []  # X-Revision answered instead of the recorded one, per listing call
         self.refs_commits = []  # convert commit answered instead of the recorded one, per refs call
-        self.tree_sizes = {}  # path in the build: size answered instead of the listed one
-        self.tree_status = 200
+        self.build_sizes = {}  # path in the build: size answered instead of the listed one
+        self.build_status = 200
+        self.build_missing = set()  # paths the pinned build does not have
+        self.head_failures = []  # statuses the Hub's dataset record answers before the real one
+
+    def post(self, url, data=None, timeout=None, **kwargs):
+        # paths-info at the pinned build, as the listings recorded its files.
+        assert url.startswith(parquet.HUB) and "/paths-info/" in url
+        self.hub_calls.append(url)
+        dataset = url.removeprefix(parquet.HUB).split("/paths-info/", 1)[0]
+        sizes = {
+            parquet._in_build(s["url"]): s["size"]
+            for key, recorded in LISTINGS.items() if key.startswith(dataset + "?")
+            for s in (recorded["body"].get("parquet_files") or [])
+        }
+        sizes.update(self.build_sizes)
+        body = [{"type": "file", "path": p, "size": sizes[p]} for p in data["paths"] if p in sizes and p not in self.build_missing]
+        return Response(self.build_status, body)
 
     def get(self, url, params=None, timeout=None, stream=False, **kwargs):
         if self.failures:
@@ -61,23 +77,6 @@ class FakeHuggingFace:
             return Response(recorded["status"], recorded["body"], headers=headers)
         if url.startswith(parquet.HUB):
             self.hub_calls.append(url)
-            if "/tree/" in url:
-                # The pinned build's folder, as the listings recorded its files.
-                dataset, rest = url.removeprefix(parquet.HUB).split("/tree/", 1)
-                folder = unquote(rest.split("/", 1)[1])
-                files = [
-                    parquet._in_build(s["url"])
-                    for key, recorded in LISTINGS.items() if key.startswith(dataset + "?")
-                    for s in (recorded["body"].get("parquet_files") or [])
-                ]
-                sizes = {
-                    parquet._in_build(s["url"]): s["size"]
-                    for key, recorded in LISTINGS.items() if key.startswith(dataset + "?")
-                    for s in (recorded["body"].get("parquet_files") or [])
-                }
-                sizes.update(self.tree_sizes)
-                body = [{"type": "file", "path": p, "size": sizes[p]} for p in files if p.rsplit("/", 1)[0] == folder]
-                return Response(self.tree_status, body)
             if url.endswith("/refs"):
                 dataset = url.removeprefix(parquet.HUB).removesuffix("/refs")
                 if self.refs_failures:
@@ -86,6 +85,8 @@ class FakeHuggingFace:
                 if self.refs_commits:
                     body = {**body, "converts": [{"name": "parquet", "ref": parquet.CONVERT, "targetCommit": self.refs_commits.pop(0)}]}
                 return Response(200, body)
+            if self.head_failures:
+                return Response(self.head_failures.pop(0), {"error": "busy"})
             recorded = HUB.get(url.removeprefix(parquet.HUB), {"status": 404, "body": {"error": "Repository not found"}})
             return Response(recorded["status"], recorded["body"])
         assert stream, "shards are streamed"
@@ -97,6 +98,7 @@ class FakeHuggingFace:
 def hf(monkeypatch):
     fake = FakeHuggingFace()
     monkeypatch.setattr(parquet.requests, "get", fake.get)
+    monkeypatch.setattr(parquet.requests, "post", fake.post)
     return fake
 
 
@@ -124,7 +126,7 @@ def test_the_import_records_the_revision_the_rows_were_read_from(hf, tmp_path):
 
     assert fetched.revision == "c23fdff1a6bf74e0e1a71cb86f1e781d37da888c"
     hub = "https://huggingface.co/api/datasets/coastalcph/lex_glue"
-    assert hf.hub_calls == [f"{hub}/refs", f"{hub}/refs", f"{hub}/tree/{LEX_CONVERSION}/ledgar/train", hub]
+    assert hf.hub_calls == [f"{hub}/refs", f"{hub}/refs", f"{hub}/paths-info/{LEX_CONVERSION}", hub]
     # The head is asked only to explain a refusal; the recorded revision is the conversion's.
     assert fetched.head == "c23fdff1a6bf74e0e1a71cb86f1e781d37da888c"
 
@@ -183,7 +185,7 @@ def test_a_conversion_rebuilt_while_the_listing_is_read_is_not_imported_yet(hf, 
 def test_a_listing_describing_another_build_than_the_pinned_one_is_not_imported_yet(hf, tmp_path):
     # A cached listing while the branch has moved on: the pinned build's file
     # is not the size the listing gave.
-    hf.tree_sizes = {"ledgar/train/0000.parquet": 1}
+    hf.build_sizes = {"ledgar/train/0000.parquet": 1}
 
     with pytest.raises(ProviderUnavailable) as waiting:
         fetch(tmp_path, "coastalcph/lex_glue", "ledgar", "train")
@@ -193,12 +195,42 @@ def test_a_listing_describing_another_build_than_the_pinned_one_is_not_imported_
 
 
 def test_a_pinned_build_the_hub_cannot_list_is_not_imported_yet(hf, tmp_path):
-    hf.tree_status = 404
+    hf.build_status = 404
 
     with pytest.raises(ProviderUnavailable):
         fetch(tmp_path, "coastalcph/lex_glue", "ledgar", "train")
 
     assert hf.downloads == []
+
+
+def test_a_shard_missing_from_the_pinned_build_is_not_imported_yet(hf, tmp_path):
+    # paths-info leaves out a path the build does not have.
+    hf.build_missing = {"ledgar/train/0000.parquet"}
+
+    with pytest.raises(ProviderUnavailable) as waiting:
+        fetch(tmp_path, "coastalcph/lex_glue", "ledgar", "train")
+
+    assert str(waiting.value) == parquet.REBUILDING
+    assert hf.downloads == []
+
+
+def test_a_hub_that_cannot_name_its_head_does_not_fail_the_fetch(hf, tmp_path):
+    # The head only explains a refusal; a busy Hub record gives None instead.
+    hf.head_failures = [503, 503, 503, 503]
+
+    fetched = fetch(tmp_path, "coastalcph/lex_glue", "ledgar", "train")
+
+    assert fetched.paths and fetched.head is None
+    assert fetched.revision == "c23fdff1a6bf74e0e1a71cb86f1e781d37da888c"
+
+
+def test_a_listing_with_no_revision_does_not_ask_for_the_head(hf, tmp_path):
+    hf.no_revision = True
+
+    fetched = fetch(tmp_path, "coastalcph/lex_glue", "ledgar", "train")
+
+    assert fetched.head is None
+    assert "https://huggingface.co/api/datasets/coastalcph/lex_glue" not in hf.hub_calls
 
 
 def test_a_convert_commit_that_is_not_a_revision_is_not_used(hf, tmp_path):
