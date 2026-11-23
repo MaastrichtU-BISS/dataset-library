@@ -24,7 +24,7 @@ While the version is 0.x, minor releases may contain breaking changes.
     helper, `imports.refusal_for`, which `_fetch` still uses after a fetch as a safety net for a
     host's own fetch, so the codes and messages cannot drift.
   - Copies (#121) pass no `expected_revision` and behave exactly as before.
-  - A refused import now always fails with its refusal. Before, one whose download then hit a
+  - With the built-in Hugging Face fetch, a refused import now always fails with its refusal. Before, one whose download then hit a
     `ProviderError` could fall back to a copy, or fail as `provider_busy`, without being refused.
 - **Seam change for hosts:** `fetch_shards` implementations and test fakes that a worker passes to
   `run_import` must now accept an extra keyword-only `expected_revision=None` (e.g. `def
