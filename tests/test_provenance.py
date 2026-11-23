@@ -226,7 +226,10 @@ def test_a_dataset_cited_only_in_its_readme_is_cited_from_that_bibtex(make_app, 
     }
 
 
-def test_an_import_whose_fetch_reports_no_revision_keeps_the_one_it_was_queued_at(make_app, tmp_path, cited_lex_glue):
+def test_an_import_that_cannot_know_its_revision_records_none(make_app, tmp_path, cited_lex_glue):
+    # The fetch's shards were read from a revision it could not name (#168):
+    # nothing is recorded, rather than the revision the import was queued at,
+    # which the rows did not come from.
     app = make_app(enqueue=lambda import_ref: None)
     started = queue_lex_glue(app)
     shard = write_shard(tmp_path / "0000.parquet", ["A clause", "Another"], [0, 1])
@@ -238,12 +241,12 @@ def test_an_import_whose_fetch_reports_no_revision_keeps_the_one_it_was_queued_a
         )
         record = app.db.session.get(LibraryImport, started["id"])
         assert record.status == "completed"
-        assert record.revision == SHA
-        assert record.citation["revision"] == SHA
+        assert record.revision is None
+        assert record.citation["revision"] is None
 
     body = app.test_client().get("/api/library/provenance/dataset-1", headers=ALICE).get_json()
-    assert body["revision"] == SHA
-    assert body["citation"]["revision"] == SHA
+    assert body["revision"] is None
+    assert body["citation"]["revision"] is None
 
 
 def test_an_import_made_before_citations_existed_has_none(app, tmp_path):

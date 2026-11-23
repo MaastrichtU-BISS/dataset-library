@@ -102,7 +102,9 @@ RECENT = timedelta(days=1)
 
 @dataclass
 class Fetched:
-    """Downloaded Parquet shards of one split, at the revision they were read from."""
+    """Downloaded Parquet shards of one split, at the revision they were read
+    from (#168): a Hub import records the conversion's source revision, a copy
+    its own, and None when neither can say which one the rows came from."""
 
     paths: list = field(default_factory=list)
     revision: str | None = None
@@ -598,8 +600,9 @@ def run_import(
             fetched, copy_updates = _fetch_community(session, record, seams, max_bytes, work), {}
         else:
             fetched, copy_updates = _fetch(session, record, fetch_shards, max_bytes, work, snapshot_dir)
-        # A fetch that reports no revision keeps the one the import was queued at (#120).
-        _advance(session, record, SAMPLING, {"revision": fetched.revision or record.revision, **copy_updates})
+        # The import records the revision its rows were read from, whatever the
+        # fetch could name; one that could not say records none (#120, #168).
+        _advance(session, record, SAMPLING, {"revision": fetched.revision, **copy_updates})
         rows, method, note = _sample(record, fetched.paths, random.Random(seed), open_parquet)
         _advance(session, record, VALIDATING, {"sample_method": method, "sample_note": note})
         _write_csv(path, record, rows)
@@ -639,7 +642,10 @@ def _fetch(session, record, fetch_shards, max_bytes, work, snapshot_dir):
 
     An import queued from a copy reads that copy. Otherwise Hugging Face is asked,
     and when it cannot be, a copy of the same part of the dataset stands in, at the
-    copy's revision; the import then says it came from the copy (#121)."""
+    copy's revision (#121). The fetch names the revision its rows were read from:
+    the converted files' source revision (#168). The import was queued at the
+    revision the student saw, so a conversion still at that revision imports; one
+    that lags behind it, or was rebuilt from a different commit, is refused."""
     if record.source == SNAPSHOT:
         copy = snapshots_module.reading(session, record.snapshot_id)
         if copy is None or snapshot_dir is None:

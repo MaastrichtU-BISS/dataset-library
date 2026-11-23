@@ -1,0 +1,51 @@
+{
+ "coastalcph/lex_glue": {
+  "status": 200,
+  "body": {
+   "tags": [],
+   "branches": [
+    {"name": "main", "ref": "refs/heads/main", "targetCommit": "c23fdff1a6bf74e0e1a71cb86f1e781d37da888c"},
+    {"name": "script", "ref": "refs/heads/script", "targetCommit": "ffaa9c42d045272139621689b58081b040d8a5a7"}
+   ],
+   "converts": [
+    {"name": "parquet", "ref": "refs/convert/parquet", "targetCommit": "823338615adfc9049aadc2841a9b2d2bd531363c"}
+   ]
+  }
+ },
+ "isaacus/open-australian-legal-corpus": {
+  "status": 200,
+  "body": {
+   "tags": [
+    {"name": "v1.0.0", "ref": "refs/tags/v1.0.0", "targetCommit": "16b798ca54630ad33c96d83a65cc018aee6bef08"}
+   ],
+   "branches": [
+    {"name": "main", "ref": "refs/heads/main", "targetCommit": "ef45e3fec41a960919a31149eee6dab9aa39f725"}
+   ],
+   "converts": [
+    {"name": "parquet", "ref": "refs/convert/parquet", "targetCommit": "ef6ae142f81f5c135978cde1fd0d7c9c4c765555"}
+   ]
+  }
+ },
+ "turhancan97/doppeldwarf-306": {
+  "status": 200,
+  "body": {
+   "tags": [],
+   "branches": [
+    {"name": "main", "ref": "refs/heads/main", "targetCommit": "f5a645c5f00fe5acfe939d15e00c2faa3cb85375"}
+   ],
+   "converts": [
+    {"name": "parquet", "ref": "refs/convert/parquet", "targetCommit": "ac78ba966b386ec617057c606445d435f36de67f"}
+   ]
+  }
+ },
+ "Agnuxo/P2PCLAW-Innovative-Benchmark": {
+  "status": 200,
+  "body": {
+   "tags": [],
+   "branches": [
+    {"name": "main", "ref": "refs/heads/main", "targetCommit": "2304d5b9def5403aa3f9c7ff0a59584583f45fbf"}
+   ],
+   "converts": []
+  }
+ }
+}

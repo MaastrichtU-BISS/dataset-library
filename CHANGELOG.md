@@ -8,6 +8,24 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-23
+
+### Fixed
+
+- An import records the revision its rows were read from (#168, BAIGLE #168). `fetch_shards` used to
+  record the Hub's current head (`GET /api/datasets/<id>`), while the shards came from the converted
+  Parquet on `refs/convert/parquet`, which can lag a new commit or be rebuilt mid-import; provenance
+  and the citation (#120) could then name a revision whose data was never read.
+  - The revision is now the listing's `X-Revision` header: the dataset commit the conversion was built
+    from. The queued-revision check in `_fetch` therefore refuses a lagging conversion as `changed`.
+  - Every shard is downloaded from the commit `refs/convert/parquet` points at (`GET
+    /api/datasets/<id>/refs`), not from the moving branch. The branch is read on both sides of a second
+    listing; a commit or source revision that moves in between, or a missing convert branch, means a
+    rebuild is under way, and the fetch raises `ProviderUnavailable` so the import is tried later.
+  - A listing that names no revision records none, and the import no longer falls back to the revision
+    it was queued at, which its rows may not have come from. Snapshot (#121) and Community (#122)
+    imports are unchanged.
+
 ## [0.13.0] - 2026-11-19
 
 ### Added

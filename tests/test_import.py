@@ -374,15 +374,49 @@ def test_a_finished_import_is_not_run_again(run, tmp_path, app):
     assert create.calls == []
 
 
-def test_a_dataset_changed_since_its_preview_is_not_imported_unseen(run, tmp_path):
+def test_a_conversion_that_lags_the_queued_revision_is_refused_as_changed(app, tmp_path):
+    # A conversion recorded while it lagged (turhancan97/doppeldwarf-306,
+    # 2026-11-23): the import was queued at the Hub's head, its rows would be
+    # read from the older commit the conversion was built from.
+    shard = write_shard(tmp_path / "0000.parquet", ["A clause", "Another"], [0, 1])
+    with app.app_context():
+        session = app.db.session
+        record = LibraryImport(
+            owner_id="alice", provider="huggingface", external_id="turhancan97/doppeldwarf-306",
+            config="classes", split="reference", revision="f5a645c5f00fe5acfe939d15e00c2faa3cb85375",
+            text_column="text", label_column="label", task_type="classification",
+            sample_size=2, max_rows=1000, name="Doppeldwarf", license="cc-by-4.0",
+            url="https://huggingface.co/datasets/turhancan97/doppeldwarf-306", status="queued",
+        )
+        session.add(record)
+        session.commit()
+        ref = record.id
+
+        def fetch_shards(external_id, config, split, max_bytes, dest_dir):
+            return imports.Fetched(paths=[str(shard)], revision="18d016c41417e9beb85fb83a94b4fbf866805cce")
+
+        imports.run_import(
+            ref, session=session, fetch_shards=fetch_shards,
+            create_dataset=FakeCreateDataset(), data_dir=str(tmp_path / "data"), seed=7,
+        )
+        found = session.get(LibraryImport, ref).to_dict()
+
+    assert found["status"] == "failed"
+    assert found["code"] == "changed"
+    assert found["error"] == "This dataset changed on Hugging Face after you opened it. Open it again to import the new version."
+    assert found["revision"] == "f5a645c5f00fe5acfe939d15e00c2faa3cb85375", "a refused import keeps the revision it was queued at"
+
+
+def test_an_import_of_a_caught_up_conversion_records_the_revision_its_rows_came_from(run, tmp_path):
+    # The conversion sits at the revision the import was queued at, so the import
+    # completes and records it — that revision, not the Hub's head at fetch time.
     shard = write_shard(tmp_path / "0000.parquet", ["A clause", "Another"], [0, 1])
 
-    result, create = run([shard], size=2, revision="seen-at-preview")
+    result, create = run([shard], size=2, revision="abc123")
 
-    assert result["status"] == "failed"
-    assert result["code"] == "changed"
-    assert result["error"] == "This dataset changed on Hugging Face after you opened it. Open it again to import the new version."
-    assert create.calls == []
+    assert result["status"] == "completed", result
+    assert result["revision"] == "abc123"
+    assert len(create.calls) == 1
 
 
 def test_an_import_erased_while_it_runs_stops_without_making_a_dataset(run, tmp_path):
