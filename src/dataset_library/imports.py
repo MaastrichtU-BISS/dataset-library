@@ -13,9 +13,11 @@ that lands first wins and no Dataset is made; one that lands after is refused.
 While it runs, the worker refreshes ``heartbeat_at``; ``sweep`` fails imports
 whose worker went quiet, and queued imports nothing picked up.
 
-The host supplies how shards are fetched (``fetch_shards``) and how a file
-becomes a Dataset (``create_dataset``, which raises ``ValueError`` with a
-student-readable message for every refusal).
+The host supplies how shards are fetched (``fetch_shards``, which takes the
+revision the import was queued at as the keyword ``expected_revision`` and
+refuses a conversion at another revision before it downloads anything (#174))
+and how a file becomes a Dataset (``create_dataset``, which raises
+``ValueError`` with a student-readable message for every refusal).
 """
 import csv
 import json
@@ -132,6 +134,21 @@ class Refused(Exception):
     def __init__(self, status, code, message):
         super().__init__(message)
         self.status, self.code, self.message = status, code, message
+
+
+def refusal_for(expected, revision, head):
+    """The ImportFailed refusing an import queued at `expected` whose fetch read
+    `revision`: `conversion_behind` when the Hub's head is still `expected` (the
+    conversion has not caught up with the dataset, so opening it again would not
+    help), `changed` when the dataset itself moved on. None when nothing refuses:
+    either could not name its revision, or both name the same one. Shared by
+    ``fetch_shards``, which raises it before any shard is downloaded (#174), and
+    by ``_fetch``, which checks what a host's own fetch returned."""
+    if not (expected and revision) or expected == revision:
+        return None
+    if head == expected:
+        return ImportFailed("conversion_behind", BEHIND)
+    return ImportFailed("changed", CHANGED)
 
 
 def _facts(host, provider, external_id, config, split, binding=None):
@@ -659,18 +676,20 @@ def _fetch(session, record, fetch_shards, max_bytes, work, snapshot_dir):
             raise ImportFailed("copy_gone", COPY_GONE)
         return _from_copy(snapshot_dir, copy), {}
     try:
-        fetched = fetch_shards(record.external_id, record.config, record.split, max_bytes, work)
+        fetched = fetch_shards(
+            record.external_id, record.config, record.split, max_bytes, work,
+            expected_revision=record.revision,
+        )
     except ProviderError:
         copy = snapshots_module.fallback_for(session, record, snapshot_dir)
         if copy is None:
             raise
         return _from_copy(snapshot_dir, copy), {"source": SNAPSHOT, "snapshot_id": copy.id, "revision": copy.revision}
-    if record.revision and fetched.revision and fetched.revision != record.revision:
-        # Still at the revision the student saw, so opening it again would not
-        # help: Hugging Face's conversion has not caught up with it.
-        if fetched.head == record.revision:
-            raise ImportFailed("conversion_behind", BEHIND)
-        raise ImportFailed("changed", CHANGED)
+    # A safety net for a host's own fetch: this one has already refused before
+    # it downloaded (#174).
+    refusal = refusal_for(record.revision, fetched.revision, fetched.head)
+    if refusal is not None:
+        raise refusal
     return fetched, {}
 
 

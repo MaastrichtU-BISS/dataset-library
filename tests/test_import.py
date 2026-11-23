@@ -127,7 +127,7 @@ def run(app, tmp_path):
            while_saving=None, heartbeat_seconds=None, snapshot_dir=None, **fields):
         create = FakeCreateDataset(refuse, while_saving and (lambda: while_saving(app)))
 
-        def fetch_shards(external_id, config, split, max_bytes, dest_dir):
+        def fetch_shards(external_id, config, split, max_bytes, dest_dir, **kwargs):
             create.fetched_with = (external_id, config, split, max_bytes)
             if while_fetching:
                 while_fetching(app.db.engine)
@@ -403,7 +403,7 @@ def test_a_conversion_at_another_revision_than_the_queued_one_is_refused(app, tm
         session.commit()
         ref = record.id
 
-        def fetch_shards(external_id, config, split, max_bytes, dest_dir):
+        def fetch_shards(external_id, config, split, max_bytes, dest_dir, **kwargs):
             return imports.Fetched(paths=[str(shard)], revision="18d016c41417e9beb85fb83a94b4fbf866805cce", head=head)
 
         imports.run_import(

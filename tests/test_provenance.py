@@ -50,7 +50,7 @@ def finish(app, tmp_path, import_ref):
     with app.app_context():
         imports.run_import(
             import_ref, session=app.db.session,
-            fetch_shards=lambda *_: imports.Fetched(paths=[str(shard)], revision=SHA),
+            fetch_shards=lambda *_args, **_kwargs: imports.Fetched(paths=[str(shard)], revision=SHA),
             create_dataset=FakeCreateDataset(), data_dir=str(tmp_path / "data"), seed=7,
         )
     return app.test_client().get("/api/library/provenance/dataset-1", headers=ALICE).get_json()
@@ -71,7 +71,7 @@ def complete(app, tmp_path, *, license, license_ack_at=None, balance=False):
         session.add(record)
         session.commit()
 
-        def fetch_shards(external_id, config, split, max_bytes, dest_dir):
+        def fetch_shards(external_id, config, split, max_bytes, dest_dir, **kwargs):
             return imports.Fetched(paths=[str(shard)], revision="abc123")
 
         imports.run_import(
@@ -236,7 +236,7 @@ def test_an_import_that_cannot_know_its_revision_records_none(make_app, tmp_path
     with app.app_context():
         imports.run_import(
             started["id"], session=app.db.session,
-            fetch_shards=lambda *_: imports.Fetched(paths=[str(shard)], revision=None),
+            fetch_shards=lambda *_args, **_kwargs: imports.Fetched(paths=[str(shard)], revision=None),
             create_dataset=FakeCreateDataset(), data_dir=str(tmp_path / "data"), seed=7,
         )
         record = app.db.session.get(LibraryImport, started["id"])

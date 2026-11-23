@@ -140,7 +140,7 @@ def test_a_running_import_beats_while_it_downloads(make_app, tmp_path):
     shard = write_shard(tmp_path / "0000.parquet", ["A clause", "Another"], [0, 1])
     beats = []
 
-    def slow_fetch(external_id, config, split, max_bytes, dest_dir):
+    def slow_fetch(external_id, config, split, max_bytes, dest_dir, **kwargs):
         with app.db.engine.connect() as connection:
             first = connection.execute(sa.text("SELECT heartbeat_at FROM library_imports")).scalar_one()
         time.sleep(0.3)
