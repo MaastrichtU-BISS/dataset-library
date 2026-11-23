@@ -9,7 +9,9 @@ current head. Every shard is then downloaded from the commit the Hub's
 listing and the download cannot mix two builds' files, and one rebuilt while
 the listing is read is not imported until it settles. Only huggingface.co and
 datasets-server.huggingface.co are called. 429 and 5xx are retried three times
-with backoff, then the provider is unavailable."""
+with backoff, then the provider is unavailable. An import queued at another
+revision is refused, with the same refusal ``imports`` makes, before any shard
+is downloaded (``expected_revision``, #174)."""
 import os
 import re
 import time
@@ -18,7 +20,7 @@ from urllib.parse import unquote
 import requests
 
 from ..errors import ProviderUnavailable
-from ..imports import Fetched, ImportFailed
+from ..imports import Fetched, ImportFailed, refusal_for
 
 LISTING = "https://datasets-server.huggingface.co/parquet"
 HUB = "https://huggingface.co/api/datasets/"
@@ -63,7 +65,7 @@ def _ask(method, url, sleep, **kwargs):
     raise ProviderUnavailable(f"Hugging Face {error} after {RETRIES} retries")
 
 
-def fetch_shards(external_id, config, split, max_bytes, dest_dir, *, sleep=time.sleep):
+def fetch_shards(external_id, config, split, max_bytes, dest_dir, *, expected_revision=None, sleep=time.sleep):
     listing = _get(LISTING, sleep, params={"dataset": external_id, "config": config})
     if listing.status_code != 200:
         raise ImportFailed(
@@ -98,6 +100,11 @@ def fetch_shards(external_id, config, split, max_bytes, dest_dir, *, sleep=time.
     # describes another build.
     _check_build(external_id, commit, chosen, sleep)
     head = _head(external_id, sleep) if revision else None
+    # An import queued at another revision is refused before any shard is
+    # downloaded (#174), with the refusal `imports` makes after a fetch.
+    refusal = refusal_for(expected_revision, revision, head)
+    if refusal is not None:
+        raise refusal
 
     os.makedirs(dest_dir, exist_ok=True)
     paths = []

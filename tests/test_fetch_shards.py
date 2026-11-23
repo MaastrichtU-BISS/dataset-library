@@ -6,7 +6,7 @@ from urllib.parse import unquote
 import pytest
 
 from dataset_library.errors import ProviderUnavailable
-from dataset_library.imports import ImportFailed
+from dataset_library.imports import BEHIND, CHANGED, ImportFailed
 from dataset_library.providers import parquet
 
 LISTINGS = json.loads((pathlib.Path(__file__).parent / "fixtures" / "parquet" / "listings.json").read_text())
@@ -102,11 +102,17 @@ def hf(monkeypatch):
     return fake
 
 
-def fetch(tmp_path, dataset, config, split, max_bytes=200 * MB):
-    return parquet.fetch_shards(dataset, config, split, max_bytes, str(tmp_path / "work"), sleep=lambda s: None)
+def fetch(tmp_path, dataset, config, split, max_bytes=200 * MB, expected_revision=None):
+    return parquet.fetch_shards(
+        dataset, config, split, max_bytes, str(tmp_path / "work"),
+        expected_revision=expected_revision, sleep=lambda s: None,
+    )
 
 
 LEX_CONVERSION = "823338615adfc9049aadc2841a9b2d2bd531363c"
+DWARF = "turhancan97/doppeldwarf-306"
+DWARF_LISTED = "18d016c41417e9beb85fb83a94b4fbf866805cce"
+DWARF_HEAD = "f5a645c5f00fe5acfe939d15e00c2faa3cb85375"
 
 
 def test_the_chosen_splits_shards_are_downloaded_from_the_converts_commit(hf, tmp_path):
@@ -135,11 +141,51 @@ def test_a_conversion_that_lags_the_queued_revision_records_its_own(hf, tmp_path
     # turhancan97/doppeldwarf-306 was recorded while its conversion still sat at
     # 18d016c4: the Hub's head was already f5a645c5, and the convert branch tip
     # was ac78ba96 (checked live on 2026-11-23).
-    fetched = fetch(tmp_path, "turhancan97/doppeldwarf-306", "classes", "reference")
+    fetched = fetch(tmp_path, DWARF, "classes", "reference")
 
-    assert fetched.revision == "18d016c41417e9beb85fb83a94b4fbf866805cce"
-    assert fetched.revision != "f5a645c5f00fe5acfe939d15e00c2faa3cb85375"
-    assert hf.downloads == ["https://huggingface.co/datasets/turhancan97/doppeldwarf-306/resolve/ac78ba966b386ec617057c606445d435f36de67f/classes/reference/0000.parquet"]
+    assert fetched.revision == DWARF_LISTED
+    assert fetched.revision != DWARF_HEAD
+    assert fetched.head == DWARF_HEAD
+    assert hf.downloads == [f"https://huggingface.co/datasets/{DWARF}/resolve/ac78ba966b386ec617057c606445d435f36de67f/classes/reference/0000.parquet"]
+
+
+def test_an_import_queued_at_the_datasets_head_downloads_no_shards(hf, tmp_path):
+    # The conversion still sits at 18d016c4 while the Hub's head is f5a645c5, the
+    # revision the import was queued at: opening the dataset again would not help
+    # until the conversion catches up, and no shard is downloaded for the refusal (#174).
+    with pytest.raises(ImportFailed) as refused:
+        fetch(tmp_path, DWARF, "classes", "reference", expected_revision=DWARF_HEAD)
+
+    assert refused.value.code == "conversion_behind"
+    assert refused.value.message == BEHIND
+    assert hf.downloads == []
+
+
+def test_an_import_queued_at_another_revision_than_conversion_and_head_downloads_no_shards(hf, tmp_path):
+    # The dataset moved on after the import was queued at a revision neither the
+    # conversion nor the Hub's head is at: opening it again shows the new version (#174).
+    with pytest.raises(ImportFailed) as refused:
+        fetch(tmp_path, DWARF, "classes", "reference", expected_revision="a" * 40)
+
+    assert refused.value.code == "changed"
+    assert refused.value.message == CHANGED
+    assert hf.downloads == []
+
+
+def test_an_import_queued_at_the_conversion_s_revision_downloads(hf, tmp_path):
+    fetched = fetch(tmp_path, DWARF, "classes", "reference", expected_revision=DWARF_LISTED)
+
+    assert fetched.revision == DWARF_LISTED
+    assert len(hf.downloads) == 1
+
+
+def test_a_copy_with_no_expected_revision_downloads_even_when_the_conversion_lags(hf, tmp_path):
+    # Copies pass no expected revision: a conversion at another revision still
+    # downloads, as it did before the refusal existed (#174).
+    fetched = fetch(tmp_path, DWARF, "classes", "reference")
+
+    assert fetched.revision == DWARF_LISTED
+    assert len(hf.downloads) == 1
 
 
 def test_a_listing_that_names_no_revision_records_none(hf, tmp_path):
@@ -293,3 +339,43 @@ def test_429_and_5xx_are_retried_three_times_then_hugging_face_is_busy(hf, tmp_p
     hf.failures = [503, 503, 503, 503]
     with pytest.raises(ProviderUnavailable):
         fetch(tmp_path, "coastalcph/lex_glue", "ledgar", "train")
+
+
+def test_an_import_refused_for_its_revision_downloads_nothing_and_uses_no_copy(app, hf, tmp_path, monkeypatch):
+    # Through run_import with the real fetch: the queued revision reaches
+    # fetch_shards, which refuses before any download (#174), and the refusal is
+    # not a ProviderError, so no copy stands in for it.
+    from dataset_library import imports, snapshots
+    from dataset_library.models import LibraryImport
+
+    def no_copy(*args, **kwargs):
+        raise AssertionError("a refusal must not fall back to a copy")
+
+    monkeypatch.setattr(snapshots, "fallback_for", no_copy)
+
+    def real_fetch(external_id, config, split, max_bytes, dest_dir, **kwargs):
+        return parquet.fetch_shards(external_id, config, split, max_bytes, dest_dir, sleep=lambda s: None, **kwargs)
+
+    with app.app_context():
+        session = app.db.session
+        record = LibraryImport(
+            owner_id="alice", provider="huggingface", external_id=DWARF,
+            config="classes", split="reference", revision=DWARF_HEAD,
+            text_column="text", label_column="label", task_type="classification",
+            sample_size=2, max_rows=1000, name="Doppeldwarf", license="cc-by-4.0",
+            url=f"https://huggingface.co/datasets/{DWARF}", status="queued",
+        )
+        session.add(record)
+        session.commit()
+        ref = record.id
+
+        imports.run_import(
+            ref, session=session, fetch_shards=real_fetch,
+            create_dataset=lambda *args, **kwargs: pytest.fail("no Dataset is made"),
+            data_dir=str(tmp_path / "data"), seed=7,
+        )
+        found = session.get(LibraryImport, ref).to_dict()
+
+    assert (found["status"], found["code"], found["error"]) == ("failed", "conversion_behind", imports.BEHIND)
+    assert found["revision"] == DWARF_HEAD
+    assert hf.downloads == []

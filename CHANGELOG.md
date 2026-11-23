@@ -8,6 +8,29 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-23
+
+### Fixed
+
+- An import whose conversion is at another revision than the one it was queued at is now refused
+  before any shard is downloaded (#174, BAIGLE #174). `fetch_shards` knew the conversion's source
+  revision (`X-Revision`) and the Hub's head before its first download, but `_fetch` compared them
+  with the queued revision only after the fetch returned, so a refused import downloaded up to its
+  byte cap (200 MB by default) on every try and threw the shards away — the `conversion_behind`
+  message asks the student to try again later, so this repeated.
+  - `fetch_shards` takes the queued revision as the keyword `expected_revision` and raises the same
+    refusal once the revision and head are known: `conversion_behind` when the Hub's head is still
+    the queued revision, `changed` when the dataset moved on. The refusal is decided by one shared
+    helper, `imports.refusal_for`, which `_fetch` still uses after a fetch as a safety net for a
+    host's own fetch, so the codes and messages cannot drift.
+  - Copies (#121) pass no `expected_revision` and behave exactly as before.
+  - With the built-in Hugging Face fetch, a refused import now always fails with its refusal. Before, one whose download then hit a
+    `ProviderError` could fall back to a copy, or fail as `provider_busy`, without being refused.
+- **Seam change for hosts:** `fetch_shards` implementations and test fakes that a worker passes to
+  `run_import` must now accept an extra keyword-only `expected_revision=None` (e.g. `def
+  fetch_shards(external_id, config, split, max_bytes, dest_dir, **kwargs)`); it is None for a copy.
+- `dataset_library.__version__` is 0.15.0.
+
 ## [0.14.0] - 2026-11-23
 
 ### Fixed
