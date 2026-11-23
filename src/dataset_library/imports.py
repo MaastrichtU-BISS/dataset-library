@@ -62,6 +62,10 @@ COMMUNITY_NOT_OFFERED = "Importing from Zenodo is not set up on this platform."
 NOT_STARTED = "Import could not start. Try again."
 STOPPED = "Import stopped. Try again."
 CHANGED = "This dataset changed on Hugging Face after you opened it. Open it again to import the new version."
+BEHIND = (
+    "Hugging Face hasn't converted this dataset's latest version yet, so it can't be imported now. "
+    "Try again later."
+)
 COPY_GONE = "This dataset's copy is no longer kept here, so it cannot be imported. Try again in a few minutes."
 # Shown when a balanced import falls back to a random one (#115).
 LABEL_MISSING = "The label column was missing, so this is a random sample instead of a balanced one."
@@ -108,6 +112,9 @@ class Fetched:
 
     paths: list = field(default_factory=list)
     revision: str | None = None
+    # The dataset's current commit on the Hub, when the fetch asked: it is never
+    # recorded, only used to say why a conversion at another revision is refused.
+    head: str | None = None
 
 
 class ImportFailed(Exception):
@@ -659,6 +666,10 @@ def _fetch(session, record, fetch_shards, max_bytes, work, snapshot_dir):
             raise
         return _from_copy(snapshot_dir, copy), {"source": SNAPSHOT, "snapshot_id": copy.id, "revision": copy.revision}
     if record.revision and fetched.revision and fetched.revision != record.revision:
+        # Still at the revision the student saw, so opening it again would not
+        # help: Hugging Face's conversion has not caught up with it.
+        if fetched.head == record.revision:
+            raise ImportFailed("conversion_behind", BEHIND)
         raise ImportFailed("changed", CHANGED)
     return fetched, {}
 

@@ -229,7 +229,7 @@ def test_a_dataset_cited_only_in_its_readme_is_cited_from_that_bibtex(make_app, 
 def test_an_import_that_cannot_know_its_revision_records_none(make_app, tmp_path, cited_lex_glue):
     # The fetch's shards were read from a revision it could not name (#168):
     # nothing is recorded, rather than the revision the import was queued at,
-    # which the rows did not come from.
+    # which the rows may not have come from.
     app = make_app(enqueue=lambda import_ref: None)
     started = queue_lex_glue(app)
     shard = write_shard(tmp_path / "0000.parquet", ["A clause", "Another"], [0, 1])

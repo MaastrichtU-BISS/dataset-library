@@ -13,6 +13,7 @@ with backoff, then the provider is unavailable."""
 import os
 import re
 import time
+from urllib.parse import quote, unquote
 
 import requests
 
@@ -33,6 +34,7 @@ RETRIES = 3
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 CHUNK = 1 << 20
 REBUILDING = "Hugging Face is rebuilding this dataset's converted files"
+UNPINNABLE = "Hugging Face listed a file we cannot pin to one build of this dataset"
 # A dataset revision as the Hub names one (providers/huggingface keeps the same).
 REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
@@ -83,6 +85,11 @@ def fetch_shards(external_id, config, split, max_bytes, dest_dir, *, sleep=time.
     again = _get(LISTING, sleep, params={"dataset": external_id, "config": config})
     if again.status_code != 200 or _source_revision(again) != revision or _convert_commit(external_id, sleep) != commit:
         raise ProviderUnavailable(REBUILDING)
+    # The listing can be cached while the branch has moved on: every chosen file
+    # must be in the pinned build at the size the listing gives, or the listing
+    # describes another build.
+    _check_build(external_id, commit, chosen, sleep)
+    head = _head(external_id, sleep)
 
     os.makedirs(dest_dir, exist_ok=True)
     paths = []
@@ -90,7 +97,7 @@ def fetch_shards(external_id, config, split, max_bytes, dest_dir, *, sleep=time.
         path = os.path.join(dest_dir, f"{n:05}.parquet")
         _download(_pinned(shard["url"], commit), path, shard["size"], sleep)
         paths.append(path)
-    return Fetched(paths=paths, revision=revision)
+    return Fetched(paths=paths, revision=revision, head=head)
 
 
 def _source_revision(listing):
@@ -109,14 +116,58 @@ def _convert_commit(external_id, sleep):
     if refs.status_code != 200:
         raise ProviderUnavailable(f"Hugging Face answered {refs.status_code} for the convert branch")
     try:
-        return next(c["targetCommit"] for c in refs.json().get("converts") or [] if c.get("ref") == CONVERT)
+        commit = next(c["targetCommit"] for c in refs.json().get("converts") or [] if c.get("ref") == CONVERT)
     except (StopIteration, AttributeError, KeyError, TypeError, ValueError) as broken:
         raise ProviderUnavailable(REBUILDING) from broken
+    if not (isinstance(commit, str) and REVISION_PATTERN.match(commit)):
+        raise ProviderUnavailable(REBUILDING)
+    return commit
+
+
+def _check_build(external_id, commit, chosen, sleep):
+    """Every chosen shard is in the build at `commit`, at the size the listing
+    gave; otherwise the listing describes a different build (#168)."""
+    sizes = {}
+    for folder in dict.fromkeys(_in_build(shard["url"]).rsplit("/", 1)[0] for shard in chosen):
+        tree = _get(f"{HUB}{external_id}/tree/{commit}/{quote(folder)}", sleep)
+        if tree.status_code != 200:
+            raise ProviderUnavailable(REBUILDING)
+        try:
+            sizes.update({entry["path"]: entry["size"] for entry in tree.json() if entry.get("type") == "file"})
+        except (AttributeError, KeyError, TypeError, ValueError) as broken:
+            raise ProviderUnavailable(REBUILDING) from broken
+    if any(sizes.get(_in_build(shard["url"])) != shard["size"] for shard in chosen):
+        raise ProviderUnavailable(REBUILDING)
+
+
+def _head(external_id, sleep):
+    """The dataset's current commit, only to tell a conversion that lags it from
+    a dataset that changed after it was opened. Never recorded as read."""
+    hub = _get(HUB + external_id, sleep)
+    if hub.status_code != 200:
+        return None
+    try:
+        sha = hub.json().get("sha")
+    except (AttributeError, ValueError):
+        return None
+    return sha if isinstance(sha, str) and REVISION_PATTERN.match(sha) else None
+
+
+def _in_build(url):
+    """A shard's path inside the converted build, from its listed URL."""
+    marker = f"/resolve/{ENCODED_CONVERT}/"
+    if marker not in url:
+        raise ProviderUnavailable(UNPINNABLE)
+    return unquote(url.split(marker, 1)[1])
 
 
 def _pinned(url, commit):
-    """The shard's URL at `commit`, not at the branch the conversion moves on."""
-    return url.replace(f"/resolve/{ENCODED_CONVERT}/", f"/resolve/{commit}/")
+    """The shard's URL at `commit`, not at the branch the conversion moves on.
+    A URL that does not name the branch cannot be pinned, so it is refused."""
+    marker = f"/resolve/{ENCODED_CONVERT}/"
+    if marker not in url:
+        raise ProviderUnavailable(UNPINNABLE)
+    return url.replace(marker, f"/resolve/{commit}/", 1)
 
 
 def _download(url, path, expected, sleep):

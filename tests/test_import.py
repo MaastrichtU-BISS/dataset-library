@@ -374,7 +374,18 @@ def test_a_finished_import_is_not_run_again(run, tmp_path, app):
     assert create.calls == []
 
 
-def test_a_conversion_that_lags_the_queued_revision_is_refused_as_changed(app, tmp_path):
+@pytest.mark.parametrize(
+    "head, code, message",
+    [
+        # Still at the revision the student saw: the conversion has not caught up.
+        ("f5a645c5f00fe5acfe939d15e00c2faa3cb85375", "conversion_behind", imports.BEHIND),
+        # Moved on since it was opened: opening it again shows the new version.
+        ("2" * 40, "changed", imports.CHANGED),
+        # The head could not be asked: the dataset may have changed.
+        (None, "changed", imports.CHANGED),
+    ],
+)
+def test_a_conversion_at_another_revision_than_the_queued_one_is_refused(app, tmp_path, head, code, message):
     # A conversion recorded while it lagged (turhancan97/doppeldwarf-306,
     # 2026-11-23): the import was queued at the Hub's head, its rows would be
     # read from the older commit the conversion was built from.
@@ -393,7 +404,7 @@ def test_a_conversion_that_lags_the_queued_revision_is_refused_as_changed(app, t
         ref = record.id
 
         def fetch_shards(external_id, config, split, max_bytes, dest_dir):
-            return imports.Fetched(paths=[str(shard)], revision="18d016c41417e9beb85fb83a94b4fbf866805cce")
+            return imports.Fetched(paths=[str(shard)], revision="18d016c41417e9beb85fb83a94b4fbf866805cce", head=head)
 
         imports.run_import(
             ref, session=session, fetch_shards=fetch_shards,
@@ -402,8 +413,8 @@ def test_a_conversion_that_lags_the_queued_revision_is_refused_as_changed(app, t
         found = session.get(LibraryImport, ref).to_dict()
 
     assert found["status"] == "failed"
-    assert found["code"] == "changed"
-    assert found["error"] == "This dataset changed on Hugging Face after you opened it. Open it again to import the new version."
+    assert found["code"] == code
+    assert found["error"] == message
     assert found["revision"] == "f5a645c5f00fe5acfe939d15e00c2faa3cb85375", "a refused import keeps the revision it was queued at"
 
 
