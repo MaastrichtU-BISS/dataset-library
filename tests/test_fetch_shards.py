@@ -339,3 +339,43 @@ def test_429_and_5xx_are_retried_three_times_then_hugging_face_is_busy(hf, tmp_p
     hf.failures = [503, 503, 503, 503]
     with pytest.raises(ProviderUnavailable):
         fetch(tmp_path, "coastalcph/lex_glue", "ledgar", "train")
+
+
+def test_an_import_refused_for_its_revision_downloads_nothing_and_uses_no_copy(app, hf, tmp_path, monkeypatch):
+    # Through run_import with the real fetch: the queued revision reaches
+    # fetch_shards, which refuses before any download (#174), and the refusal is
+    # not a ProviderError, so no copy stands in for it.
+    from dataset_library import imports, snapshots
+    from dataset_library.models import LibraryImport
+
+    def no_copy(*args, **kwargs):
+        raise AssertionError("a refusal must not fall back to a copy")
+
+    monkeypatch.setattr(snapshots, "fallback_for", no_copy)
+
+    def real_fetch(external_id, config, split, max_bytes, dest_dir, **kwargs):
+        return parquet.fetch_shards(external_id, config, split, max_bytes, dest_dir, sleep=lambda s: None, **kwargs)
+
+    with app.app_context():
+        session = app.db.session
+        record = LibraryImport(
+            owner_id="alice", provider="huggingface", external_id=DWARF,
+            config="classes", split="reference", revision=DWARF_HEAD,
+            text_column="text", label_column="label", task_type="classification",
+            sample_size=2, max_rows=1000, name="Doppeldwarf", license="cc-by-4.0",
+            url=f"https://huggingface.co/datasets/{DWARF}", status="queued",
+        )
+        session.add(record)
+        session.commit()
+        ref = record.id
+
+        imports.run_import(
+            ref, session=session, fetch_shards=real_fetch,
+            create_dataset=lambda *args, **kwargs: pytest.fail("no Dataset is made"),
+            data_dir=str(tmp_path / "data"), seed=7,
+        )
+        found = session.get(LibraryImport, ref).to_dict()
+
+    assert (found["status"], found["code"], found["error"]) == ("failed", "conversion_behind", imports.BEHIND)
+    assert found["revision"] == DWARF_HEAD
+    assert hf.downloads == []
