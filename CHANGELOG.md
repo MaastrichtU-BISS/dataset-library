@@ -8,6 +8,36 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-23
+
+### Fixed
+
+- An import records the revision its rows were read from (#168, BAIGLE #168). `fetch_shards` used to
+  record the Hub's current head (`GET /api/datasets/<id>`), while the shards came from the converted
+  Parquet on `refs/convert/parquet`, which can lag a new commit or be rebuilt mid-import; provenance
+  and the citation (#120) could then name a revision whose data was never read.
+  - The revision is now the listing's `X-Revision` header: the dataset commit the conversion was built
+    from. The queued-revision check in `_fetch` therefore catches a conversion at another revision.
+    When the Hub's head is still the queued revision, the conversion has not caught up, and the import
+    fails as `conversion_behind` ("Hugging Face hasn't converted this dataset's latest version yet…
+    Try again later."), not as `changed`, whose "open it again" would never help. `Fetched.head`
+    carries that head: it is never recorded, asked only when the listing names a revision, and a Hub
+    that cannot answer gives None rather than failing the fetch.
+  - Every shard is downloaded from the commit `refs/convert/parquet` points at (`GET
+    /api/datasets/<id>/refs`), not from the moving branch. The branch is read on both sides of a second
+    listing, and every chosen shard must be in the pinned build at the listed size (one `POST
+    /api/datasets/<id>/paths-info/<commit>` for exactly those files, so no paging), which catches a
+    listing cached while the branch moved.
+    A commit or source revision that moves, a size that differs, a missing or malformed convert commit,
+    or a shard URL that does not name the convert branch raises `ProviderUnavailable`; the import fails
+    as `provider_busy` (unless a copy stands in) and can be retried.
+  - A listing that names no revision records none, and the import no longer falls back to the revision
+    it was queued at, which its rows may not have come from. Community (#122) imports are unchanged.
+  - Copies (#121) use the same fetch, so a copy now records the conversion's source revision rather
+    than the Hub's head, fails as `no_revision` when the listing names none, and fails as
+    `provider_busy` during a rebuild.
+- `dataset_library.__version__` is 0.14.0.
+
 ## [0.13.0] - 2026-11-19
 
 ### Added

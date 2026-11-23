@@ -62,6 +62,10 @@ COMMUNITY_NOT_OFFERED = "Importing from Zenodo is not set up on this platform."
 NOT_STARTED = "Import could not start. Try again."
 STOPPED = "Import stopped. Try again."
 CHANGED = "This dataset changed on Hugging Face after you opened it. Open it again to import the new version."
+BEHIND = (
+    "Hugging Face hasn't converted this dataset's latest version yet, so it can't be imported now. "
+    "Try again later."
+)
 COPY_GONE = "This dataset's copy is no longer kept here, so it cannot be imported. Try again in a few minutes."
 # Shown when a balanced import falls back to a random one (#115).
 LABEL_MISSING = "The label column was missing, so this is a random sample instead of a balanced one."
@@ -102,10 +106,15 @@ RECENT = timedelta(days=1)
 
 @dataclass
 class Fetched:
-    """Downloaded Parquet shards of one split, at the revision they were read from."""
+    """Downloaded Parquet shards of one split, at the revision they were read
+    from (#168): a Hub import records the conversion's source revision, a copy
+    its own, and None when neither can say which one the rows came from."""
 
     paths: list = field(default_factory=list)
     revision: str | None = None
+    # The dataset's current commit on the Hub, when the fetch asked: it is never
+    # recorded, only used to say why a conversion at another revision is refused.
+    head: str | None = None
 
 
 class ImportFailed(Exception):
@@ -598,8 +607,9 @@ def run_import(
             fetched, copy_updates = _fetch_community(session, record, seams, max_bytes, work), {}
         else:
             fetched, copy_updates = _fetch(session, record, fetch_shards, max_bytes, work, snapshot_dir)
-        # A fetch that reports no revision keeps the one the import was queued at (#120).
-        _advance(session, record, SAMPLING, {"revision": fetched.revision or record.revision, **copy_updates})
+        # The import records the revision its rows were read from, whatever the
+        # fetch could name; one that could not say records none (#120, #168).
+        _advance(session, record, SAMPLING, {"revision": fetched.revision, **copy_updates})
         rows, method, note = _sample(record, fetched.paths, random.Random(seed), open_parquet)
         _advance(session, record, VALIDATING, {"sample_method": method, "sample_note": note})
         _write_csv(path, record, rows)
@@ -639,7 +649,10 @@ def _fetch(session, record, fetch_shards, max_bytes, work, snapshot_dir):
 
     An import queued from a copy reads that copy. Otherwise Hugging Face is asked,
     and when it cannot be, a copy of the same part of the dataset stands in, at the
-    copy's revision; the import then says it came from the copy (#121)."""
+    copy's revision (#121). The fetch names the revision its rows were read from:
+    the converted files' source revision (#168). The import was queued at the
+    revision the student saw, so a conversion still at that revision imports; one
+    that lags behind it, or was rebuilt from a different commit, is refused."""
     if record.source == SNAPSHOT:
         copy = snapshots_module.reading(session, record.snapshot_id)
         if copy is None or snapshot_dir is None:
@@ -653,6 +666,10 @@ def _fetch(session, record, fetch_shards, max_bytes, work, snapshot_dir):
             raise
         return _from_copy(snapshot_dir, copy), {"source": SNAPSHOT, "snapshot_id": copy.id, "revision": copy.revision}
     if record.revision and fetched.revision and fetched.revision != record.revision:
+        # Still at the revision the student saw, so opening it again would not
+        # help: Hugging Face's conversion has not caught up with it.
+        if fetched.head == record.revision:
+            raise ImportFailed("conversion_behind", BEHIND)
         raise ImportFailed("changed", CHANGED)
     return fetched, {}
 

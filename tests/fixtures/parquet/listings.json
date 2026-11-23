@@ -1,6 +1,7 @@
 {
  "coastalcph/lex_glue?config=ledgar": {
   "status": 200,
+  "headers": {"X-Revision": "c23fdff1a6bf74e0e1a71cb86f1e781d37da888c"},
   "body": {
    "parquet_files": [
     {
@@ -33,6 +34,7 @@
  },
  "isaacus/open-australian-legal-corpus?config=corpus": {
   "status": 200,
+  "headers": {"X-Revision": "ef45e3fec41a960919a31149eee6dab9aa39f725"},
   "body": {
    "parquet_files": [
     {
@@ -123,6 +125,23 @@
   "status": 501,
   "body": {
    "error": "The dataset viewer doesn't support this dataset because it runs arbitrary python code."
+  }
+ },
+ "turhancan97/doppeldwarf-306?config=classes": {
+  "status": 200,
+  "headers": {"X-Revision": "18d016c41417e9beb85fb83a94b4fbf866805cce"},
+  "body": {
+   "parquet_files": [
+    {
+     "dataset": "turhancan97/doppeldwarf-306",
+     "config": "classes",
+     "split": "reference",
+     "url": "https://huggingface.co/datasets/turhancan97/doppeldwarf-306/resolve/refs%2Fconvert%2Fparquet/classes/reference/0000.parquet",
+     "filename": "0000.parquet",
+     "size": 47606
+    }
+   ],
+   "partial": false
   }
  }
 }
