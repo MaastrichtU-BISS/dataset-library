@@ -19,23 +19,47 @@ While the version is 0.x, minor releases may contain breaking changes.
   - `fetch_shards` now reads each chosen shard's footer with HTTP range requests (the last 8 bytes,
     then the footer), and then only the row groups that fit under the cap, taken one shard at a time
     and spread across each shard, so a sample is not just the head of shard 0. Up to 16 shards,
-    spread across the split, are read from. Footers and row groups both count against the cap.
-  - What was read is written as one local Parquet file per shard, with the shard's schema and its
-    `huggingface` metadata, so `Fetched.paths`, imports, label balance and copies (#121) read it as
-    before.
-  - `too_large` is raised only when not even one row group, with the footers read, fits under the
-    cap; its message is now `parquet.TOO_LARGE` ("Too large to sample here: even one block of rows
-    in this dataset is over the download limit."). Retrying cannot help, so a host should not offer
-    Try again for `too_large`.
-  - A server that answers a range request with the whole file (200) is closed before its body is
-    read, and one that sends another range or more bytes than asked is cut off; both raise
-    `ProviderUnavailable` (`parquet.NO_RANGES`, `parquet.WRONG_RANGE`). A shard whose footer cannot
-    be read raises `ProviderUnavailable` (`parquet.NOT_PARQUET`). The old "bigger than Hugging Face
-    said" `too_large` is gone with whole-shard downloads.
+    spread across the split, are read from. Footers and row groups both count against the cap, and
+    no byte is read twice. While fewer than two shards have rows, one shard does not take the room
+    another shard's cheapest row group needs, so uneven row groups still give a sample from two.
+  - `fetch_shards` takes an optional keyword `max_rows`, the rows an import keeps. With it, the
+    reading stops once it has `parquet.row_target(max_rows)` rows, `max(3 * max_rows, max_rows +
+    1000)`, headroom for the random and stratified samplers and for rows without text, instead of
+    filling the byte cap. `imports` passes the import's sample size only to a `fetch_shards` that
+    accepts the keyword, so a host's own fetch without it keeps working. Copies pass none and fill
+    the byte cap as before.
+  - What was read is written as one local Parquet file per shard, with the shard's schema (nested
+    field names included, such as a list item named `custom`) and its `huggingface` metadata, so
+    `Fetched.paths`, imports, label balance and copies (#121) read it as before. Each file is written
+    under a temporary name and moved into place only when whole; a fetch that fails leaves no file.
+  - Empty row groups are skipped. A split with no rows at all is refused as `not_importable`.
+  - Files that parquet-mr 1.2.8 and older wrote are read with the 100 bytes pyarrow reads past each
+    column chunk (PARQUET-816), and those bytes count against the cap.
+  - `too_large` is raised only when no row group of any shard whose footer was read fits under the
+    cap; a shard whose footer or row groups do not fit is skipped and later shards are still read.
+    Its message is now `parquet.TOO_LARGE` ("Too large to sample here: even one block of rows in this
+    dataset is over the download limit."). Retrying cannot help, so a host should not offer Try
+    again for `too_large`.
+  - Ranges are asked for with `Accept-Encoding: identity`. A server that answers a range request
+    with the whole file (200) is closed before its body is read (`parquet.NO_RANGES`). A 206 must
+    name the range asked of a file of the size the build check confirmed (or `*`) in its
+    `Content-Range`, and any `Content-Length` must be the range's; otherwise it is refused before
+    its body is read. A body is read at most one byte past the range, and one longer or shorter than
+    the range is refused (`parquet.WRONG_RANGE`). A connection lost while a body is read raises
+    `ProviderUnavailable` (`parquet.CUT_OFF`). All of these are `ProviderUnavailable`, so an import
+    still falls back to a copy (#121).
+  - A shard that is not a Parquet file we can read (a bad trailer, a footer of length 0, row groups
+    outside the file's data, pages that cannot be decoded) raises `errors.NotParquet`, a
+    `ProviderUnavailable` with the message `parquet.NOT_PARQUET`. An import refuses it as
+    `not_importable` with that message rather than calling Hugging Face busy, as asking again
+    cannot help, and reads no copy for it. An error writing the local files (a full disk) is raised
+    as it is, so a copy still reports `storage_full` or `write_failed`. The old "bigger than Hugging
+    Face said" `too_large` is gone with whole-shard downloads.
   - #168 and #174 are kept: every range is read from the shard URL pinned to the convert commit, the
     build check covers every shard whose footer is read, and a refusal for the revision comes before
     any byte of a shard, footers included.
-- `fetch_shards`'s signature and `Fetched` are unchanged; hosts need no code change.
+- `fetch_shards` gains only the optional keyword `max_rows`, and `Fetched` is unchanged; hosts need
+  no code change.
 - `dataset_library.__version__` is 0.17.0.
 
 ## [0.15.0] - 2026-11-23
