@@ -73,6 +73,7 @@ class FakeAdapter(requests.adapters.BaseAdapter):
         self.fake = fake
 
     def send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
+        self.fake.__dict__.setdefault("sent", []).append({"url": request.url, "stream": stream, "timeout": timeout, "verify": verify, "proxies": dict(proxies or {})})
         answered = self.fake.serve(request.url, dict(request.headers))
         response = requests.Response()
         response.status_code, response.reason = answered.status_code, "fake"
@@ -1755,3 +1756,53 @@ def test_an_import_that_reads_bytes_never_fetched_fails_as_unexpected_and_logs_i
     assert create.calls == []
     logged = [r for r in caplog.records if r.getMessage().startswith("library.import.error")]
     assert logged and logged[0].exc_info[0] is RangeNotFetched
+
+
+def test_a_late_dear_footer_never_costs_the_sample_its_second_shard(hf, tmp_path):
+    # Three small shards (one group each) and a fourth whose footer is dear and whose groups cost as much. Once two
+    # footers have fitting groups, a further footer must leave room for two shards' groups, not one.
+    T = 12000
+    small = [parquet_shard(s, groups=1, rows_per_group=1, text_bytes=T) for s in range(3)]
+    G = max(max(measured(d)[1]) for d in small)
+    n = 40
+    while True:
+        big = parquet_shard(3, groups=n, rows_per_group=1, text_bytes=T)
+        F = measured(big)[0] - 8
+        if F >= 0.6 * G:
+            break
+        n += 20
+    f = [measured(d)[0] - 8 for d in small]
+    cap = 4 * 8 + sum(f) + F + int(1.5 * G)
+    assert cap - 32 - sum(f) >= 2 * G  # without the dear footer, two shards' groups fit
+    hf.add_dataset(FINE, "default", "train", small + [big])
+
+    fetched = fetch(tmp_path, FINE, "default", "train", max_bytes=cap)
+
+    assert len(shards_read(fetched.paths)) >= 2
+    assert hf.served <= cap
+
+
+def test_each_range_goes_to_the_adapter_with_a_timeout_the_proxies_and_certificates_of_its_host(fine, tmp_path, monkeypatch):
+    bundle = tmp_path / "ca.pem"
+    bundle.write_text("not a real bundle: the fake adapter never opens it")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:3128")
+    monkeypatch.setenv("NO_PROXY", "cdn.example")
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(bundle))
+    fine.redirects = 1
+
+    assert fetch(tmp_path / "out", FINE, "default", "train", max_bytes=SCALED_CAP).paths
+
+    assert fine.sent
+    assert all(s["stream"] and s["timeout"] and s["verify"] == str(bundle) for s in fine.sent)
+    hub = [s for s in fine.sent if not s["url"].startswith("https://cdn.example/")]
+    cdn = [s for s in fine.sent if s["url"].startswith("https://cdn.example/")]
+    assert hub and cdn
+    assert all(s["proxies"].get("https") == "http://proxy.example:3128" for s in hub)
+    assert all(not s["proxies"].get("https") for s in cdn)  # NO_PROXY holds per host
+
+
+def test_a_listed_shard_that_is_not_https_is_never_asked_for(fine, tmp_path):
+    fine.redirects = 0
+    with pytest.raises(ProviderUnavailable):
+        parquet._open_range(requests.Session(), "http://huggingface.co/x.parquet", {"Range": "bytes=0-7"}, lambda s: None)
+    assert not getattr(fine, "sent", [])

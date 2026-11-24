@@ -81,6 +81,10 @@ While the version is 0.x, minor releases may contain breaking changes.
 - `fetch_shards` gains only the optional keyword `max_rows`, and `Fetched` is unchanged; hosts need
   no code change.
 - `dataset_library.__version__` is 0.17.0.
+- Once two shards' footers have row groups that fit, a further footer is read only if it still leaves room
+  for both shards' cheapest groups, so a late, dear footer never costs the sample its second shard.
+- A listed shard URL that is not https is refused before it is asked for, so every range is read over https
+  from the first hop. A range read to its stated length hands its connection back to the pool.
 
 ## [0.15.0] - 2026-11-23
 

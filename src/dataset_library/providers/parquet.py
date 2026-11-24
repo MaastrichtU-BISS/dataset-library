@@ -23,8 +23,9 @@ conversion was built from (#168), so the import records what its rows were read
 from, not the Hub's current head. Every range is read from the commit the Hub's
 ``refs/convert/parquet`` branch points at, so a conversion rebuilt between the
 listing and the read cannot mix two builds' files, and one rebuilt while the
-listing is read is not imported until it settles. Only huggingface.co and
-datasets-server.huggingface.co are called. 429 and 5xx are retried three times
+listing is read is not imported until it settles. Only huggingface.co,
+datasets-server.huggingface.co and the https hosts the Hub redirects a range
+to (its CDN) are called. 429 and 5xx are retried three times
 with backoff, then the provider is unavailable. An import queued at another
 revision is refused, with the same refusal ``imports`` makes, before any byte
 of a shard is read, footers included (``expected_revision``, #174)."""
@@ -339,8 +340,7 @@ def _read_footers(session, urls, sizes, budget, sleep):
     footers = {}
     trailers.sort(key=lambda t: t[:2])
     for k, (length, n, url, size, trailer) in enumerate(trailers):
-        cheapest = min((c for f in footers.values() for c in f.costs() if c <= budget.left), default=1)
-        if length > budget.left - cheapest:
+        if length > budget.left - _reserve(footers.values(), budget):
             skipped += len(trailers) - k
             break
         data_end = size - TRAILER - length
@@ -351,6 +351,17 @@ def _read_footers(session, urls, sizes, budget, sleep):
             raise NotParquet(NOT_PARQUET) from broken
         footers[n] = _Footer(url, size, metadata, data_end, footer + trailer)
     return [footers[n] for n in sorted(footers)], skipped
+
+
+def _reserve(footers, budget):
+    """The room a further footer must leave. Before any row group that fits is
+    known, any room at all. Once one shard has one, its cheapest; once two
+    shards have, the two cheapest shards' cheapest together, so a footer read
+    late never costs the sample its second shard."""
+    cheapest = sorted(
+        min(fitting) for fitting in ([c for c in f.costs() if c <= budget.left] for f in footers) if fitting
+    )
+    return sum(cheapest[:2]) if cheapest else 1
 
 
 def _group_range(group, data_end):
@@ -630,6 +641,7 @@ def _stream_range(session, url, start, end, size, sink, sleep, spare=0):
     lost while reading is Hugging Face being unavailable; an error from `sink`
     (a disk that is full) is its own."""
     want = end - start
+    reusable = False
     response = _open_range(session, url, {"Range": f"bytes={start}-{end - 1}", "Accept-Encoding": "identity"}, sleep)
     try:
         if response.status_code == 200:
@@ -659,8 +671,17 @@ def _stream_range(session, url, start, end, size, sink, sleep, spare=0):
             got += len(chunk)
         if got != want:
             raise ProviderUnavailable(WRONG_RANGE)
+        # A body read to its stated length leaves the connection reusable: hand it
+        # back to the pool, so the next range does not open a new TLS connection.
+        reusable = length is not None and hasattr(response.raw, "release_conn")
+    except BaseException:
+        reusable = False
+        raise
     finally:
-        response.close()
+        if reusable:
+            response.raw.release_conn()
+        else:
+            response.close()
 
 
 def _open_range(session, url, headers, sleep):
@@ -671,6 +692,8 @@ def _open_range(session, url, headers, sleep):
     reads a redirect's body even with ``allow_redirects=False``, to make
     `Response.next`, and the Hub answers a pinned resolve/ URL with a redirect
     to its CDN."""
+    if urlsplit(url).scheme != "https":
+        raise ProviderUnavailable(BAD_REDIRECT)
     for _ in range(MAX_REDIRECTS + 1):
         response = _ask(_sender(session, headers), url, sleep)
         if response.status_code not in REDIRECTS:
