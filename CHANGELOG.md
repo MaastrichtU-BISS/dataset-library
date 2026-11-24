@@ -8,6 +8,50 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-24
+
+### Added
+
+- Legal Data Hunter entries (BAIGLE #126, decisions L1–L15). See the README's "Legal Data Hunter
+  entries" for the routes and shapes.
+  - Host seam: `init_dataset_library(legal_data_hunter_key=)` and `run_import(legal_data_hunter_key=)`,
+    `legal_data_hunter_key(owner_id) -> str | None`. The package never stores, logs or returns a key.
+    Without the seam, Legal Data Hunter is not offered.
+  - Admin routes under `/api/library/admin/legal-data-hunter/`: `preview` (search with the admin's own
+    key: query, corpus, country, source, date range), and `entries` (create, list, get, update,
+    `refresh`, delete). An entry keeps its query and at most 100 frozen document ids; Refresh reruns the
+    query and replaces them, and imports keep the ids they copied.
+  - Entries are featured cards (`GET /featured` → `legalDataHunter`, `GET /legal-data-hunter/entries`,
+    `GET /datasets/legal_data_hunter/<ref>`) labelled "Legal Data Hunter", with `documentCount` and
+    `creditCost` ("uses 100 of your Legal Data Hunter credits"). Without a key, Import is disabled with
+    "Needs your Legal Data Hunter key — add it in Settings".
+  - Importing (`POST /imports` with `provider: "legal_data_hunter"`) always needs `licenseAck: true`; its
+    time is the provenance's `licenseAckAt`. The worker fetches each document through
+    `GET /v1/documents/{country}/{source}?source_id=` with the student's key, writes one unlabelled row
+    per document (`text, court, date, country, language, ecli, eli, source_url, text_truncated`), and counts
+    documents with no text (`skipped`) and documents gone (`missing`).
+  - Out of credits (429): the import fails as `out_of_credits` with "Fetched N of M — your Legal Data
+    Hunter credits ran out. Try again when they reset." and `resumeAfter`; the documents it fetched are
+    kept, and Try again fetches only the rest.
+  - The license table has "Legal Data Hunter terms" (`legal-data-hunter-terms`, new group "Provider
+    terms"): Warn or Hide, never Allow. Every license dict now carries `levels`, the levels an admin may
+    choose.
+  - Provenance carries `publishable` and `publishRefusal` for every import, and `legalDataHunter` for an
+    entry's. `legal_data_hunter.publish_refusal(session, dataset_ref, model=)` gives the host the reason to
+    refuse publishing a dataset built from Legal Data Hunter, or a model trained on one, to Zenodo.
+  - Only `https://legaldatahunter.com` is called; a redirect to another host is refused. Tests use
+    recorded responses (`tests/fake_legal_data_hunter.py`), never the live API.
+- Migration `dl_0010_legal_data_hunter`: tables `library_ldh_entries` and `library_ldh_documents`, and
+  `library_imports.documents`, `skipped`, `missing`, `resume_after`.
+- `legal_data_hunter.erase(session, owner_id)` for a host erasing a user; `imports.sweep` also deletes
+  fetched documents no import will resume from.
+
+### Changed
+
+- `GET /featured` answers `{"featured": [...], "legalDataHunter": [...]}`; `GET /options` and `GET
+  /admin/settings` carry `legalDataHunter`.
+- `dataset_library.__version__` is 0.16.0.
+
 ## [0.15.0] - 2026-11-23
 
 ### Fixed
