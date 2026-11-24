@@ -17,9 +17,10 @@
   "legislation": {
     "query": "data protection",
     "hits": [
-      {"source": "eurlex", "source_id": "32016R0679", "score": 0.95, "title": "Regulation (EU) 2016/679 (General Data Protection Regulation)", "snippet": "on the protection of natural persons with regard to the processing of personal data…", "url": "https://eur-lex.europa.eu/eli/reg/2016/679/oj", "country": "EU", "date": "2016-04-27", "jurisdiction": "EU", "language": "en"}
+      {"source": "eurlex", "source_id": "32016R0679", "score": 0.95, "title": "Regulation (EU) 2016/679 (General Data Protection Regulation)", "snippet": "on the protection of natural persons with regard to the processing of personal data…", "url": "https://eur-lex.europa.eu/eli/reg/2016/679/oj", "country": "EU", "date": "2016-04-27", "jurisdiction": "EU", "language": "en"},
+      {"source": "CoE/conventions", "source_id": "ETS-108", "score": 0.81, "title": "Convention for the Protection of Individuals with regard to Automatic Processing of Personal Data", "snippet": "to secure in the territory of each Party for every individual…", "url": "https://www.coe.int/en/web/conventions/full-list?module=treaty-detail&treatynum=108", "country": "CoE", "date": "1981-01-28", "jurisdiction": "CoE", "language": "en"}
     ],
-    "total_hits": 1,
+    "total_hits": 2,
     "alpha": 0.9,
     "namespace": "legislation",
     "elapsed_ms": 230

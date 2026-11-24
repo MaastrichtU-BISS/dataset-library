@@ -42,5 +42,14 @@
     "date": "2016-04-27", "country": "EU", "language": "en",
     "document_type": "regulation", "authority": "European Parliament and Council", "status": "in_force",
     "identifier": "2016/679", "eli_uri": "http://data.europa.eu/eli/reg/2016/679/oj", "meta": {}
+  },
+  "CoE/conventions/ETS-108": {
+    "source": "CoE/conventions", "source_id": "ETS-108", "data_type": "legislation",
+    "title": "Convention for the Protection of Individuals with regard to Automatic Processing of Personal Data",
+    "text": "Article 1. The purpose of this Convention is to secure in the territory of each Party for every individual respect for his rights and fundamental freedoms.",
+    "url": "https://www.coe.int/en/web/conventions/full-list?module=treaty-detail&treatynum=108",
+    "date": "1981-01-28", "country": "CoE", "language": "en",
+    "document_type": "treaty", "authority": "Council of Europe", "status": "in_force",
+    "identifier": "ETS No. 108", "meta": {}
   }
 }

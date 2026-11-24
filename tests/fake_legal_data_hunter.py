@@ -3,7 +3,8 @@
 The answers have the shapes legaldatahunter.com/docs gives for `POST /v1/search`, `GET /v1/documents/...` and a
 429 (checked 2026-11-24). No test reaches the network: the provider's `requests.request` is replaced by `FakeLegalDataHunter`.
 A test changes what Legal Data Hunter says by setting `credits` (calls left before a 429), `keys` (the keys it
-accepts), `redirects` (path -> Location), `gone` (document paths it answers 404 for) or `busy`."""
+accepts), `redirects` (path -> Location), `gone` (document paths it answers 404 for), `rejected` (document paths ->
+400 or 422) or `busy`. The key is read as `requests` would send it: from the `auth=` the provider passes."""
 import copy
 import json
 import pathlib
@@ -29,6 +30,18 @@ class Response:
             raise ValueError("not JSON")
         return self._body
 
+    @property
+    def content(self):
+        body = self._body if isinstance(self._body, str) else json.dumps(self._body)
+        return (body or "").encode("utf-8")
+
+
+class _Prepared:
+    """What an `auth=` sees of a request: its headers."""
+
+    def __init__(self, headers):
+        self.headers = dict(headers or {})
+
 
 class FakeLegalDataHunter:
     def __init__(self):
@@ -37,12 +50,17 @@ class FakeLegalDataHunter:
         self.retry_after = "3600"
         self.redirects = {}  # path -> Location header
         self.gone = set()  # "country/source/source_id" answered 404
+        self.rejected = {}  # "country/source/source_id" -> 400 or 422
         self.busy = False
         self.minute_limited = 0  # requests answered with a per-minute 429 before the next one goes through
+        self.minute_retry_after = "7"  # the per-minute 429's Retry-After
         self.calls = []  # {method, url, path, params, json, key}
 
-    def request(self, method, url, params=None, json=None, headers=None, timeout=None, allow_redirects=True, **kwargs):
-        auth = (headers or {}).get("Authorization", "")
+    def request(self, method, url, params=None, json=None, headers=None, timeout=None, allow_redirects=True, auth=None, **kwargs):
+        prepared = _Prepared(headers)
+        if auth is not None:
+            auth(prepared)
+        auth = prepared.headers.get("Authorization", "")
         parts = urlsplit(url)
         # A redirect's Location carries its query in the URL, not in `params`.
         params = {**dict(parse_qsl(parts.query)), **dict(params or {})}
@@ -65,7 +83,7 @@ class FakeLegalDataHunter:
             return Response(429, {
                 "type": "error",
                 "error": {"type": "rate_limit_error", "message": "Per-minute limit reached", "limit_type": "minute", "plan": "free"},
-            }, {"Retry-After": "7"})
+            }, {"Retry-After": self.minute_retry_after})
         if self.credits is not None:
             if self.credits <= 0:
                 return Response(429, {
@@ -84,6 +102,8 @@ class FakeLegalDataHunter:
         if method == "GET" and parts.path.startswith("/v1/documents/"):
             country, source = [unquote(part) for part in parts.path.removeprefix("/v1/documents/").split("/")]
             key = f"{country}/{source}/{(params or {}).get('source_id')}"
+            if key in self.rejected:
+                return Response(self.rejected[key], {"detail": "Invalid source_id"})
             if key in self.gone or key not in DOCUMENTS:
                 return Response(404, {"detail": "Document not found in any table"})
             return Response(200, copy.deepcopy(DOCUMENTS[key]))
