@@ -143,9 +143,13 @@ never stores, logs or returns a key. Without the seam, Legal Data Hunter is not 
 that raises is read as no key (only the exception's type is logged), so no page breaks. In the
 worker the same holds: a seam that raises fails the import as `needs_key`, which Try again resumes
 from, and only the exception's type is logged. The key
-goes out through `requests`' `auth=`, so a `.netrc` entry for the host cannot replace it. Only
-`https://legaldatahunter.com` is called: redirects are followed by hand, only on that
-origin, and one to any other host is refused before anything is sent there.
+goes out through `requests`' `auth=`, applied to every hop the provider prepares, so a `.netrc`
+entry for the host cannot replace it. Only `https://legaldatahunter.com` is called: redirects are
+followed by hand, one hop at a time, only on that origin, and one to any other host is refused
+before anything is sent there. Each hop is prepared by a `requests.Session` and handed straight
+to its transport adapter (with the environment's proxies and CA bundle), never through
+`Session.send`, which reads a redirect's body even when it does not follow it: a redirect's body
+is never read, only its `Location`, and the response is closed.
 
 Its terms forbid storing full text or training models unless the user's plan allows it, and
 the free plan does not. So:
@@ -159,8 +163,11 @@ the free plan does not. So:
   other way is read as Warn. Every license now carries `levels`, the levels an admin may choose.
   Hide takes the entries out of the library, fails queued imports, and deletes the documents
   every import not running fetched (no Try again may resume while the terms are hidden). A
-  running import checks the terms before it writes each document and once more before it saves
-  the dataset: under Hide it fails as `license_hidden` and discards what it fetched. While the
+  running import checks the terms before each request to Legal Data Hunter (a repeat after a
+  per-minute wait too) and before it writes each document, and its move to saving requires, in
+  the same statement, that the terms are not Hide, reading the policy row there: a Hide that
+  commits first wins. Under Hide it fails as `license_hidden`, makes no Dataset and discards what
+  it fetched. While the
   terms are Hide, `imports.sweep` deletes the documents of every import not running, whatever
   its failure.
   `GET /options` leaves the terms out of the student's license filter, and no Hugging Face
@@ -188,12 +195,16 @@ annotation dataset (it has no label). A document with no text is skipped (`skipp
 Legal Data Hunter no longer has (404) or refuses as malformed (400, 422) too (`missing`); both
 are counted on the import and in provenance. An import fetches at most the row cap's worth of
 documents, and its documents' responses together may not pass the worker's download cap (the
-`max_bytes` it passes to `run_import`, under the admin's cap). Each response body is read
-streamed, and reading stops within one chunk of what is left of the cap; the bytes each
-document's response measured (`nbytes`, also for one with no text or one gone) are kept with
-it, and a resumed import starts its total from them. An import that would pass the cap fails as
-`too_large`, keeping the documents fetched before it, and records the cap it stopped under
-(`failed_cap`). Try again resumes past them once an admin has raised the download limit; until
+`max_bytes` it passes to `run_import`, under the admin's cap). Only the bodies an import keeps or
+counts (200, and the 404, 400 and 422 of a missing document) are read against the cap: streamed,
+and reading stops within one chunk of what is left of it. A 429's or a 5xx's body is read only
+to say why, at most 8 KB, never counted and never `too_large`, so a 429 near the cap is still out
+of credits (or a per-minute wait) and a 5xx is still `provider_busy`. The bytes each document's
+response measured (`nbytes`, also for one with no text or one gone) are kept with it, and a
+resumed import starts its total from them; one whose kept documents already pass the cap (it was
+lowered since) fails as `too_large` before it fetches anything. An import that would pass the
+cap fails as `too_large`, keeping the documents fetched before it, and records the cap it
+stopped under (`failed_cap`). Try again resumes past them once an admin has raised the download limit; until
 then it is refused with 409 `cap_unchanged` ("This import stopped at the platform's download
 limit, so trying again now would stop at the same place. An admin has to raise the download
 limit first."), without calling Legal Data Hunter. The worker's `max_bytes` should be the
@@ -205,22 +216,38 @@ Each document is kept as it is fetched (`library_ldh_documents`). A 429 for Lega
 per-minute cap (`limit_type: "minute"`, on every plan) is waited out (its `Retry-After`, at least a
 second and at most a minute), up to three times in a row, and the same document is asked for again;
 if it does not lift, the import fails as `provider_busy`. A `Retry-After` is read as ASCII digits or
-an HTTP date, and never as more than 31 days; more than ten digits is read as 31 days without
-being parsed. When
+an HTTP date, and never as more than 31 days; leading zeros are dropped (`00000000007` is seven
+seconds), then more than ten digits is read as 31 days without being parsed. When
 the credits run out (a 429 for the day or the period) the import fails with code `out_of_credits` and "Fetched N of M — your Legal Data Hunter
 credits ran out. Try again when they reset.", and `resumeAfter` from `Retry-After`. Such a pause
 stays on the student's list (`GET /imports`), and resumable, until a week after it paused or a
 day after its credits reset, whichever is later; any other failure Try again resumes from stays
-listed for the week its documents are kept. Try again (`/imports/<ref>/retry`) moves the
+listed for the week its documents are kept. The failures Try again resumes from
+(`imports.RESUMABLE`) are `out_of_credits`, `provider_busy`, `bad_key`, `needs_key`, `too_large`,
+the sweep's `stopped` and `not_started` (a queued retry nothing picked up holds the documents it
+took over), and `unexpected`; none of them once the import reached saving (`saved_path` or
+`dataset_ref` set), which is neither listed nor kept for Try again. Try again (`/imports/<ref>/retry`) moves the
 fetched documents to the new import, which fetches only the rest, from the ids the first import
 was started with, all of them, even when the entry has since been deleted or the row cap
 lowered. It is refused with 409 `already_running` while another import of the same entry runs,
-and with 409 `not_retryable` once the import was put away. A retry claims the paused import
-(puts it away, with one conditional update from not put away) in the same transaction that
-inserts the new import and moves the documents, so of two retries of one import exactly one
-starts and the other gets 409 `not_retryable`. When the queue refuses the new import, one commit
+and with 409 `not_retryable` once the import was put away. Once the import reached saving it is
+refused with 409 `already_saved` ("This import was saving its dataset when it stopped. Look for
+it in My datasets before importing again."): its Dataset may exist, or be being made. A retry
+claims the paused import (puts it away, with one conditional update from not put away and not
+saved) in the same transaction that inserts the new import and moves the documents, so of two
+retries of one import exactly one starts and the other gets 409 `not_retryable`, and a save
+committed between the first check and the claim still wins (`already_saved`). When the queue refuses the new import, one commit
 fails it as `not_started` and puts it away, moves the documents back to the paused import and
 takes the paused import out of put away, so a sweep in between finds nothing to delete.
+
+The CSV's path is committed as `staging_path` before the file is written, and the move to saving
+copies it to `saved_path` (and requires it still staged). A file with `staging_path` set and
+`saved_path` null was never handed to the host, so the package deletes it: for an import the
+sweep fails, one put away or cancelled (`discard`), one whose documents `imports.sweep` purges,
+and every import of a user in `legal_data_hunter.erase`. Each is claimed first (`staging_path`
+set to null, committed), so the worker can no longer save with it. A file with `saved_path` set
+is never deleted by the package: it may be the host's Dataset's, which the host deletes with the
+user's Datasets.
 
 At most one import of an entry per owner is queued or running: such an import holds
 `active_key` (`"<owner>:<entry>"`), which has a unique index, and every move to completed,
@@ -233,14 +260,15 @@ not put away (`INSERT … SELECT … WHERE EXISTS`), so a document that arrives 
 cancelled, put away or erased, even between the worker's last check and its write, is never
 written.
 
-Fetched documents are kept only for a failure Try again resumes from (`out_of_credits`,
-`provider_busy`, `bad_key`, `needs_key`, `too_large`, and `stopped`, the sweep's code for an
-import whose worker went quiet, as on a restart), for as long as above. They are deleted when the import
+Fetched documents are kept only for a failure Try again resumes from (`imports.RESUMABLE`, above;
+`stopped` is the sweep's code for an import whose worker went quiet, as on a restart) of an import
+that never reached saving, for as long as above. They are deleted when the import
 completes (best effort: a failed delete leaves them to the sweep, never the dataset's file), is
 cancelled or put away, or fails any other way, and `imports.sweep` deletes any left over. A host
-erasing a user calls `legal_data_hunter.erase(session, owner_id)`, before or after deleting the
-user's imports: it deletes the documents of that user's imports and any whose import is gone,
-and sets `created_by` to null on the entries the user made (entries are course data and stay).
+erasing a user calls `legal_data_hunter.erase(session, owner_id)` **before** deleting the user's
+imports (it finds their unsaved CSVs from them): it deletes those CSVs, the documents of that
+user's imports and any whose import is gone, and sets `created_by` to null on the entries the
+user made (entries are course data and stay).
 
 ### Legal Data Hunter routes
 

@@ -41,8 +41,9 @@ While the version is 0.x, minor releases may contain breaking changes.
     a day after the credits reset, whichever is later. Try again is refused with 409 `already_running`
     while another import of the entry runs, and with 409 `not_retryable` once the import was put away.
   - Fetched documents are kept only for a failure Try again resumes from (`out_of_credits`,
-    `provider_busy`, `bad_key`, `needs_key`, `too_large`, and the sweep's `stopped`), and every such
-    failure stays on the student's list while they are kept; a cancel, another failure, completion, Put away, or an
+    `provider_busy`, `bad_key`, `needs_key`, `too_large`, the sweep's `stopped` and `not_started`, and
+    `unexpected`) of an import that never reached saving (`saved_path` and `dataset_ref` null), and every
+    such failure stays on the student's list while they are kept; a cancel, another failure, completion, Put away, or an
     admin setting the terms to Hide deletes them. A document answered after a cancel, Put away or
     erasure is never written.
   - The license table has "Legal Data Hunter terms" (`legal-data-hunter-terms`, new group "Provider
@@ -55,34 +56,44 @@ While the version is 0.x, minor releases may contain breaking changes.
     before `create_dataset` is called, and records the Dataset's ref the moment it returns; the refusal
     matches any import by either, whatever its status. `publishable` covers a provider's terms only, not
     licenses.
-  - The key is sent through `requests`' `auth=`, so a `.netrc` entry cannot replace it; a key seam that
-    raises is read as no key (in the worker: the import fails as `needs_key`, resumable), and only the
-    exception's type is logged. A `Retry-After` is ASCII digits or a date, at most 31 days; more than ten
-    digits is read as 31 days unparsed. A search's `corpus` is case law only when missing or null.
-  - Each document's response is read streamed and stops within one chunk of what is left of the download
-    cap; its measured bytes are kept (`nbytes`), and a resumed import counts from them. A `too_large`
+  - The key is sent through `requests`' `auth=` on every hop, so a `.netrc` entry cannot replace it; a key
+    seam that raises is read as no key (in the worker: the import fails as `needs_key`, resumable), and only
+    the exception's type is logged. A `Retry-After` is ASCII digits or a date, at most 31 days; leading
+    zeros are dropped, then more than ten digits is read as 31 days unparsed. A search's `corpus` is case law only when missing or null.
+  - Each document's response (200, or a 404, 400 or 422) is read streamed and stops within one chunk of what
+    is left of the download cap; its measured bytes are kept (`nbytes`), and a resumed import counts from
+    them, failing as `too_large` before fetching anything when they already pass a lowered cap. A 429's or
+    a 5xx's body is read at most 8 KB, never counted and never `too_large`. A `too_large`
     import records the cap it stopped under (`failed_cap`), and Try again is refused with 409
     `cap_unchanged` until the cap is higher.
-  - Try again is refused with 409 `already_saved` for an import that stopped after its Dataset was made
-    (now that `stopped` is resumable), so it never makes a second Dataset.
+  - Try again is refused with 409 `already_saved` ("This import was saving its dataset when it stopped.
+    Look for it in My datasets before importing again.") once the import reached saving (`saved_path` or
+    `dataset_ref` set), so it never makes a second Dataset. The retry's claim requires it in the same
+    statement, so a save committed between the first check and the claim still wins.
   - At most one import of an entry per owner is queued or running (`active_key`, unique; null once it
     ends): a start that races another gets 409 `already_running`. Try again claims the paused import in
     the transaction that creates the new one (of two retries one starts, the other gets 409
     `not_retryable`), and a queue refusal restores the paused import and its documents in one commit.
   - A document is written by one conditional statement, only while its import runs and is not put away.
-    A running import stops as `license_hidden`, discarding what it fetched, once the terms are Hide, and
-    the sweep deletes every non-running import's documents while they are. Once `create_dataset`
+    A running import stops as `license_hidden`, discarding what it fetched, once the terms are Hide: it
+    checks before every request (a repeat after a per-minute wait too), and its move to saving requires the
+    terms not Hide in the same statement, so a Hide committed first means no Dataset. The sweep deletes
+    every non-running import's documents while they are. Once `create_dataset`
     returns, nothing removes the CSV (any import).
   - Only `https://legaldatahunter.com` is called; a redirect to another host, or one with no
-    `Location`, is refused. Tests use
+    `Location`, is refused. Each hop is prepared by a `requests.Session` and sent through its transport
+    adapter, never `Session.send`, so a redirect's body is never read: only its `Location`.
+  - The CSV's path is committed as `staging_path` before the file is written. A CSV never handed to the
+    host (`saved_path` null) is deleted by the sweep (for the import it fails), `discard` and the purge
+    (for imports whose documents go), and `erase`; one with `saved_path` set never is. Tests use
     recorded responses (`tests/fake_legal_data_hunter.py`), never the live API.
 - Migration `dl_0010_legal_data_hunter`: tables `library_ldh_entries` and `library_ldh_documents` (with
   `nbytes`, nullable integer), and `library_imports.documents`, `skipped`, `missing`, `resume_after`,
-  `saved_path` (string 1000), `failed_cap` (big integer) and `active_key` (string 300, unique index
+  `saved_path` and `staging_path` (string 1000), `failed_cap` (big integer) and `active_key` (string 300, unique index
   `ix_library_imports_active_key`), all nullable.
-- `legal_data_hunter.erase(session, owner_id)` for a host erasing a user, before or after it deletes the
-  user's imports: it also deletes documents whose import is gone, and sets the user's entries'
-  `created_by` to null. `imports.sweep` also deletes fetched documents no import will resume from.
+- `legal_data_hunter.erase(session, owner_id)` for a host erasing a user, before it deletes the user's
+  imports (so the CSVs they never handed over are found and deleted): it also deletes documents whose
+  import is gone, and sets the user's entries' `created_by` to null. `imports.sweep` also deletes fetched documents no import will resume from.
 
 ### Changed
 
