@@ -293,6 +293,31 @@ def test_a_range_read_fetch_that_cannot_write_its_files_fails_the_copy_as_a_writ
     assert (copy["status"], copy["error_code"]) == ("failed", code), copy
 
 
+def test_a_copy_of_a_shard_that_is_not_parquet_is_refused_not_busy(client, app, snapshot_dir, monkeypatch):
+    # #178: asking again cannot help, so the copy says its rows cannot be read
+    # rather than that Hugging Face is busy.
+    from dataset_library.providers import parquet
+    from test_fetch_shards import FakeHuggingFace
+
+    pinned = pin_as_admin(client)
+    copy = copy_row(app, pinned["ref"])
+    fake = FakeHuggingFace()
+    fake.add_dataset(GREEK, copy["config"], copy["split"], [b"not a parquet file at all, just text"], revision=SHA)
+
+    def fetch_shards(external_id, config, split, max_bytes, dest_dir, **kwargs):
+        return parquet.fetch_shards(external_id, config, split, max_bytes, dest_dir, sleep=lambda s: None, **kwargs)
+
+    with monkeypatch.context() as hub:
+        hub.setattr(parquet.requests, "get", fake.get)
+        hub.setattr(parquet.requests, "post", fake.post)
+        with app.app_context():
+            snapshots.run_copy(copy["id"], session=app.db.session, fetch_shards=fetch_shards, snapshot_dir=snapshot_dir, max_bytes=10**9)
+
+    copy = copy_row(app, pinned["ref"])
+    assert (copy["status"], copy["error_code"], copy["error_message"]) == ("failed", "no_rows", snapshots.NO_ROWS)
+    assert not os.path.exists(snapshot_dir) or copy_files(snapshot_dir) == []
+
+
 @pytest.mark.parametrize(
     "error, code, message",
     [

@@ -2,19 +2,21 @@
 
 The viewer lists the shards it converted (``/parquet``). Whole shards are not
 downloaded (#178): a shard can be bigger than the byte cap while an import keeps
-a few thousand rows. Up to ``MAX_SHARDS`` shards, spread across the split, have
-their footers read with HTTP range requests (the last 8 bytes, then the footer);
-then row groups are taken one shard at a time, each spread across its shard,
-while the cap allows and, for an import, until there are enough rows for
-its sample (``max_rows``); only their byte ranges are read. Footers and row
-groups both count against the cap. Each shard's row groups are written as a
-local Parquet file, so what an import or a copy reads is unchanged. A server
-that answers a range with the whole file is closed before its body is read,
-and one that sends another range, or more or less than asked, is refused
-without being read past it. The only size refusal left, ``too_large``, is not
-even one row group of any shard whose footer was read fitting. A file that is
-not Parquet we can read raises ``NotParquet``, which an import refuses as
-``not_importable``.
+a few thousand rows. Up to ``MAX_SHARDS`` shards, spread across the split, are
+read from with HTTP range requests: first every shard's last 8 bytes, which give
+its footer's length, then the footers, cheapest first, while each leaves room
+for the cheapest row group found so far. Then row groups are taken one shard at
+a time, each spread across its shard, while the cap allows and, for an import,
+until there are enough rows for its sample (``max_rows``) from two shards; only
+their byte ranges are read. Footers and row groups both count against the cap,
+and no byte is read twice. Each shard's row groups are written as a local
+Parquet file, so what an import or a copy reads is unchanged. A redirect is
+followed by hand, its body never read. A server that answers a range with the
+whole file is closed before its body is read, and one that sends another
+range, or more or less than asked, is refused without being read past it or
+past the cap. The only size refusal left, ``too_large``, is not even one row
+group of any shard whose footer was read fitting. A file that is not Parquet we
+can read raises ``NotParquet``, which an import refuses as ``not_importable``.
 
 The listing answers with ``X-Revision``, the commit of the dataset its
 conversion was built from (#168), so the import records what its rows were read
@@ -30,12 +32,12 @@ import io
 import os
 import re
 import time
-from urllib.parse import unquote
+from urllib.parse import unquote, urljoin, urlsplit
 
 import requests
 import urllib3
 
-from ..errors import NotParquet, ProviderUnavailable
+from ..errors import NotParquet, ProviderUnavailable, RangeNotFetched
 from ..imports import Fetched, ImportFailed, refusal_for
 
 LISTING = "https://datasets-server.huggingface.co/parquet"
@@ -69,14 +71,21 @@ NO_RANGES = "Hugging Face sent a whole file when asked for part of it, so it was
 WRONG_RANGE = "Hugging Face sent a different part of a file than the one asked for"
 NOT_PARQUET = "Hugging Face listed a file that is not a Parquet file we can read"
 CUT_OFF = "Hugging Face stopped sending part of a file"
+BAD_REDIRECT = "Hugging Face sent us somewhere else for part of a file that we do not read from"
+# A range is asked for again where a redirect points, at most this many times,
+# and only over https.
+REDIRECTS = {301, 302, 303, 307, 308}
+MAX_REDIRECTS = 5
 # The rows an import reads for a sample of `max_rows` (see `row_target`).
 ROW_HEADROOM = 3
 MIN_EXTRA_ROWS = 1000
 # PARQUET-816: files parquet-mr 1.2.8 and older wrote are read up to 100 bytes
-# past each column chunk.
-OLD_WRITER = re.compile(r"^parquet-mr version (\d+)\.(\d+)\.(\d+)")
-PARQUET_816_FIXED = (1, 2, 9)
+# past each column chunk. Arrow's ApplicationVersion decides which, from the
+# footer's created_by (cpp/src/parquet/metadata.cc, file_reader.cc).
+PARQUET_816_FIXED = ("parquet-mr", (1, 2, 9))
 PARQUET_816_PADDING = 100
+SPACES = " \t\v\r\n\f"
+DIGITS = "0123456789"
 
 
 def _get(url, sleep, **kwargs):
@@ -154,7 +163,7 @@ def fetch_shards(external_id, config, split, max_bytes, dest_dir, *, expected_re
     try:
         for n, (footer, groups) in enumerate(plan):
             path = os.path.join(dest_dir, f"{n:05}.parquet")
-            _write_row_groups(footer, groups, path, sleep)
+            _write_row_groups(footer, groups, path, budget, sleep)
             paths.append(path)
     except BaseException:
         # No file of a fetch that failed is left for anything to read.
@@ -193,30 +202,92 @@ class _Budget:
 
 class _Footer:
     """A shard's parsed footer: where it is read from, its size, its metadata,
-    and each row group's rows and the byte range pyarrow reads for it."""
+    each row group's rows and the byte range pyarrow reads for it, and the
+    bytes already held: the footer and trailer, [data_end, size)."""
 
-    def __init__(self, url, size, metadata, data_end):
+    def __init__(self, url, size, metadata, data_end, tail):
         self.url, self.size, self.metadata = url, size, metadata
+        self.data_end, self.tail = data_end, tail
+        self.held = [(data_end, size)]
         pad = _padding(metadata.created_by)
         self.groups = []
         for i in range(metadata.num_row_groups):
             rows, start, end = _group_range(metadata.row_group(i), data_end)
             if rows:
                 # pyarrow reads up to `pad` bytes past each column chunk, but
-                # never past the end of the file (PARQUET-816).
+                # never past the end of the file (PARQUET-816); those in the
+                # footer are already held.
                 end += min(pad, size - end)
             self.groups.append((rows, start, end))
+
+    def costs(self):
+        """What reading each row group with rows alone would add."""
+        return [_uncovered(self.held, start, end) for rows, start, end in self.groups if rows]
 
 
 def _padding(created_by):
     """The bytes pyarrow reads past each column chunk of a file `created_by`
     wrote: parquet-mr 1.2.8 and older did not count the dictionary page's
     header in a chunk's size (PARQUET-816), so pyarrow reads up to 100 bytes
-    more for files they wrote."""
-    match = OLD_WRITER.match(created_by or "")
-    if match and tuple(int(n) for n in match.groups()) < PARQUET_816_FIXED:
+    more for files they wrote. Which files those are is Arrow's call, so its
+    parse is followed exactly: a bare "parquet-mr", or one whose version
+    cannot be parsed past some part, is version 0 in the parts not parsed."""
+    application, version = _writer_version(created_by)
+    if application == PARQUET_816_FIXED[0] and version < PARQUET_816_FIXED[1]:
         return PARQUET_816_PADDING
     return 0
+
+
+def _writer_version(created_by):
+    """(application, (major, minor, patch)) as Arrow's ApplicationVersion
+    parses `created_by`: "NAME", "NAME version VERSION" or "NAME version
+    VERSION (build BUILD)". pyarrow gives "" when the footer names no writer,
+    which Arrow reads as "unknown"; neither is padded."""
+    text = created_by or ""
+    mark = text.find(" version ")
+    application = (text if mark < 0 else text[:mark]).strip(SPACES)
+    version = [0, 0, 0]
+    if mark >= 0:
+        start = mark + len(" version ")
+        while start < len(text) and text[start] in SPACES:
+            start += 1
+        end = text.find(" (", start)
+        if end < 0:
+            end = len(text)
+        while start < end - 1 and text[end - 1] in SPACES:
+            end -= 1
+        if start != end:
+            _parse_version(text[start:end], version)
+    return application, tuple(version)
+
+
+def _parse_version(text, version):
+    """MAJOR[.MINOR[.PATCH...]] into `version`, stopping where Arrow's parser
+    gives up and leaving the parts after it 0."""
+    pos = 0
+    for part in (0, 1):
+        end = _digits_end(text, pos)
+        if end < len(text):
+            if text[end] != "." or end == pos:
+                return
+            version[part], pos = _atoi(text[pos:end]), end + 1
+        else:
+            version[part], pos = _atoi(text[pos:]), len(text)
+    end = _digits_end(text, pos)
+    if end != pos:
+        version[2] = _atoi(text[pos:end])
+
+
+def _digits_end(text, pos):
+    while pos < len(text) and text[pos] in DIGITS:
+        pos += 1
+    return pos
+
+
+def _atoi(digits):
+    """C's atoi as Arrow calls it: strtol clamped to a 64-bit long, then cut to a 32-bit int."""
+    n = min(int(digits or "0"), 2**63 - 1) & 0xFFFFFFFF
+    return n - 2**32 if n >= 2**31 else n
 
 
 def _spread_shards(shards):
@@ -241,21 +312,19 @@ def _spread(n):
 
 
 def _read_footers(urls, sizes, budget, sleep):
-    """Each shard's footer, read with two ranges: the last 8 bytes, which give
-    its length, then the footer. Until a row group that fits has been seen, a
-    footer may use the whole budget; after that, footers stop at half of it and
-    never take the room the cheapest such row group needs, so a later footer
-    cannot make an import too large. A footer that does not fit is skipped, and
-    later, smaller ones are still read. Returns the footers read, in order, and
-    how many shards were skipped."""
+    """The shards' footers. Every shard's last 8 bytes are read first: they are
+    cheap, and give its footer's length. Then the footers are read cheapest
+    first, each only while it leaves room for the cheapest row group that fits
+    of those read so far, or, before any is known, any room at all; a footer
+    that does not is skipped, and so are the dearer ones after it. Returns the
+    footers read, in the shards' order, and how many shards were skipped."""
     import pyarrow.parquet as pq
 
-    footers, skipped = [], 0
+    trailers, skipped = [], 0
     for n, (url, size) in enumerate(zip(urls, sizes)):
         if size < len(MAGIC) + TRAILER:
             raise NotParquet(NOT_PARQUET)
-        limit = _footer_limit(footers, budget)
-        if budget.spent + TRAILER > limit:
+        if not budget.fits(TRAILER):
             # Every trailer is 8 bytes: no later shard's fits either.
             skipped += len(urls) - n
             break
@@ -263,27 +332,23 @@ def _read_footers(urls, sizes, budget, sleep):
         length = int.from_bytes(trailer[:4], "little")
         if trailer[4:] != MAGIC or length == 0 or length > size - TRAILER - len(MAGIC):
             raise NotParquet(NOT_PARQUET)
-        if budget.spent + length > limit:
-            skipped += 1
-            continue
+        trailers.append((length, n, url, size, trailer))
+
+    footers = {}
+    trailers.sort(key=lambda t: t[:2])
+    for k, (length, n, url, size, trailer) in enumerate(trailers):
+        cheapest = min((c for f in footers.values() for c in f.costs() if c <= budget.left), default=1)
+        if length > budget.left - cheapest:
+            skipped += len(trailers) - k
+            break
         data_end = size - TRAILER - length
         footer = _read_range(url, data_end, size - TRAILER, size, budget, sleep)
         try:
             metadata = pq.read_metadata(io.BytesIO(footer + trailer))
         except Exception as broken:  # noqa: BLE001 - whatever pyarrow raised, the footer cannot be read
             raise NotParquet(NOT_PARQUET) from broken
-        footers.append(_Footer(url, size, metadata, data_end))
-    return footers, skipped
-
-
-def _footer_limit(footers, budget):
-    """How much may have been spent once the next footer is read: all of the
-    cap while no row group read so far fits what is left, else half of it, and
-    never the room the cheapest row group that still fits needs."""
-    fitting = [end - start for f in footers for rows, start, end in f.groups if rows and end - start <= budget.left]
-    if not fitting:
-        return budget.cap
-    return min(budget.cap // 2, budget.cap - min(fitting))
+        footers[n] = _Footer(url, size, metadata, data_end, footer + trailer)
+    return [footers[n] for n in sorted(footers)], skipped
 
 
 def _group_range(group, data_end):
@@ -314,8 +379,10 @@ def _plan(footers, budget, target=None, skipped=0):
     across it, while the budget allows and, with a `target`, until that many
     rows are taken. Until two shards have a row group, a shard does not take
     the room another shard's cheapest row group needs, so uneven costs still
-    give a sample from two shards. Returns [(footer, [row group indexes])] for
-    shards with any taken."""
+    give a sample from two shards, and the target does not end the reading
+    while a second shard's row group can fit; past the target only a shard with
+    none is read from. Returns [(footer, [row group indexes])] for shards with
+    any taken."""
     queues = [[g for g in _spread(len(f.groups)) if f.groups[g][0] > 0] for f in footers]
     if not any(queues):
         if skipped:
@@ -325,10 +392,11 @@ def _plan(footers, budget, target=None, skipped=0):
     rows = 0
 
     def cost(i, g):
-        # What reading group g adds to shard i's ranges already taken: padded
-        # ranges of neighbouring groups overlap, and no byte is read twice.
+        # What reading group g adds to shard i's bytes already held or taken:
+        # padded ranges overlap their neighbours and the footer, and no byte
+        # is read twice.
         _, start, end = footers[i].groups[g]
-        return _uncovered([footers[i].groups[t][1:] for t in taken[i]], start, end)
+        return _uncovered(footers[i].held + [footers[i].groups[t][1:] for t in taken[i]], start, end)
 
     def reserve(i):
         # The room the cheapest fitting row group of another shard with none
@@ -339,12 +407,24 @@ def _plan(footers, budget, target=None, skipped=0):
         others = [c for c in others if c <= budget.left]
         return min(others, default=0)
 
+    def reached():
+        # The target ends the reading once two shards have rows, or once no
+        # shard without any has a row group that still fits.
+        if target is None or rows < target:
+            return False
+        if sum(1 for t in taken if t) >= 2:
+            return True
+        return not any(cost(j, g) <= budget.left for j, queue in enumerate(queues) if not taken[j] for g in queue)
+
     reserving = True
-    while target is None or rows < target:
+    while not reached():
         progress = False
         for i, queue in enumerate(queues):
-            if target is not None and rows >= target:
+            if reached():
                 break
+            if taken[i] and target is not None and rows >= target:
+                # Past the target, only a second shard is wanted.
+                continue
             # A group that does not fit now never will: the budget only shrinks.
             while queue and cost(i, queue[0]) > budget.left:
                 queue.pop(0)
@@ -402,14 +482,15 @@ def _merged(footer, groups):
     return ranges
 
 
-def _write_row_groups(footer, groups, path, sleep):
+def _write_row_groups(footer, groups, path, budget, sleep):
     """Read `groups` of one shard, overlapping and adjacent ones in one range,
     into a spool file next to `path`, then write them as a Parquet file of
-    their own. The file is written under a temporary name and moved to `path`
-    only when whole; on failure neither it nor the spool is left. A shard that
-    cannot be decoded is NOT_PARQUET; a local file that cannot be written
-    raises its own error."""
-    import pyarrow as pa
+    their own. Bytes in the footer, which padding can reach, are not read
+    again: they are served from the footer already held. The file is written
+    under a temporary name and moved to `path` only when whole; on failure
+    neither it nor the spool is left. A shard pyarrow cannot decode is
+    NOT_PARQUET; a spool or local file that cannot be read or written raises
+    its own OSError, and a read of bytes never fetched raises RangeNotFetched."""
     import pyarrow.parquet as pq
 
     spool_path, partial = path + ".ranges", path + ".partial"
@@ -417,21 +498,18 @@ def _write_row_groups(footer, groups, path, sleep):
         with open(spool_path, "w+b") as spool:
             segments = []
             for start, end in _merged(footer, groups):
+                end = min(end, footer.data_end)
+                if start >= end:
+                    continue
                 segments.append((start, end, spool.tell()))
-                _stream_range(footer.url, start, end, footer.size, spool.write, sleep)
-            source = _Ranges(spool, segments, footer.size)
-            unreadable = (pa.ArrowException, OSError, ValueError, EOFError)
-            try:
-                reader = pq.ParquetFile(source, metadata=footer.metadata, pre_buffer=False)
-            except unreadable as broken:
-                raise NotParquet(NOT_PARQUET) from broken
+                # Everything planned is spent already: what is left is spare.
+                _stream_range(footer.url, start, end, footer.size, spool.write, sleep, spare=budget.left)
+            source = _Ranges(spool, segments, footer.size, held=[(footer.data_end, footer.tail)])
+            reader = _decoded(source, lambda: pq.ParquetFile(source, metadata=footer.metadata, pre_buffer=False))
             writer = None
             try:
                 for g in groups:
-                    try:
-                        table = reader.read_row_group(g)
-                    except unreadable as broken:
-                        raise NotParquet(NOT_PARQUET) from broken
+                    table = _decoded(source, lambda: reader.read_row_group(g))
                     if writer is None:
                         # A list's item keeps the name its writer gave it.
                         writer = pq.ParquetWriter(partial, reader.schema_arrow, use_compliant_nested_type=False)
@@ -447,6 +525,24 @@ def _write_row_groups(footer, groups, path, sleep):
         _remove(spool_path)
 
 
+def _decoded(source, read):
+    """What `read` returns from pyarrow decoding `source`. A failure of our own
+    reading of `source` is raised as itself, whatever pyarrow made of it: a
+    spool's OSError keeps its errno, and a read outside the fetched ranges is
+    RangeNotFetched. Only what pyarrow raised decoding the bytes is
+    NOT_PARQUET."""
+    import pyarrow as pa
+
+    try:
+        return read()
+    except Exception as broken:
+        if source.failure is not None:
+            raise source.failure from None
+        if isinstance(broken, (pa.ArrowException, OSError, ValueError, EOFError)):
+            raise NotParquet(NOT_PARQUET) from broken
+        raise
+
+
 def _remove(path):
     try:
         os.remove(path)
@@ -455,12 +551,17 @@ def _remove(path):
 
 
 class _Ranges(io.RawIOBase):
-    """A shard as pyarrow reads it, holding only the ranges read: a read
-    outside them is an error, never a download."""
+    """A shard as pyarrow reads it, holding only the ranges read: `segments`,
+    (start, end, offset) in the spool, and `held`, (start, bytes) in memory. A
+    read outside them raises RangeNotFetched, never a download. The first
+    failure of a read is kept as `failure`, so it is raised as itself however
+    pyarrow passes it on."""
 
-    def __init__(self, spool, segments, size):
+    def __init__(self, spool, segments, size, held=()):
         super().__init__()
         self._spool, self._segments, self._size, self._pos = spool, segments, size, 0
+        self._held = list(held)
+        self.failure = None
 
     def readable(self):
         return True
@@ -480,34 +581,54 @@ class _Ranges(io.RawIOBase):
         n = min(len(buffer), self._size - self._pos)
         if n <= 0:
             return 0
+        out = memoryview(buffer).cast("B")
+        done = 0
+        while done < n:
+            try:
+                piece = self._piece(self._pos + done, n - done)
+            except OSError as failed:
+                self.failure = failed
+                raise
+            if not piece:
+                self.failure = RangeNotFetched(f"bytes {self._pos + done}-{self._pos + n} of the shard were not fetched")
+                raise self.failure
+            out[done : done + len(piece)] = piece
+            done += len(piece)
+        self._pos += n
+        return n
+
+    def _piece(self, pos, n):
+        """Up to `n` bytes from `pos`, from whichever range holds `pos`; b"" when none does."""
         for start, end, local in self._segments:
-            if start <= self._pos and self._pos + n <= end:
-                self._spool.seek(local + self._pos - start)
-                data = self._spool.read(n)
-                buffer[: len(data)] = data
-                self._pos += len(data)
-                return len(data)
-        raise OSError(f"bytes {self._pos}-{self._pos + n} of the shard were not read")
+            if start <= pos < end:
+                self._spool.seek(local + pos - start)
+                return self._spool.read(min(n, end - pos))
+        for start, data in self._held:
+            if start <= pos < start + len(data):
+                return data[pos - start : pos - start + n]
+        return b""
 
 
 def _read_range(url, start, end, size, budget, sleep):
     """Bytes [start, end) of a pinned shard of `size` bytes, counted against the budget."""
     parts = []
-    _stream_range(url, start, end, size, parts.append, sleep)
+    _stream_range(url, start, end, size, parts.append, sleep, spare=budget.left - (end - start))
     budget.spend(end - start)
     return b"".join(parts)
 
 
-def _stream_range(url, start, end, size, sink, sleep):
+def _stream_range(url, start, end, size, sink, sleep, spare=0):
     """Bytes [start, end) of a pinned shard of `size` bytes, passed to `sink` as
     they come. A server that answers with the whole file (200) is closed before
     its body is read. A 206 must name this range of a file of this size, and
-    any length it gives must be the range's; it is read at most one byte past
-    the range, and one that sends more or less is refused. A connection lost
-    while reading is Hugging Face being unavailable; an error from `sink`
+    any length it gives must be the range's. With no length given, the body is
+    read one byte past the range, to tell one that sends more, only when the
+    cap has a byte to `spare`; otherwise exactly the range is read, which its
+    Content-Range names. One that sends more or less is refused. A connection
+    lost while reading is Hugging Face being unavailable; an error from `sink`
     (a disk that is full) is its own."""
     want = end - start
-    response = _get(url, sleep, stream=True, headers={"Range": f"bytes={start}-{end - 1}", "Accept-Encoding": "identity"})
+    response = _open_range(url, {"Range": f"bytes={start}-{end - 1}", "Accept-Encoding": "identity"}, sleep)
     try:
         if response.status_code == 200:
             raise ProviderUnavailable(NO_RANGES)
@@ -521,10 +642,11 @@ def _stream_range(url, start, end, size, sink, sleep):
             raise ProviderUnavailable(WRONG_RANGE)
         if headers.get("Content-Encoding", "identity").strip().lower() != "identity":
             raise ProviderUnavailable(WRONG_RANGE)
+        limit = want + 1 if length is None and spare > 0 else want
         got = 0
-        while True:
+        while got < limit:
             try:
-                chunk = response.raw.read(min(CHUNK, want - got + 1), decode_content=False)
+                chunk = response.raw.read(min(CHUNK, limit - got), decode_content=False)
             except (requests.RequestException, urllib3.exceptions.HTTPError, OSError) as lost:
                 raise ProviderUnavailable(CUT_OFF) from lost
             if not chunk:
@@ -537,6 +659,23 @@ def _stream_range(url, start, end, size, sink, sleep):
             raise ProviderUnavailable(WRONG_RANGE)
     finally:
         response.close()
+
+
+def _open_range(url, headers, sleep):
+    """The answer to a range request, its redirects followed here rather than
+    by `requests`, which reads a redirect's body: each redirect is closed
+    unread, the range asked again where it points, with the same headers, at
+    most MAX_REDIRECTS times and only over https."""
+    for _ in range(MAX_REDIRECTS + 1):
+        response = _get(url, sleep, stream=True, allow_redirects=False, headers=headers)
+        if response.status_code not in REDIRECTS:
+            return response
+        location = response.headers.get("Location")
+        response.close()
+        url = urljoin(url, location or "")
+        if not location or urlsplit(url).scheme != "https":
+            break
+    raise ProviderUnavailable(BAD_REDIRECT)
 
 
 def _source_revision(listing):

@@ -3,13 +3,13 @@ import io
 import json
 import pathlib
 import random
-from urllib.parse import unquote
+from urllib.parse import unquote, urljoin
 
 import pytest
 import requests
 from requests.structures import CaseInsensitiveDict
 
-from dataset_library.errors import NotParquet, ProviderUnavailable
+from dataset_library.errors import NotParquet, ProviderUnavailable, RangeNotFetched
 from dataset_library.imports import BEHIND, CHANGED, ImportFailed
 from dataset_library.providers import parquet
 
@@ -112,12 +112,16 @@ class FakeHuggingFace:
         self.build_missing = set()  # paths the pinned build does not have
         self.head_failures = []  # statuses the Hub's dataset record answers before the real one
         self.ignore_ranges = False  # answer a range with 200 and the whole shard
-        self.extra_bytes = 0  # sent past the asked range
+        self.extra_bytes = 0  # sent past the asked range; or (first, last, size) -> bytes
         self.short_bytes = 0  # left off the end of the asked range
         self.send_length = True  # answer a range with its Content-Length
         self.content_range = None  # (url, first, last, size) -> Content-Range answered, or None for none
         self.fail_after = None  # bytes of a range body read before the connection is lost
-        self.responses = []  # every shard response, in order
+        self.responses = []  # every range response, in order
+        self.redirects = 0  # redirects answered before each range, each to the next hop
+        self.redirect_body = b""  # the body each redirect carries
+        self.redirect_location = None  # Location answered instead of the next hop's
+        self.redirect_responses = []  # every redirect answered, in order
         self.asked_headers = []  # the headers each range was asked with
         self.listings = {key: recorded for key, recorded in LISTINGS.items()}
         self.files = {}  # path in the build: bytes, made on first use
@@ -184,6 +188,22 @@ class FakeHuggingFace:
             recorded = HUB.get(url.removeprefix(parquet.HUB), {"status": 404, "body": {"error": "Repository not found"}})
             return Response(recorded["status"], recorded["body"])
         assert stream, "shards are streamed"
+        url, _, query = url.partition("?")
+        hop = int(query.removeprefix("hop=")) if query.startswith("hop=") else 0
+        if hop < self.redirects and headers and "Range" in headers:
+            # The Hub answers a pinned resolve/ URL with a redirect to its CDN.
+            location = self.redirect_location
+            if location is None:
+                location = f"https://cdn.example/resolve/{url.split('/resolve/', 1)[1]}?hop={hop + 1}"
+            response = Response(302, content=self.redirect_body, headers={"Location": location, "Content-Length": str(len(self.redirect_body))})
+            self.redirect_responses.append(response)
+            self.asked_headers.append(dict(headers))
+            if kwargs.get("allow_redirects", True):
+                # What requests does when it follows a redirect: reads its body, then asks again.
+                response.raw.read()
+                response.close()
+                return self.get(urljoin(url, location), params, timeout, stream, headers, **kwargs)
+            return response
         if url not in self.downloads:
             self.downloads.append(url)
         data = self.file(url.split("/resolve/", 1)[1].split("/", 1)[1])
@@ -195,7 +215,8 @@ class FakeHuggingFace:
         first, last = (int(n) for n in asked.removeprefix("bytes=").split("-"))
         self.ranges.append((url, first, last))
         self.asked_headers.append(dict(headers))
-        content = data[first : last + 1 + self.extra_bytes]
+        extra = self.extra_bytes(first, last, len(data)) if callable(self.extra_bytes) else self.extra_bytes
+        content = data[first : last + 1 + extra]
         content = content[: len(content) - self.short_bytes]
         answered = {"Content-Range": f"bytes {first}-{last}/{len(data)}"}
         if self.content_range is not None:
@@ -783,10 +804,10 @@ def test_a_server_that_says_it_sends_more_than_the_range_is_refused_unread(fine,
         fetch(tmp_path, FINE, "default", "train", max_bytes=SCALED_CAP)
 
     assert str(refused.value) == parquet.WRONG_RANGE
-    # The trailer ends the file, so it came whole; the footer's Content-Length
-    # was 100 bytes too many, and its body was not read.
-    assert len(fine.ranges) == 2
-    assert fine.served == 8
+    # The trailers end their files, so they came whole; the first footer's
+    # Content-Length was 100 bytes too many, and its body was not read.
+    assert len(fine.ranges) == 11
+    assert fine.served == 8 * 10
     assert all(r.closed for r in fine.responses)
 
 
@@ -801,7 +822,7 @@ def test_a_server_that_sends_more_than_the_range_unannounced_is_read_one_byte_pa
     _, first, last = fine.ranges[-1]
     want = last + 1 - first
     assert fine.responses[-1].raw.read_bytes <= want + 1
-    assert fine.served <= 8 + want + 1
+    assert fine.served <= 8 * 10 + want + 1
 
 
 def test_a_body_shorter_than_the_range_is_refused(fine, tmp_path):
@@ -1030,6 +1051,8 @@ def test_only_old_parquet_mr_writers_are_padded():
 
 class PlannedFooter:
     """A footer as `_plan` sees one: each row group's rows and byte range."""
+
+    held = []
 
     def __init__(self, costs, rows=10):
         self.groups, at = [], 4
@@ -1274,3 +1297,419 @@ def test_an_import_refused_for_its_revision_downloads_nothing_and_uses_no_copy(a
     assert (found["status"], found["code"], found["error"]) == ("failed", "conversion_behind", imports.BEHIND)
     assert found["revision"] == DWARF_HEAD
     assert hf.downloads == []
+
+
+# --- Council round 2 (#178) ---------------------------------------------------------
+
+
+def plain_shard(shard, text_bytes, extra=0, pad=0, features=True):
+    """A one-row shard written plainly (no compression, dictionary or
+    statistics), so its size moves byte for byte with `extra` characters of
+    text and its footer with `pad`, a schema metadata value; that is how the
+    reviewers' exact sizes are made. `features` adds the `huggingface`
+    metadata, which makes the footer heavy."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    text = f"s{shard}-r0 " + random.Random(shard * 1_000_003).randbytes(text_bytes // 2).hex() + "x" * extra
+    table = pa.table({"text": pa.array([text], pa.string()), "label": pa.array([0], pa.int64())})
+    metadata = {}
+    if features:
+        metadata["huggingface"] = json.dumps({"info": {"features": {
+            "text": {"dtype": "string", "_type": "Value"}, "label": {"names": ["a", "b"], "_type": "ClassLabel"},
+        }}})
+    if pad:
+        metadata["pad"] = "p" * pad
+    table = table.replace_schema_metadata(metadata)
+    sink = io.BytesIO()
+    pq.write_table(table, sink, compression="none", use_dictionary=False, write_statistics=False)
+    return sink.getvalue()
+
+
+def footer_length(data):
+    return int.from_bytes(data[-8:-4], "little")
+
+
+def read_bytes(hf):
+    """Every body byte read, from range answers and redirects alike."""
+    return sum(r.raw.read_bytes for r in hf.responses + hf.redirect_responses)
+
+
+# The row target, item 1.
+
+
+def test_a_first_row_group_past_the_target_still_leaves_room_for_a_second_shard():
+    # Row groups of 20,000 rows and a 5000-row import: one group passes the
+    # 15,000-row target, and the sample would be one shard's.
+    footers = [PlannedFooter([1_000] * 4, rows=20_000) for _ in range(10)]
+    budget = parquet._Budget(10**9)
+
+    plan = parquet._plan(footers, budget, target=parquet.row_target(5000))
+
+    assert len(plan) == 2
+    assert [len(groups) for _, groups in plan] == [1, 1]
+    assert budget.spent == 2_000
+
+
+def test_the_target_ends_the_reading_with_one_shard_when_no_other_fits():
+    footers = [PlannedFooter([1_000] * 4, rows=20_000), PlannedFooter([9_000], rows=20_000)]
+    budget = parquet._Budget(5_000)
+
+    plan = parquet._plan(footers, budget, target=parquet.row_target(5000))
+
+    assert [(footers.index(f), groups) for f, groups in plan] == [(0, [0])]
+
+
+def test_an_import_whose_first_row_group_passes_the_target_reads_rows_from_two_shards(hf, tmp_path):
+    hf.add_dataset(FINE, "default", "train", [shard_with_groups(0, [1200, 1200]), shard_with_groups(1, [1200, 1200])])
+    cap = 10**7
+
+    fetched = parquet.fetch_shards(FINE, "default", "train", cap, str(tmp_path / "work"), max_rows=100, sleep=lambda s: None)
+
+    assert shards_read(fetched.paths) == {"s0", "s1"}
+    assert rows_in(fetched.paths) == 2400
+    assert hf.served == read_bytes(hf) <= cap
+    assert_no_byte_read_twice(hf.ranges)
+
+
+def texts_shard(texts_by_group):
+    """A shard of the given texts, one row group per list, with ClassLabel names."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    features = {"text": {"dtype": "string", "_type": "Value"}, "label": {"names": ["a", "b"], "_type": "ClassLabel"}}
+    sink = io.BytesIO()
+    writer = None
+    for texts in texts_by_group:
+        table = pa.table({"text": pa.array(texts, pa.string()), "label": pa.array([r % 2 for r in range(len(texts))], pa.int64())})
+        table = table.replace_schema_metadata({"huggingface": json.dumps({"info": {"features": features}})})
+        writer = writer or pq.ParquetWriter(sink, table.schema)
+        writer.write_table(table)
+    writer.close()
+    return sink.getvalue()
+
+
+def test_an_import_whose_first_row_group_is_blank_keeps_rows_from_the_next_shard(app, hf, tmp_path):
+    # Shard 0's first row group is 1,200 rows without text, past the 1,100-row
+    # target of a 100-row import; shard 1 has 120 rows with text.
+    blank = texts_shard([[""] * 1200, [""] * 1200])
+    usable = texts_shard([[f"s1-r{r} a clause" for r in range(120)]])
+    hf.add_dataset(FINE, "default", "train", [blank, usable])
+
+    def real_fetch(external_id, config, split, max_bytes, dest_dir, **kwargs):
+        return parquet.fetch_shards(external_id, config, split, 10**7, dest_dir, sleep=lambda s: None, **kwargs)
+
+    found, create = run_fine_import(app, tmp_path, real_fetch, sample_size=100)
+
+    assert found["status"] == "completed", found
+    assert found["rows"] == 100
+    assert {row["text"].split("-", 1)[0] for row in create.calls[0]["rows"]} == {"s1"}
+
+
+# Every byte read counts, item 2.
+
+
+def test_a_redirect_is_followed_without_reading_its_body(fine, tmp_path):
+    # The Hub answers a pinned resolve/ URL with a 302 carrying a body, then its CDN answers 206.
+    fine.redirects = 1
+    fine.redirect_body = b"r" * 1_000
+
+    fetched = fetch(tmp_path, FINE, "default", "train", max_bytes=SCALED_CAP)
+
+    assert fetched.paths
+    asked = sum(last + 1 - first for _, first, last in fine.ranges)
+    assert read_bytes(fine) == fine.served == asked <= SCALED_CAP
+    assert len(fine.redirect_responses) == len(fine.ranges)
+    assert all(r.closed and r.raw.read_bytes == 0 for r in fine.redirect_responses)
+    # The CDN is asked for the same range, uncompressed.
+    assert all(url.startswith("https://cdn.example/") for url, _, _ in fine.ranges)
+    assert all(h["Range"].startswith("bytes=") and h["Accept-Encoding"] == "identity" for h in fine.asked_headers)
+
+
+@pytest.mark.parametrize("redirects", [5, 6])
+def test_at_most_five_redirects_are_followed(fine, tmp_path, redirects):
+    fine.redirects = redirects
+    fine.redirect_body = b"r" * 1_000
+
+    if redirects == 5:
+        assert fetch(tmp_path, FINE, "default", "train", max_bytes=SCALED_CAP).paths
+    else:
+        with pytest.raises(ProviderUnavailable) as refused:
+            fetch(tmp_path, FINE, "default", "train", max_bytes=SCALED_CAP)
+        assert str(refused.value) == parquet.BAD_REDIRECT
+        assert fine.served == 0
+    assert all(r.closed and r.raw.read_bytes == 0 for r in fine.redirect_responses)
+
+
+@pytest.mark.parametrize("location", ["http://cdn.example/resolve/x", "ftp://cdn.example/x", ""])
+def test_a_redirect_anywhere_but_https_is_refused_unread(fine, tmp_path, location):
+    fine.redirects = 1
+    fine.redirect_body = b"r" * 1_000
+    fine.redirect_location = location
+
+    with pytest.raises(ProviderUnavailable) as refused:
+        fetch(tmp_path, FINE, "default", "train", max_bytes=SCALED_CAP)
+
+    assert str(refused.value) == parquet.BAD_REDIRECT
+    assert read_bytes(fine) == 0
+    assert all(r.closed for r in fine.redirect_responses)
+
+
+def test_an_overlong_answer_with_no_length_is_not_read_past_the_cap(hf, tmp_path):
+    # The reviewer's case: a 1,087-byte cap, exactly the shard's trailer,
+    # footer and row group. Its row group is answered with more than asked and
+    # no Content-Length; reading one byte past it would pass the cap, so
+    # exactly the range is read, as its exact Content-Range names.
+    shard = plain_shard(0, text_bytes=522, extra=8, features=False)
+    assert len(shard) - 4 == 1_087
+    hf.add_dataset(FINE, "default", "train", [shard])
+    data_end = len(shard) - 8 - footer_length(shard)
+    hf.extra_bytes = lambda first, last, size: 100 if last < data_end else 0
+    hf.send_length = False
+
+    fetched = fetch(tmp_path, FINE, "default", "train", max_bytes=1_087)
+
+    assert rows_in(fetched.paths) == 1
+    assert read_bytes(hf) <= 1_087
+
+
+def test_an_overlong_answer_with_no_length_is_still_refused_while_the_cap_has_room(hf, tmp_path):
+    shard = plain_shard(0, text_bytes=522, extra=8, features=False)
+    hf.add_dataset(FINE, "default", "train", [shard])
+    hf.extra_bytes = 100
+    hf.send_length = False
+
+    with pytest.raises(ProviderUnavailable) as refused:
+        fetch(tmp_path, FINE, "default", "train", max_bytes=10_000)
+
+    assert str(refused.value) == parquet.WRONG_RANGE
+    assert read_bytes(hf) <= 10_000
+
+
+# Footers, cheapest first, item 3.
+
+
+def test_an_affordable_shard_listed_after_a_dear_one_is_imported(hf, tmp_path):
+    # Shard 0's footer is the dearer and none of its row groups fits; reading
+    # it first would leave no room for shard 1's row group.
+    dear = parquet_shard(0, groups=8, rows_per_group=8, text_bytes=4400)
+    cheap = plain_shard(1, text_bytes=16_000)
+    hf.add_dataset(FINE, "default", "train", [dear, cheap])
+    cap = 16 + footer_length(cheap) + measured(cheap)[1][0]
+    assert footer_length(dear) > footer_length(cheap) and footer_length(dear) < cap
+    assert min(measured(dear)[1]) > cap
+
+    fetched = fetch(tmp_path, FINE, "default", "train", max_bytes=cap)
+
+    assert shards_read(fetched.paths) == {"s1"}
+    assert read_bytes(hf) <= cap
+    assert_no_byte_read_twice(hf.ranges)
+
+
+def test_a_cap_just_over_one_shard_s_whole_file_imports_it(hf, tmp_path):
+    # The reviewer's case: a 10,799-byte cap, and shard 2's whole file is
+    # 10,783 bytes. Shards 0 and 1 have dearer footers and row groups over the cap.
+    dear = [plain_shard(n, text_bytes=12_000) for n in (0, 1)]
+    affordable = plain_shard(2, text_bytes=10_000, extra=39, pad=47, features=False)
+    assert len(affordable) == 10_783
+    assert all(footer_length(d) > footer_length(affordable) and measured(d)[1][0] > 10_799 for d in dear)
+    hf.add_dataset(FINE, "default", "train", dear + [affordable])
+
+    fetched = fetch(tmp_path, FINE, "default", "train", max_bytes=10_799)
+
+    assert shards_read(fetched.paths) == {"s2"}
+    assert read_bytes(hf) == 24 + len(affordable) - 12 <= 10_799
+
+
+def test_a_first_footer_that_would_crowd_out_a_later_shard_is_not_read(hf, tmp_path):
+    # The reviewer's case: a 1,470-byte cap, an 896-byte first footer over a
+    # row group that does not fit, and a later shard costing 1,454 bytes.
+    first = plain_shard(0, text_bytes=3_000, pad=152, features=False)
+    later = plain_shard(1, text_bytes=880, extra=17, features=False)
+    assert footer_length(first) == 896 and measured(first)[1][0] > 1_470
+    assert 8 + footer_length(later) + measured(later)[1][0] == 1_454
+    hf.add_dataset(FINE, "default", "train", [first, later])
+
+    fetched = fetch(tmp_path, FINE, "default", "train", max_bytes=1_470)
+
+    assert shards_read(fetched.paths) == {"s1"}
+    assert read_bytes(hf) == 8 + 1_454
+
+
+def test_two_metadata_heavy_shards_are_both_read_without_a_row_target(hf, tmp_path):
+    # The reviewer's case: two 1,268-byte shards, mostly footer, under a
+    # 2,536-byte cap. A copy passes no row target, so this is what it reads.
+    shards = [plain_shard(n, text_bytes=16, extra=38, pad=96) for n in (0, 1)]
+    assert [len(s) for s in shards] == [1_268, 1_268]
+    assert footer_length(shards[0]) > measured(shards[0])[1][0]
+    hf.add_dataset(FINE, "default", "train", shards)
+
+    fetched = fetch(tmp_path, FINE, "default", "train", max_bytes=2_536)
+
+    assert shards_read(fetched.paths) == {"s0", "s1"}
+    assert read_bytes(hf) <= 2_536
+    assert_no_byte_read_twice(hf.ranges)
+
+
+# Old writers' padding, item 4.
+
+
+def test_an_old_writer_s_last_row_group_fits_a_cap_of_the_file_s_unique_bytes(hf, tmp_path):
+    # The last row group's padding runs into the footer, already read: it is
+    # neither read again nor counted again.
+    shard = with_created_by(parquet_shard(0, groups=3, rows_per_group=2, text_bytes=64), "parquet-mr version 1.2.8 (build 1)")
+    hf.add_dataset(FINE, "default", "train", [shard])
+    cap = len(shard) - 4  # all but the leading magic
+
+    fetched = fetch(tmp_path, FINE, "default", "train", max_bytes=cap)
+
+    assert rows_in(fetched.paths) == 6
+    assert read_bytes(hf) == hf.served == cap
+    assert_no_byte_read_twice(hf.ranges)
+
+
+def test_an_old_writer_s_shard_is_read_with_no_byte_fetched_twice(hf, tmp_path):
+    shard = with_created_by(parquet_shard(0, groups=6, rows_per_group=2, text_bytes=64), "parquet-mr")
+    hf.add_dataset(FINE, "default", "train", [shard])
+
+    fetched = fetch(tmp_path, FINE, "default", "train", max_bytes=10**9)
+
+    assert rows_in(fetched.paths) == 12
+    assert_no_byte_read_twice(hf.ranges)
+
+
+WRITERS_AS_ARROW_READS_THEM = [
+    "parquet-mr",
+    "parquet-mr version 1.2",
+    "parquet-mr version 1",
+    "parquet-mr version 1.2.8 (build abc)",
+    "parquet-mr version 1.2.8-rc1",
+    "parquet-mr version abc",
+    "parquet-mr version 1.x.9",
+    "  parquet-mr  version 1.2.8",
+    "parquet-mr version 1.2.9 (build abc)",
+    "parquet-mr version 1.2.10",
+    "parquet-mr version 1.3",
+    "parquet-mr-x version 1.2.8",
+    "parquet-cpp version 1.0.0",
+    "impala version 1.0",
+]
+
+
+@pytest.mark.parametrize("created_by", WRITERS_AS_ARROW_READS_THEM)
+def test_the_padding_is_what_pyarrow_reads_past_a_column_chunk(created_by):
+    # Not a copy of Arrow's rule: what this pyarrow really reads for a footer
+    # naming this writer.
+    import pyarrow.parquet as pq
+
+    shard = with_created_by(parquet_shard(0, groups=3, rows_per_group=2, text_bytes=64), created_by)
+    metadata = pq.read_metadata(io.BytesIO(shard))
+    assert metadata.created_by == created_by
+    reads = []
+
+    class Recording(io.RawIOBase):
+        def __init__(self):
+            self.pos = 0
+
+        def readable(self):
+            return True
+
+        def seekable(self):
+            return True
+
+        def tell(self):
+            return self.pos
+
+        def seek(self, offset, whence=io.SEEK_SET):
+            self.pos = {io.SEEK_SET: 0, io.SEEK_CUR: self.pos, io.SEEK_END: len(shard)}[whence] + offset
+            return self.pos
+
+        def readinto(self, buffer):
+            n = min(len(buffer), len(shard) - self.pos)
+            buffer[:n] = shard[self.pos : self.pos + n]
+            reads.append(self.pos + n)
+            self.pos += n
+            return n
+
+    pq.ParquetFile(Recording(), metadata=metadata, pre_buffer=False).read_row_group(0)
+
+    _, _, end = parquet._group_range(metadata.row_group(0), len(shard))
+    assert max(reads) - end == parquet._padding(created_by)
+
+
+def test_only_old_parquet_mr_writers_are_padded_as_arrow_parses_them():
+    assert parquet._padding("parquet-mr") == 100
+    assert parquet._padding("parquet-mr version 1.2") == 100
+    assert parquet._padding("parquet-mr version ") == 100
+    assert parquet._padding("parquet-mr version 1.2.9") == 0
+    assert parquet._padding("") == 0
+    assert parquet._writer_version("parquet-mr version 1.x.9") == ("parquet-mr", (1, 0, 0))
+    assert parquet._writer_version("parquet-mr version 1.2.8abc-rc1+x (build y)") == ("parquet-mr", (1, 2, 8))
+
+
+# Our own failures are not "not Parquet", item 5.
+
+
+class FailingSpool:
+    """A spool file whose reads fail as a failing disk does."""
+
+    def __init__(self, file):
+        self._file = file
+
+    def __getattr__(self, name):
+        return getattr(self._file, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return self._file.__exit__(*exc)
+
+    def read(self, n=-1):
+        import errno
+
+        raise OSError(errno.EIO, "Input/output error")
+
+
+def test_a_spool_that_cannot_be_read_raises_its_own_error(fine, tmp_path, monkeypatch):
+    import errno
+
+    monkeypatch.setattr(parquet, "open", lambda path, mode: FailingSpool(open(path, mode)), raising=False)
+
+    with pytest.raises(OSError) as failed:
+        fetch(tmp_path, FINE, "default", "train", max_bytes=SCALED_CAP)
+
+    assert failed.value.errno == errno.EIO
+    assert not isinstance(failed.value, (NotParquet, ProviderUnavailable))
+    assert list((tmp_path / "work").iterdir()) == []
+
+
+def fetch_one_byte_short(monkeypatch):
+    # A plan bug: each range starts one byte after what pyarrow will read.
+    real = parquet._merged
+    monkeypatch.setattr(parquet, "_merged", lambda footer, groups: [[start + 1, end] for start, end in real(footer, groups)])
+
+
+def test_a_read_of_bytes_never_fetched_is_our_own_error(fine, tmp_path, monkeypatch):
+    fetch_one_byte_short(monkeypatch)
+
+    with pytest.raises(RangeNotFetched):
+        fetch(tmp_path, FINE, "default", "train", max_bytes=SCALED_CAP)
+
+    assert not issubclass(RangeNotFetched, (OSError, ProviderUnavailable))
+    assert list((tmp_path / "work").iterdir()) == []
+
+
+def test_an_import_that_reads_bytes_never_fetched_fails_as_unexpected_and_logs_it(app, fine, tmp_path, monkeypatch, caplog):
+    fetch_one_byte_short(monkeypatch)
+
+    def real_fetch(external_id, config, split, max_bytes, dest_dir, **kwargs):
+        return parquet.fetch_shards(external_id, config, split, SCALED_CAP, dest_dir, sleep=lambda s: None, **kwargs)
+
+    with caplog.at_level("ERROR", logger="dataset_library"):
+        found, create = run_fine_import(app, tmp_path, real_fetch, sample_size=20)
+
+    assert (found["status"], found["code"]) == ("failed", "unexpected")
+    assert create.calls == []
+    logged = [r for r in caplog.records if r.getMessage().startswith("library.import.error")]
+    assert logged and logged[0].exc_info[0] is RangeNotFetched
