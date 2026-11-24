@@ -155,21 +155,23 @@ def fetch_shards(external_id, config, split, max_bytes, dest_dir, *, expected_re
 
     budget = _Budget(max_bytes)
     urls = [_pinned(shard["url"], commit) for shard in chosen]
-    footers, skipped = _read_footers(urls, [shard["size"] for shard in chosen], budget, sleep)
-    plan = _plan(footers, budget, None if max_rows is None else row_target(max_rows), skipped)
+    # Ranges are sent through one session's adapter, below its redirect handling (see `_open_range`).
+    with requests.Session() as session:
+        footers, skipped = _read_footers(session, urls, [shard["size"] for shard in chosen], budget, sleep)
+        plan = _plan(footers, budget, None if max_rows is None else row_target(max_rows), skipped)
 
-    os.makedirs(dest_dir, exist_ok=True)
-    paths = []
-    try:
-        for n, (footer, groups) in enumerate(plan):
-            path = os.path.join(dest_dir, f"{n:05}.parquet")
-            _write_row_groups(footer, groups, path, budget, sleep)
-            paths.append(path)
-    except BaseException:
-        # No file of a fetch that failed is left for anything to read.
-        for path in paths:
-            _remove(path)
-        raise
+        os.makedirs(dest_dir, exist_ok=True)
+        paths = []
+        try:
+            for n, (footer, groups) in enumerate(plan):
+                path = os.path.join(dest_dir, f"{n:05}.parquet")
+                _write_row_groups(session, footer, groups, path, budget, sleep)
+                paths.append(path)
+        except BaseException:
+            # No file of a fetch that failed is left for anything to read.
+            for path in paths:
+                _remove(path)
+            raise
     return Fetched(paths=paths, revision=revision, head=head)
 
 
@@ -311,7 +313,7 @@ def _spread(n):
     return order
 
 
-def _read_footers(urls, sizes, budget, sleep):
+def _read_footers(session, urls, sizes, budget, sleep):
     """The shards' footers. Every shard's last 8 bytes are read first: they are
     cheap, and give its footer's length. Then the footers are read cheapest
     first, each only while it leaves room for the cheapest row group that fits
@@ -328,7 +330,7 @@ def _read_footers(urls, sizes, budget, sleep):
             # Every trailer is 8 bytes: no later shard's fits either.
             skipped += len(urls) - n
             break
-        trailer = _read_range(url, size - TRAILER, size, size, budget, sleep)
+        trailer = _read_range(session, url, size - TRAILER, size, size, budget, sleep)
         length = int.from_bytes(trailer[:4], "little")
         if trailer[4:] != MAGIC or length == 0 or length > size - TRAILER - len(MAGIC):
             raise NotParquet(NOT_PARQUET)
@@ -342,7 +344,7 @@ def _read_footers(urls, sizes, budget, sleep):
             skipped += len(trailers) - k
             break
         data_end = size - TRAILER - length
-        footer = _read_range(url, data_end, size - TRAILER, size, budget, sleep)
+        footer = _read_range(session, url, data_end, size - TRAILER, size, budget, sleep)
         try:
             metadata = pq.read_metadata(io.BytesIO(footer + trailer))
         except Exception as broken:  # noqa: BLE001 - whatever pyarrow raised, the footer cannot be read
@@ -482,7 +484,7 @@ def _merged(footer, groups):
     return ranges
 
 
-def _write_row_groups(footer, groups, path, budget, sleep):
+def _write_row_groups(session, footer, groups, path, budget, sleep):
     """Read `groups` of one shard, overlapping and adjacent ones in one range,
     into a spool file next to `path`, then write them as a Parquet file of
     their own. Bytes in the footer, which padding can reach, are not read
@@ -503,7 +505,7 @@ def _write_row_groups(footer, groups, path, budget, sleep):
                     continue
                 segments.append((start, end, spool.tell()))
                 # Everything planned is spent already: what is left is spare.
-                _stream_range(footer.url, start, end, footer.size, spool.write, sleep, spare=budget.left)
+                _stream_range(session, footer.url, start, end, footer.size, spool.write, sleep, spare=budget.left)
             source = _Ranges(spool, segments, footer.size, held=[(footer.data_end, footer.tail)])
             reader = _decoded(source, lambda: pq.ParquetFile(source, metadata=footer.metadata, pre_buffer=False))
             writer = None
@@ -609,15 +611,15 @@ class _Ranges(io.RawIOBase):
         return b""
 
 
-def _read_range(url, start, end, size, budget, sleep):
+def _read_range(session, url, start, end, size, budget, sleep):
     """Bytes [start, end) of a pinned shard of `size` bytes, counted against the budget."""
     parts = []
-    _stream_range(url, start, end, size, parts.append, sleep, spare=budget.left - (end - start))
+    _stream_range(session, url, start, end, size, parts.append, sleep, spare=budget.left - (end - start))
     budget.spend(end - start)
     return b"".join(parts)
 
 
-def _stream_range(url, start, end, size, sink, sleep, spare=0):
+def _stream_range(session, url, start, end, size, sink, sleep, spare=0):
     """Bytes [start, end) of a pinned shard of `size` bytes, passed to `sink` as
     they come. A server that answers with the whole file (200) is closed before
     its body is read. A 206 must name this range of a file of this size, and
@@ -628,7 +630,7 @@ def _stream_range(url, start, end, size, sink, sleep, spare=0):
     lost while reading is Hugging Face being unavailable; an error from `sink`
     (a disk that is full) is its own."""
     want = end - start
-    response = _open_range(url, {"Range": f"bytes={start}-{end - 1}", "Accept-Encoding": "identity"}, sleep)
+    response = _open_range(session, url, {"Range": f"bytes={start}-{end - 1}", "Accept-Encoding": "identity"}, sleep)
     try:
         if response.status_code == 200:
             raise ProviderUnavailable(NO_RANGES)
@@ -661,13 +663,16 @@ def _stream_range(url, start, end, size, sink, sleep, spare=0):
         response.close()
 
 
-def _open_range(url, headers, sleep):
-    """The answer to a range request, its redirects followed here rather than
-    by `requests`, which reads a redirect's body: each redirect is closed
-    unread, the range asked again where it points, with the same headers, at
-    most MAX_REDIRECTS times and only over https."""
+def _open_range(session, url, headers, sleep):
+    """The answer to a range request, its redirects followed here: each
+    redirect is closed unread, and the range asked again where it points, with
+    the same headers, at most MAX_REDIRECTS times and only over https. Each
+    request goes straight to the session's adapter: a session's own `send`
+    reads a redirect's body even with ``allow_redirects=False``, to make
+    `Response.next`, and the Hub answers a pinned resolve/ URL with a redirect
+    to its CDN."""
     for _ in range(MAX_REDIRECTS + 1):
-        response = _get(url, sleep, stream=True, allow_redirects=False, headers=headers)
+        response = _ask(_sender(session, headers), url, sleep)
         if response.status_code not in REDIRECTS:
             return response
         location = response.headers.get("Location")
@@ -676,6 +681,21 @@ def _open_range(url, headers, sleep):
         if not location or urlsplit(url).scheme != "https":
             break
     raise ProviderUnavailable(BAD_REDIRECT)
+
+
+def _sender(session, headers):
+    """A GET of a URL with `headers`, sent by `session`'s adapter with the
+    session's own headers, proxies and certificates, and no redirect handling."""
+
+    def send(url, timeout):
+        prepared = session.prepare_request(requests.Request("GET", url, headers=headers))
+        settings = session.merge_environment_settings(prepared.url, {}, True, None, None)
+        return session.get_adapter(prepared.url).send(
+            prepared, stream=True, timeout=timeout,
+            verify=settings["verify"], cert=settings["cert"], proxies=settings["proxies"],
+        )
+
+    return send
 
 
 def _source_revision(listing):

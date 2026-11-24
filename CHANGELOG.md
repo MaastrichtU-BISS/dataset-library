@@ -49,11 +49,12 @@ While the version is 0.x, minor releases may contain breaking changes.
     Its message is now `parquet.TOO_LARGE` ("Too large to sample here: even one block of rows in this
     dataset is over the download limit."). Retrying cannot help, so a host should not offer Try
     again for `too_large`.
-  - Ranges are asked for with `Accept-Encoding: identity`. Redirects are followed by
-    `fetch_shards`, not by `requests`, which reads a redirect's body: the Hub answers a pinned
-    `resolve/` URL with a 302 to its CDN, and each redirect is closed with its body unread, the
-    range asked again where it points with the same headers, at most five times and only over
-    https (`parquet.BAD_REDIRECT` otherwise). A server that answers a range request
+  - Ranges are asked for with `Accept-Encoding: identity`. The Hub answers a pinned `resolve/` URL
+    with a 302 to its CDN. Each range request is sent straight to a `requests.Session`'s adapter,
+    because the session's own `send` reads a redirect's body even with `allow_redirects=False` (to
+    make `Response.next`). `fetch_shards` follows redirects itself: each is closed with its body
+    unread, and the range asked again where it points with the same headers, at most five times and
+    only over https (`parquet.BAD_REDIRECT` otherwise). A server that answers a range request
     with the whole file (200) is closed before its body is read (`parquet.NO_RANGES`). A 206 must
     name the range asked of a file of the size the build check confirmed (or `*`) in its
     `Content-Range`, and any `Content-Length` must be the range's; otherwise it is refused before

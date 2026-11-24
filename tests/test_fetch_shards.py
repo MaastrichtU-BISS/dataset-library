@@ -3,7 +3,7 @@ import io
 import json
 import pathlib
 import random
-from urllib.parse import unquote, urljoin
+from urllib.parse import unquote
 
 import pytest
 import requests
@@ -27,6 +27,10 @@ class Body:
     def __init__(self, content, served=None, fail_after=None):
         self._content, self._served, self._fail_after = content, served, fail_after
         self.read_bytes = 0
+        self.closed = False
+
+    def close(self):
+        self.closed = True
 
     def read(self, amt=None, decode_content=None):
         if self._fail_after is not None and self.read_bytes >= self._fail_after:
@@ -47,13 +51,37 @@ class Response:
         self._body = body
         self.headers = CaseInsensitiveDict(headers or {})
         self.raw = Body(content, served, fail_after)
-        self.closed = False
+
+    @property
+    def closed(self):
+        return self.raw.closed
 
     def json(self):
         return self._body
 
     def close(self):
-        self.closed = True
+        self.raw.close()
+
+
+class FakeAdapter(requests.adapters.BaseAdapter):
+    """The transport under a real `requests.Session`: what it sends goes to
+    the fake Hub, and its answer comes back as a real `requests.Response`, so
+    the session's own redirect handling runs on it as it would."""
+
+    def __init__(self, fake):
+        super().__init__()
+        self.fake = fake
+
+    def send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
+        answered = self.fake.serve(request.url, dict(request.headers))
+        response = requests.Response()
+        response.status_code, response.reason = answered.status_code, "fake"
+        response.headers = CaseInsensitiveDict(answered.headers)
+        response.raw, response.url, response.request, response.connection = answered.raw, request.url, request, self
+        return response
+
+    def close(self):
+        pass
 
 
 def parquet_shard(shard, groups, rows_per_group, text_bytes, labels=("a", "b"), nested=False, **options):
@@ -187,10 +215,30 @@ class FakeHuggingFace:
                 return Response(self.head_failures.pop(0), {"error": "busy"})
             recorded = HUB.get(url.removeprefix(parquet.HUB), {"status": 404, "body": {"error": "Repository not found"}})
             return Response(recorded["status"], recorded["body"])
-        assert stream, "shards are streamed"
+        raise AssertionError(f"a shard is read through a session's adapter, not requests.get: {url}")
+
+    def install(self, monkeypatch):
+        """Answer the listing and the Hub for `requests.get` and `.post`, and
+        shards for a real `requests.Session` with this fake as its transport."""
+        real_session = requests.Session
+
+        def session():
+            made = real_session()
+            made.mount("https://", FakeAdapter(self))
+            made.mount("http://", FakeAdapter(self))
+            return made
+
+        monkeypatch.setattr(parquet.requests, "get", self.get)
+        monkeypatch.setattr(parquet.requests, "post", self.post)
+        monkeypatch.setattr(parquet.requests, "Session", session)
+
+    def serve(self, url, headers):
+        """A shard request, as the Hub and its CDN answer it."""
+        if self.failures:
+            return Response(self.failures.pop(0), {"error": "busy"})
         url, _, query = url.partition("?")
         hop = int(query.removeprefix("hop=")) if query.startswith("hop=") else 0
-        if hop < self.redirects and headers and "Range" in headers:
+        if hop < self.redirects and "Range" in headers:
             # The Hub answers a pinned resolve/ URL with a redirect to its CDN.
             location = self.redirect_location
             if location is None:
@@ -198,11 +246,6 @@ class FakeHuggingFace:
             response = Response(302, content=self.redirect_body, headers={"Location": location, "Content-Length": str(len(self.redirect_body))})
             self.redirect_responses.append(response)
             self.asked_headers.append(dict(headers))
-            if kwargs.get("allow_redirects", True):
-                # What requests does when it follows a redirect: reads its body, then asks again.
-                response.raw.read()
-                response.close()
-                return self.get(urljoin(url, location), params, timeout, stream, headers, **kwargs)
             return response
         if url not in self.downloads:
             self.downloads.append(url)
@@ -234,8 +277,7 @@ class FakeHuggingFace:
 @pytest.fixture
 def hf(monkeypatch):
     fake = FakeHuggingFace()
-    monkeypatch.setattr(parquet.requests, "get", fake.get)
-    monkeypatch.setattr(parquet.requests, "post", fake.post)
+    fake.install(monkeypatch)
     return fake
 
 

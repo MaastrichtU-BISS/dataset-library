@@ -246,8 +246,7 @@ def test_a_copy_is_made_with_the_range_read_fetch_from_shards_over_the_cap(clien
         return parquet.fetch_shards(external_id, config, split, max_bytes, dest_dir, sleep=lambda s: None, **kwargs)
 
     with monkeypatch.context() as hub:
-        hub.setattr(parquet.requests, "get", fake.get)
-        hub.setattr(parquet.requests, "post", fake.post)
+        fake.install(hub)
         with app.app_context():
             snapshots.run_copy(copy["id"], session=app.db.session, fetch_shards=fetch_shards, snapshot_dir=snapshot_dir, max_bytes=cap)
 
@@ -283,8 +282,7 @@ def test_a_range_read_fetch_that_cannot_write_its_files_fails_the_copy_as_a_writ
         return parquet.fetch_shards(external_id, config, split, max_bytes, dest_dir, sleep=lambda s: None, **kwargs)
 
     with monkeypatch.context() as hub:
-        hub.setattr(parquet.requests, "get", fake.get)
-        hub.setattr(parquet.requests, "post", fake.post)
+        fake.install(hub)
         hub.setattr(pq.ParquetWriter, "write_table", cannot_write)
         with app.app_context():
             snapshots.run_copy(copy["id"], session=app.db.session, fetch_shards=fetch_shards, snapshot_dir=snapshot_dir, max_bytes=10**9)
@@ -308,8 +306,7 @@ def test_a_copy_of_a_shard_that_is_not_parquet_is_refused_not_busy(client, app, 
         return parquet.fetch_shards(external_id, config, split, max_bytes, dest_dir, sleep=lambda s: None, **kwargs)
 
     with monkeypatch.context() as hub:
-        hub.setattr(parquet.requests, "get", fake.get)
-        hub.setattr(parquet.requests, "post", fake.post)
+        fake.install(hub)
         with app.app_context():
             snapshots.run_copy(copy["id"], session=app.db.session, fetch_shards=fetch_shards, snapshot_dir=snapshot_dir, max_bytes=10**9)
 
