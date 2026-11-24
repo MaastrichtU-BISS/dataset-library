@@ -237,7 +237,7 @@ def test_a_copy_is_made_with_the_range_read_fetch_from_shards_over_the_cap(clien
     pinned = pin_as_admin(client)
     copy = copy_row(app, pinned["ref"])
     fake = FakeHuggingFace()
-    shards = [parquet_shard(s, groups=6, rows_per_group=20, text_bytes=200) for s in range(3)]
+    shards = [parquet_shard(s, groups=6, rows_per_group=1, text_bytes=4400) for s in range(3)]
     fake.add_dataset(GREEK, copy["config"], copy["split"], shards, revision=SHA)
     cap = 20_000
     assert min(len(shard) for shard in shards) > cap
@@ -259,6 +259,38 @@ def test_a_copy_is_made_with_the_range_read_fetch_from_shards_over_the_cap(clien
     assert {text.split("-", 1)[0] for text in texts} == {"s0", "s1", "s2"}
     assert copy["columns"] == [{"name": "text", "type": "string"}, {"name": "label", "type": "int64"}]
     assert 0 < fake.served <= cap
+
+
+@pytest.mark.parametrize(
+    "error, code",
+    [(errno.ENOSPC, "storage_full"), (errno.EIO, "write_failed")],
+)
+def test_a_range_read_fetch_that_cannot_write_its_files_fails_the_copy_as_a_write(client, app, snapshot_dir, monkeypatch, error, code):
+    # #178: a local file the fetch cannot write raises its own OSError, not
+    # Hugging Face being busy, so the copy says what went wrong.
+    from dataset_library.providers import parquet
+    from test_fetch_shards import FakeHuggingFace, parquet_shard
+
+    pinned = pin_as_admin(client)
+    copy = copy_row(app, pinned["ref"])
+    fake = FakeHuggingFace()
+    fake.add_dataset(GREEK, copy["config"], copy["split"], [parquet_shard(0, groups=2, rows_per_group=2, text_bytes=64)], revision=SHA)
+
+    def cannot_write(self, table, *args, **kwargs):
+        raise OSError(error, os.strerror(error))
+
+    def fetch_shards(external_id, config, split, max_bytes, dest_dir, **kwargs):
+        return parquet.fetch_shards(external_id, config, split, max_bytes, dest_dir, sleep=lambda s: None, **kwargs)
+
+    with monkeypatch.context() as hub:
+        hub.setattr(parquet.requests, "get", fake.get)
+        hub.setattr(parquet.requests, "post", fake.post)
+        hub.setattr(pq.ParquetWriter, "write_table", cannot_write)
+        with app.app_context():
+            snapshots.run_copy(copy["id"], session=app.db.session, fetch_shards=fetch_shards, snapshot_dir=snapshot_dir, max_bytes=10**9)
+
+    copy = copy_row(app, pinned["ref"])
+    assert (copy["status"], copy["error_code"]) == ("failed", code), copy
 
 
 @pytest.mark.parametrize(

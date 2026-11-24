@@ -11,3 +11,8 @@ class ProviderUnavailable(ProviderError):
 
 class ProviderRateLimited(ProviderError):
     pass
+
+
+class NotParquet(ProviderUnavailable):
+    """A listed file is not a Parquet file that can be read. Asking again cannot
+    help, so an import refuses it rather than calling the provider busy."""
