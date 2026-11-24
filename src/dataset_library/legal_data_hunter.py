@@ -15,6 +15,7 @@ The package never keeps a key. The host gives one seam, ``legal_data_hunter_key(
 user's key or None; it is asked when the key is needed, by the request or by the worker.
 """
 import logging
+import time
 from datetime import timedelta
 
 import sqlalchemy as sa
@@ -49,6 +50,10 @@ MAX_TITLE = 120
 MAX_DESCRIPTION = 2000
 # A paused import's fetched documents are kept this long for Try again; the free plan's day limit resets well within it.
 KEEP_FETCHED = timedelta(days=7)
+# Every plan has a per-minute cap (60 a minute on the free plan), which a 100-document import can reach. A 429 for it
+# is waited out, never shown as credits running out; these bound the wait so an import cannot hang on it.
+MINUTE_WAIT_SECONDS = 60
+MINUTE_WAITS = 3
 FETCHED, NO_TEXT, MISSING = "fetched", "no_text", "missing"
 TERMS = LEGAL_DATA_HUNTER_TERMS
 
@@ -450,15 +455,26 @@ def fetch(session, record, key_for_owner):
         found.position: found
         for found in session.query(LibraryLegalDataHunterDocument).filter_by(import_id=record.id)
     }
-    for position, ref in enumerate(documents):
+    waits = 0
+    position = 0
+    while position < len(documents):
         if position in done:
+            position += 1
             continue
+        ref = documents[position]
         _still_running(session, record)
         try:
             found = provider.document(key, ref)
         except DocumentNotFound:
             outcome, row = MISSING, None
         except OutOfCredits as ran_out:
+            if ran_out.per_minute and waits < MINUTE_WAITS:
+                # Only the per-minute cap: wait it out and ask for the same document again.
+                waits += 1
+                _sleep(min(max(ran_out.retry_after or MINUTE_WAIT_SECONDS, 1), MINUTE_WAIT_SECONDS))
+                continue
+            if ran_out.per_minute:
+                raise ImportFailed("provider_busy", provider.SLOW_DOWN) from None
             resume = None
             if ran_out.retry_after is not None:
                 resume = imports_module._now() + timedelta(seconds=ran_out.retry_after)
@@ -474,10 +490,17 @@ def fetch(session, record, key_for_owner):
         session.add(kept)
         session.commit()
         done[position] = kept
+        waits = 0
+        position += 1
     rows = [done[p].row for p in sorted(done) if done[p].outcome == FETCHED and p < len(documents)]
     skipped = sum(1 for p in done if done[p].outcome == NO_TEXT and p < len(documents))
     missing = sum(1 for p in done if done[p].outcome == MISSING and p < len(documents))
     return rows, skipped, missing
+
+
+def _sleep(seconds):
+    """Wait out Legal Data Hunter's per-minute cap. Tests replace it."""
+    time.sleep(seconds)
 
 
 def _still_running(session, record):

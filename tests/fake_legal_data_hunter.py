@@ -38,6 +38,7 @@ class FakeLegalDataHunter:
         self.redirects = {}  # path -> Location header
         self.gone = set()  # "country/source/source_id" answered 404
         self.busy = False
+        self.minute_limited = 0  # requests answered with a per-minute 429 before the next one goes through
         self.calls = []  # {method, url, path, params, json, key}
 
     def request(self, method, url, params=None, json=None, headers=None, timeout=None, allow_redirects=True, **kwargs):
@@ -59,6 +60,12 @@ class FakeLegalDataHunter:
             return Response(500, {"detail": "Internal Server Error"})
         if auth.removeprefix("Bearer ") not in self.keys:
             return Response(401, {"detail": "Invalid API key"})
+        if self.minute_limited > 0:
+            self.minute_limited -= 1
+            return Response(429, {
+                "type": "error",
+                "error": {"type": "rate_limit_error", "message": "Per-minute limit reached", "limit_type": "minute", "plan": "free"},
+            }, {"Retry-After": "7"})
         if self.credits is not None:
             if self.credits <= 0:
                 return Response(429, {

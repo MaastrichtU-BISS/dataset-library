@@ -27,7 +27,8 @@ While the version is 0.x, minor releases may contain breaking changes.
     "Needs your Legal Data Hunter key — add it in Settings".
   - Importing (`POST /imports` with `provider: "legal_data_hunter"`) always needs `licenseAck: true`; its
     time is the provenance's `licenseAckAt`. The worker fetches each document through
-    `GET /v1/documents/{country}/{source}?source_id=` with the student's key, writes one unlabelled row
+    `GET /v1/documents/{country}/{source}?source_id=` with the student's key (waiting out a 429 for the
+    per-minute cap rather than pausing as out of credits), writes one unlabelled row
     per document (`text, court, date, country, language, ecli, eli, source_url, text_truncated`), and counts
     documents with no text (`skipped`) and documents gone (`missing`).
   - Out of credits (429): the import fails as `out_of_credits` with "Fetched N of M — your Legal Data

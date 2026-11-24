@@ -32,6 +32,8 @@ MAX_QUERY = 1000
 MAX_FILTERS = 10
 COUNTRY = re.compile(r"^[A-Za-z]{2,8}$")
 SOURCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\- ]{0,99}$")
+# A search's source filter, as Legal Data Hunter's discovery names sources: with their country (`FR/CNIL`) or without.
+SOURCE_FILTER = re.compile(r"^(?:[A-Za-z]{2,8}/)?[A-Za-z0-9][A-Za-z0-9_.\- ]{0,99}$")
 SOURCE_ID_MAX = 500
 TITLE_MAX = 300
 
@@ -45,6 +47,7 @@ CONFIRMATION_CHECKBOX = "My Legal Data Hunter plan allows storing these document
 NEEDS_CONFIRMATION = "Tick the box to confirm your Legal Data Hunter plan allows storing these documents and training models on them."
 BAD_KEY = "Legal Data Hunter refused your key. Check it in Settings."
 BUSY = "Legal Data Hunter is busy. Try again in a few minutes."
+SLOW_DOWN = "Legal Data Hunter asked us to slow down. Try again in a minute."
 CREDITS_RAN_OUT = "Your Legal Data Hunter credits ran out. Try again when they reset."
 NOT_OFFERED = "Legal Data Hunter is not set up on this platform."
 NOT_IN_LIBRARY = "That dataset is not in the library."
@@ -80,11 +83,18 @@ class BadKey(ProviderError):
 
 
 class OutOfCredits(ProviderRateLimited):
-    """The key's calls ran out (429). `retry_after` is how many seconds Legal Data Hunter said to wait, or None."""
+    """The key's calls ran out (429). `retry_after` is how many seconds Legal Data Hunter said to wait, or None.
+    `limit_type` is the window it hit: `minute` (a cap on every plan, over in a minute), `day` or `period`."""
 
-    def __init__(self, retry_after=None):
+    def __init__(self, retry_after=None, limit_type=None):
         super().__init__("Legal Data Hunter's limit was reached")
         self.retry_after = retry_after
+        self.limit_type = limit_type
+
+    @property
+    def per_minute(self):
+        """Only the per-minute cap was hit: the credits are not spent, and waiting a minute is enough."""
+        return self.limit_type == "minute"
 
 
 class OffOrigin(ProviderUnavailable):
@@ -122,7 +132,7 @@ def _request(method, path, key, *, params=None, body=None):
         if status == 404:
             raise DocumentNotFound("Legal Data Hunter answered 404")
         if status == 429:
-            raise OutOfCredits(retry_after(response.headers.get("Retry-After")))
+            raise OutOfCredits(retry_after(response.headers.get("Retry-After")), _limit_type(response))
         if status != 200:
             raise ProviderUnavailable(f"Legal Data Hunter answered {status}")
         try:
@@ -133,6 +143,17 @@ def _request(method, path, key, *, params=None, body=None):
             raise ProviderUnavailable("Legal Data Hunter answered with something unreadable")
         return found
     raise ProviderUnavailable("Legal Data Hunter redirected too many times")
+
+
+def _limit_type(response):
+    """Which window a 429 is for (`minute`, `day` or `period`), from its error body; None when it does not say."""
+    try:
+        found = response.json()
+    except ValueError:
+        return None
+    error = found.get("error") if isinstance(found, dict) else None
+    kind = error.get("limit_type") if isinstance(error, dict) else None
+    return kind if kind in ("minute", "day", "period") else None
 
 
 def retry_after(value, now=None):
@@ -196,7 +217,7 @@ def check_query(body):
     if corpus not in CORPORA:
         fields["corpus"] = "Choose case law, legislation or doctrine."
     country = _list_of(body.get("country"), COUNTRY, "country", fields, upper=True)
-    source = _list_of(body.get("source"), SOURCE, "source", fields)
+    source = _list_of(body.get("source"), SOURCE_FILTER, "source", fields)
     date_from = _day(body.get("dateFrom"), "dateFrom", fields)
     date_to = _day(body.get("dateTo"), "dateTo", fields)
     if date_from and date_to and date_from > date_to:

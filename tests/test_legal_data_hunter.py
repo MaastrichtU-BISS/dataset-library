@@ -687,3 +687,59 @@ def test_without_the_key_seam_legal_data_hunter_is_not_offered(make_app, hunter)
     refused = client.post("/api/library/imports", json={"provider": "legal_data_hunter", "dataset": ref, "licenseAck": True}, headers=ALICE)
     assert refused.status_code == 404 and refused.get_json()["code"] == "not_offered"
     assert hunter.calls == []
+
+
+def test_a_source_filter_may_name_its_country_as_discovery_does(client, hunter):
+    response = client.post(
+        "/api/library/admin/legal-data-hunter/preview", json={**QUERY, "source": ["FR/CNIL", "rechtspraak"]}, headers=ADMIN,
+    )
+    assert response.status_code == 200, response.get_json()
+    assert hunter.calls[-1]["json"]["source"] == ["FR/CNIL", "rechtspraak"]
+    bad = client.post("/api/library/admin/legal-data-hunter/preview", json={**QUERY, "source": ["FR/CNIL/x"]}, headers=ADMIN)
+    assert bad.status_code == 400 and "query.source" in bad.get_json()["fields"]
+
+
+def test_the_per_minute_cap_is_waited_out_not_shown_as_credits_running_out(client, app, hunter, tmp_path, monkeypatch):
+    waited = []
+    monkeypatch.setattr(ldh, "_sleep", waited.append)
+    entry = create(client)
+    queued = start(client, entry)
+    hunter.calls.clear()
+    hunter.minute_limited = 2
+
+    done, sink = work(app, tmp_path, queued["id"])
+
+    assert done["status"] == "completed", done
+    assert waited == [7, 7]  # Retry-After, twice
+    fetched = hunter.documents_fetched()
+    assert fetched[0] == fetched[1] == fetched[2]  # the same document asked for again, not skipped
+    assert len(set(fetched)) == 5
+
+
+def test_a_per_minute_cap_that_does_not_lift_stops_the_import_as_busy_and_keeps_what_it_fetched(client, app, hunter, tmp_path, monkeypatch):
+    monkeypatch.setattr(ldh, "_sleep", lambda seconds: None)
+    entry = create(client)
+    queued = start(client, entry)
+    hunter.calls.clear()
+    hunter.credits = 2  # two documents go through, then only per-minute refusals
+    original = hunter.request
+
+    def minute_after_two(*args, **kwargs):
+        if hunter.credits == 0:
+            hunter.minute_limited = 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(provider.requests, "request", minute_after_two)
+
+    stopped, _ = work(app, tmp_path, queued["id"])
+
+    assert stopped["status"] == "failed" and stopped["code"] == "provider_busy"
+    assert stopped["error"] == provider.SLOW_DOWN
+    assert kept(app, queued["id"]) == 2
+
+
+def test_an_admin_preview_over_the_per_minute_cap_is_asked_to_slow_down(client, hunter):
+    hunter.minute_limited = 1
+    response = client.post("/api/library/admin/legal-data-hunter/preview", json=QUERY, headers=ADMIN)
+    assert response.status_code == 429
+    assert response.get_json()["code"] == "slow_down"

@@ -166,8 +166,10 @@ annotation dataset (it has no label). A document with no text is skipped (`skipp
 Legal Data Hunter no longer has (404) too (`missing`); both are counted on the import and in
 provenance. An import fetches at most the row cap's worth of documents.
 
-Each document is kept as it is fetched (`library_ldh_documents`). When the credits run out
-(429) the import fails with code `out_of_credits` and "Fetched N of M — your Legal Data Hunter
+Each document is kept as it is fetched (`library_ldh_documents`). A 429 for Legal Data Hunter's
+per-minute cap (`limit_type: "minute"`, on every plan) is waited out, up to three times in a row, and
+the same document is asked for again; if it does not lift, the import fails as `provider_busy`. When
+the credits run out (a 429 for the day or the period) the import fails with code `out_of_credits` and "Fetched N of M — your Legal Data Hunter
 credits ran out. Try again when they reset.", and `resumeAfter` from `Retry-After`. Try again
 (`/imports/<ref>/retry`) moves the fetched documents to the new import, which fetches only the
 rest, from the ids the first import was started with. Fetched documents are deleted when the
@@ -220,7 +222,7 @@ Admins only (404 `not_offered` without the seam):
 - An entry: `ref`, `title`, `description`, `taskType`, `query`, `documents`, `documentCount`,
   `createdAt`, `updatedAt`, `refreshedAt`.
 - Errors: 400 `invalid` with `fields` (`query.q`, `query.corpus`, `query.dateFrom`, …), 409
-  `needs_key` (the admin has no key), 409 `bad_key`, 429 `out_of_credits` with `retryAfter`, 503
+  `needs_key` (the admin has no key), 409 `bad_key`, 429 `out_of_credits` with `retryAfter` (or `slow_down` for the per-minute cap), 503
   `provider_unavailable` (also for a redirect off Legal Data Hunter's origin), 404 `not_found`.
 - Audited: `library.ldh_entry_created`, `_updated`, `_refreshed`, `_removed`, with counts and
   field names only.

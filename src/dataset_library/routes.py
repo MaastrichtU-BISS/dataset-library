@@ -481,6 +481,8 @@ def _ldh_call(action, *args):
     except ldh_provider.BadKey:
         raise ApiError(409, ldh_provider.BAD_KEY, "bad_key")
     except ldh_provider.OutOfCredits as ran_out:
+        if ran_out.per_minute:
+            raise ApiError(429, ldh_provider.SLOW_DOWN, "slow_down", retryAfter=ran_out.retry_after)
         raise ApiError(429, ldh_provider.CREDITS_RAN_OUT, "out_of_credits", retryAfter=ran_out.retry_after)
     except ProviderError:
         raise ApiError(503, ldh_provider.BUSY, "provider_unavailable")
