@@ -422,6 +422,9 @@ def start(host, owner_id, body, *, ack_at=None, previous=None):
     if not documents:
         raise Refused(409, "no_documents", provider.NO_DOCUMENTS)
     task_type = previous.task_type if previous is not None else entry.task_type
+    if previous is not None and previous.dataset_ref:
+        # It stopped after its Dataset was made (a sweep or restart during saving): Try again would make a second one.
+        raise Refused(409, "already_saved", provider.ALREADY_SAVED)
     if previous is not None and previous.error_code == "too_large" and previous.failed_cap is not None:
         # Try again would pay for the same documents and stop at the same place.
         if limits_module.import_cap_bytes(session, host.max_fetch_bytes) <= previous.failed_cap:

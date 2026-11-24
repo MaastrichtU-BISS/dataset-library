@@ -1685,3 +1685,22 @@ def test_a_retry_after_of_too_many_digits_is_the_longest_wait_without_parsing():
     assert provider.retry_after("9" * 5000) == provider.MAX_RETRY_AFTER
     assert provider.retry_after("1" + "0" * 10) == provider.MAX_RETRY_AFTER
     assert provider.retry_after("0000000007") == 7
+
+
+def test_an_import_stopped_after_its_dataset_was_made_is_not_tried_again(client, app, hunter, tmp_path):
+    """A sweep or restart during saving leaves `stopped`, which is resumable, but the Dataset exists: Try again would
+    make a second one (and fetch nothing it needs)."""
+    queued = start(client, create(client))
+    with app.app_context():
+        record = app.db.session.get(LibraryImport, queued["id"])
+        record.status, record.error_code, record.dataset_ref = imports.FAILED, "stopped", "dataset-made-before-the-stop"
+        record.active_key = None
+        app.db.session.commit()
+    hunter.calls.clear()
+
+    refused = client.post(f"/api/library/imports/{queued['id']}/retry", headers=ALICE)
+
+    assert refused.status_code == 409 and refused.get_json()["code"] == "already_saved"
+    assert refused.get_json()["error"] == provider.ALREADY_SAVED
+    assert hunter.calls == []
+    assert record_of(app, queued["id"]).dismissed_at is None

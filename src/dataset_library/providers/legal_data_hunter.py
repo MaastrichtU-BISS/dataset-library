@@ -92,6 +92,7 @@ def too_large(max_bytes):
 
 ALREADY_RUNNING = "Another import of this entry is still running. Wait for it to finish, then try again."
 PUT_AWAY = "This import was put away, so it cannot be tried again. Start a new import instead."
+ALREADY_SAVED = "This import already made its dataset before it stopped. Find it in My datasets."
 CAP_UNCHANGED = (
     "This import stopped at the platform's download limit, so trying again now would stop at the same place. "
     "An admin has to raise the download limit first."

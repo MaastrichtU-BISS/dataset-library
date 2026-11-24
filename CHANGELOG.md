@@ -63,6 +63,8 @@ While the version is 0.x, minor releases may contain breaking changes.
     cap; its measured bytes are kept (`nbytes`), and a resumed import counts from them. A `too_large`
     import records the cap it stopped under (`failed_cap`), and Try again is refused with 409
     `cap_unchanged` until the cap is higher.
+  - Try again is refused with 409 `already_saved` for an import that stopped after its Dataset was made
+    (now that `stopped` is resumable), so it never makes a second Dataset.
   - At most one import of an entry per owner is queued or running (`active_key`, unique; null once it
     ends): a start that races another gets 409 `already_running`. Try again claims the paused import in
     the transaction that creates the new one (of two retries one starts, the other gets 409

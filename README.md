@@ -274,7 +274,8 @@ Any signed-in user:
   import. Refused: 409 `already_running` ("Another import of this entry is still running. Wait
   for it to finish, then try again."), 409 `not_retryable` (not failed or cancelled, put away,
   or claimed by another retry), 409 `cap_unchanged` (it stopped as `too_large` and the download
-  limit is not higher yet). The paused import is put away only once a new import stands in for
+  limit is not higher yet), 409 `already_saved` (it stopped after its Dataset was made, so
+  Try again would make a second one). The paused import is put away only once a new import stands in for
   it; this holds for every provider.
 
 Admins only (404 `not_offered` without the seam):
