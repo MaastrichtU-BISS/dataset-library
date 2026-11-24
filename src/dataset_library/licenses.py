@@ -153,8 +153,10 @@ def resolve_license(tag):
     """The License for a provider's tag (`cc-by-4.0`, `license:cc-by-4.0`, `CC0`...).
 
     Missing, `other` and anything unrecognised resolve to UNKNOWN, so a
-    license nobody checked is treated as one with a condition.
+    license nobody checked is treated as one with a condition. So does a
+    provider's terms (#126): a dataset's tag never claims to be one.
     """
     key = (tag or "").strip().lower().removeprefix("license:")
     key = ALIASES.get(key, key)
-    return LICENSES.get(key, UNKNOWN)
+    found = LICENSES.get(key, UNKNOWN)
+    return UNKNOWN if found.terms else found

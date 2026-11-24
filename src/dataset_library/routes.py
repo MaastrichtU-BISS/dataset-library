@@ -75,14 +75,19 @@ TASK_LABELS = {"classification": "Classification", "ner": "Named entities", "sum
 
 @library_bp.route("/options", methods=["GET"])
 def options():
-    """The filter choices, and the license table with this platform's levels."""
+    """The filter choices, and the license table with this platform's levels. A provider's terms (#126) are not a
+    license a dataset in search can have, so they are left out here; the admin's settings still list them."""
     host = _host()
     policy = policy_module.overrides(host.db)
     licenses = []
     for license in LICENSES.values():
+        if license.terms:
+            continue
         level = policy_module.level(license, policy)
         if level != "hide":
             licenses.append(license.at_level(level))
+    terms_groups = {license.group for license in LICENSES.values() if license.terms}
+    groups = [group for group in GROUPS if group not in terms_groups]
     return jsonify(
         {
             "tasks": [
@@ -91,7 +96,7 @@ def options():
                 if hugging_face_filter(task)
             ],
             "licenses": licenses,
-            "groups": GROUPS,
+            "groups": groups,
             "admin": bool(host.is_admin()),
             "importable": host.enqueue is not None,
             "maxRows": host.row_cap(),
@@ -225,7 +230,7 @@ def ldh_cards():
     host = _host()
     has_key = ldh_module.has_key(host, host.current_owner())
     return jsonify({
-        "entries": ldh_module.cards(host, host.current_owner()),
+        "entries": ldh_module.cards(host, host.current_owner(), keyed=has_key),
         "offered": ldh_module.offered(host),
         "hasKey": has_key,
         "needsKey": None if has_key else ldh_provider.NEEDS_KEY,
@@ -360,6 +365,9 @@ def put_settings():
     # A copy is kept only while its license is Allow: a changed level removes the copies it no longer allows (#121).
     if changes["licenses_changed"]:
         pins_module.reconcile_copies(host)
+        # Legal Data Hunter's terms set to Hide: no import may resume, so what they fetched goes (#126).
+        if ldh_module.TERMS.id in changes["licenses_changed"]:
+            ldh_module.hidden(host.db.session)
     host.audit("library.settings_saved", **changes)
     return jsonify({**admin_module.current(host.db, host), "groups": GROUPS})
 
