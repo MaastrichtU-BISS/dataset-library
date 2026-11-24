@@ -1183,3 +1183,36 @@ def test_the_providers_terms_are_not_a_license_a_student_filters_by(client, hub)
     assert found.status_code == 200 and found.get_json()["results"] == [] and hub.calls == []
     assert resolve_license("legal-data-hunter-terms") is UNKNOWN
     assert resolve_license("license:Legal-Data-Hunter-Terms") is UNKNOWN
+
+
+# Responses recorded from Legal Data Hunter on 2026-11-24 (search, and one NL and one Council of Europe document), with
+# the key removed and every text cut to 200 characters: its terms forbid storing or redistributing full text.
+RECORDED = __import__("pathlib").Path(__file__).parent / "fixtures" / "legal_data_hunter" / "recorded"
+
+
+def _recorded(name):
+    return json.loads((RECORDED / f"{name}.json").read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("country", ["nl", "coe"])
+def test_recorded_search_hits_name_documents_that_can_be_fetched(country):
+    found = _recorded(f"search_{country}")
+    hits = [provider._hit(item) for item in found["hits"]]
+    assert hits and all(hit is not None for hit in hits)
+    first = hits[0]
+    assert first["country"] == {"nl": "NL", "coe": "CoE"}[country]  # Legal Data Hunter's own case, kept
+    assert "/" not in first["source"] and first["sourceId"]
+
+
+@pytest.mark.parametrize("country", ["nl", "coe"])
+def test_recorded_documents_make_rows_with_the_fields_the_import_reads(country):
+    found = _recorded(f"document_{country}")
+    row = provider.row(found)
+    assert row is not None and row["text"]
+    assert row["country"] == found["country"]
+    assert row["source_url"] == found["url"]
+    assert row["date"] == found["date"]
+    assert row["text_truncated"] is False  # the document route sends no such field: the whole text came
+    if country == "coe":
+        assert row["court"] == "European Court of Human Rights"
+        assert row["ecli"].startswith("ECLI:CE:ECHR:")

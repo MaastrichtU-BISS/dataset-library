@@ -112,7 +112,8 @@ RECENT = timedelta(days=1)
 KEEP_FETCHED = timedelta(days=7)
 AFTER_RESET = timedelta(days=1)
 # The Legal Data Hunter failures Try again resumes from, keeping the documents fetched.
-RESUMABLE = frozenset({"out_of_credits", "provider_busy", "bad_key", "needs_key"})
+# `too_large`: an admin may raise the download limit, and Try again then resumes past what was kept.
+RESUMABLE = frozenset({"out_of_credits", "provider_busy", "bad_key", "needs_key", "too_large"})
 
 
 @dataclass

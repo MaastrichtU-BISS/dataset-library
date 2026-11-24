@@ -179,7 +179,8 @@ Legal Data Hunter no longer has (404) or refuses as malformed (400, 422) too (`m
 are counted on the import and in provenance. An import fetches at most the row cap's worth of
 documents, and its documents' responses together may not pass the worker's download cap (the
 `max_bytes` it passes to `run_import`, under the admin's cap): one that would fails as
-`too_large`, keeping the documents fetched before it. A country keeps the case Legal Data Hunter
+`too_large`, keeping the documents fetched before it, so Try again after an admin raises the limit
+resumes past them. A country keeps the case Legal Data Hunter
 gives it (`CoE`, `EU`, `INTL`); a search's country filter upper-cases two-letter codes only, and
 a hit whose source prefix (`FR/…`) disagrees with its `country` is left out.
 
