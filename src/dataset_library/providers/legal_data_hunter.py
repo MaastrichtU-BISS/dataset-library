@@ -1,9 +1,10 @@
 """Legal Data Hunter's REST API (#126): search, and one document by its id.
 
-Only ``https://legaldatahunter.com`` is ever called. A redirect is followed only on that origin; one to any other
-host is refused before anything is sent there, so the user's key never leaves it. The key is the caller's: it is
-sent as ``Authorization: Bearer sk-…`` (through ``requests``' ``auth=``, so a ``.netrc`` entry for the host cannot
-replace it) and never logged, stored or put in an error.
+Only ``https://legaldatahunter.com`` is ever called. A redirect is followed by hand, one hop at a time, and only on
+that origin; one to any other host is refused before anything is sent there, so the user's key never leaves it. A
+redirect's body is never read: only its ``Location``. The key is the caller's: it is sent as
+``Authorization: Bearer sk-…`` on every hop (as ``auth=``, so a ``.netrc`` entry for the host cannot replace it) and
+never logged, stored or put in an error.
 
 Search is ``POST /v1/search`` (one corpus, its ``namespace``, per call; at most 100 hits), a document is
 ``GET /v1/documents/{country}/{source}?source_id=…`` (the query form, since a source id may hold slashes). Each
@@ -32,6 +33,12 @@ MAX_RETRY_AFTER = 31 * 86_400
 MAX_RETRY_AFTER_DIGITS = 10
 # A response body is read this many bytes at a time, so a byte cap stops it within one chunk of the cap.
 CHUNK = 16_384
+# The statuses a redirect is followed for, and those whose bodies an import keeps or counts (a document, or why it is
+# missing): only these are read against the caller's byte cap. Any other body (a 429, a 5xx) is read no further than
+# ERROR_BODY_BYTES, never counted and never TooLarge.
+REDIRECTS = frozenset({301, 302, 303, 307, 308})
+COUNTED = frozenset({200, 400, 404, 422})
+ERROR_BODY_BYTES = 8_192
 # An entry holds at most this many documents (decision L8): each costs one credit per import.
 MAX_DOCUMENTS = 100
 # The corpora a search may look in (decision L15), as Legal Data Hunter names them (`namespace`).
@@ -92,7 +99,9 @@ def too_large(max_bytes):
 
 ALREADY_RUNNING = "Another import of this entry is still running. Wait for it to finish, then try again."
 PUT_AWAY = "This import was put away, so it cannot be tried again. Start a new import instead."
-ALREADY_SAVED = "This import already made its dataset before it stopped. Find it in My datasets."
+ALREADY_SAVED = (
+    "This import was saving its dataset when it stopped. Look for it in My datasets before importing again."
+)
 CAP_UNCHANGED = (
     "This import stopped at the platform's download limit, so trying again now would stop at the same place. "
     "An admin has to raise the download limit first."
@@ -170,64 +179,82 @@ class _Bearer(AuthBase):
 
 
 def _request(method, path, key, *, params=None, body=None, max_bytes=None):
-    """One call to Legal Data Hunter, as JSON. Redirects are followed by hand, and only on its origin. The body is
-    read streamed: past `max_bytes` it stops reading and raises TooLarge."""
+    """One call to Legal Data Hunter, as JSON. Redirects are followed by hand, and only on its origin. A counted body
+    (COUNTED) is read streamed: past `max_bytes` it stops reading and raises TooLarge. Any other is read no further
+    than ERROR_BODY_BYTES, and never counted."""
     if not isinstance(key, str) or not key.strip():
         raise BadKey("No key")
     url = ORIGIN + path
     headers = {"Accept": "application/json"}
     auth = _Bearer(key.strip())
-    for _ in range(MAX_REDIRECTS + 1):
-        try:
-            response = requests.request(
-                method, url, params=params, json=body, headers=headers, auth=auth, timeout=TIMEOUT,
-                allow_redirects=False, stream=True,
-            )
-        except requests.RequestException as failed:
-            raise ProviderUnavailable(f"Legal Data Hunter did not answer: {type(failed).__name__}") from None
-        status = response.status_code
-        if status in (301, 302, 303, 307, 308):
-            _close(response)
-            location = (response.headers.get("Location") or "").strip()
-            if not location:
-                raise ProviderUnavailable(f"Legal Data Hunter answered {status} with nowhere to go")
-            target = urljoin(url, location)
-            if origin_of(target) != ORIGIN:
-                raise OffOrigin("Legal Data Hunter redirected to another host")
-            if status == 303 or (status in (301, 302) and method != "GET"):
-                method, body = "GET", None
-            url, params = target, None
-            continue
-        if status in (401, 403):
-            _close(response)
-            raise BadKey(f"Legal Data Hunter answered {status}")
-        data = _read(response, max_bytes)
-        if status in (404, 400, 422):
-            gone = DocumentNotFound("Legal Data Hunter answered 404") if status == 404 else DocumentRejected(
-                f"Legal Data Hunter answered {status}"
-            )
-            gone.nbytes = len(data)
-            raise gone
-        if status == 429:
-            raise OutOfCredits(retry_after(response.headers.get("Retry-After")), _limit_type(data))
-        if status != 200:
-            raise ProviderUnavailable(f"Legal Data Hunter answered {status}")
-        found = _json(data)
-        if not isinstance(found, dict):
-            raise ProviderUnavailable("Legal Data Hunter answered with something unreadable")
-        answer = Answer(found)
-        answer.nbytes = len(data)
-        return answer
+    with requests.Session() as session:
+        for _ in range(MAX_REDIRECTS + 1):
+            hop = requests.Request(method, url, params=params, json=body, headers=headers, auth=auth)
+            response = _send(session, hop)
+            status = response.status_code
+            if status in REDIRECTS:
+                location = (response.headers.get("Location") or "").strip()
+                _close(response)  # unread: its body is never Legal Data Hunter's answer
+                if not location:
+                    raise ProviderUnavailable(f"Legal Data Hunter answered {status} with nowhere to go")
+                target = urljoin(url, location)
+                if origin_of(target) != ORIGIN:
+                    raise OffOrigin("Legal Data Hunter redirected to another host")
+                if status == 303 or (status in (301, 302) and method != "GET"):
+                    method, body = "GET", None
+                url, params = target, None
+                continue
+            if status in (401, 403):
+                _close(response)
+                raise BadKey(f"Legal Data Hunter answered {status}")
+            if status not in COUNTED:
+                # Read only to say why (which limit a 429 hit): never counted against the cap, never too large.
+                data = _read(response, ERROR_BODY_BYTES, cut=True)
+                if status == 429:
+                    raise OutOfCredits(retry_after(response.headers.get("Retry-After")), _limit_type(data))
+                raise ProviderUnavailable(f"Legal Data Hunter answered {status}")
+            data = _read(response, max_bytes)
+            if status != 200:
+                gone = DocumentNotFound("Legal Data Hunter answered 404") if status == 404 else DocumentRejected(
+                    f"Legal Data Hunter answered {status}"
+                )
+                gone.nbytes = len(data)
+                raise gone
+            found = _json(data)
+            if not isinstance(found, dict):
+                raise ProviderUnavailable("Legal Data Hunter answered with something unreadable")
+            answer = Answer(found)
+            answer.nbytes = len(data)
+            return answer
     raise ProviderUnavailable("Legal Data Hunter redirected too many times")
 
 
-def _read(response, max_bytes=None):
-    """The response body, read a chunk at a time; past `max_bytes` it stops at once and raises TooLarge."""
+def _send(session, hop):
+    """Send one hop and only that hop, streamed, with the key on it. Never `Session.send`: even without following
+    redirects it reads a redirect's body to prepare the next request. The hop is prepared by the session (so its
+    `auth=` wins over `.netrc`) and handed to the transport adapter, with the environment's proxies and CA bundle."""
+    try:
+        prepared = session.prepare_request(hop)
+        settings = session.merge_environment_settings(prepared.url, {}, True, None, None)
+        return session.get_adapter(prepared.url).send(
+            prepared, stream=True, timeout=TIMEOUT, verify=settings["verify"], cert=settings["cert"],
+            proxies=settings["proxies"],
+        )
+    except requests.RequestException as failed:
+        raise ProviderUnavailable(f"Legal Data Hunter did not answer: {type(failed).__name__}") from None
+
+
+def _read(response, max_bytes=None, *, cut=False):
+    """The response body, read a chunk at a time; past `max_bytes` it stops at once and raises TooLarge, or, with
+    `cut`, returns the first `max_bytes`."""
     data = bytearray()
     try:
         for chunk in response.iter_content(chunk_size=CHUNK):
             data += chunk
             if max_bytes is not None and len(data) > max_bytes:
+                if cut:
+                    del data[max_bytes:]
+                    break
                 raise TooLarge(len(data))
     except requests.RequestException as failed:
         raise ProviderUnavailable(f"Legal Data Hunter did not answer: {type(failed).__name__}") from None
@@ -262,6 +289,8 @@ def retry_after(value, now=None):
     MAX_RETRY_AFTER. None when it says neither."""
     text = str(value or "").strip()
     if text.isascii() and text.isdigit():
+        # Leading zeros say nothing: `00000000007` is 7 seconds.
+        text = text.lstrip("0") or "0"
         # Never parsed when it is this long: past Python's digit limit, int() would raise.
         if len(text) > MAX_RETRY_AFTER_DIGITS:
             return MAX_RETRY_AFTER

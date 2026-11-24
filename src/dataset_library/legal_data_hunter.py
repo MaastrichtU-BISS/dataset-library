@@ -29,7 +29,7 @@ from . import limits as limits_module
 from . import policy as policy_module
 from .errors import ProviderError
 from .licenses import LEGAL_DATA_HUNTER_TERMS
-from .models import LibraryImport, LibraryLegalDataHunterDocument, LibraryLegalDataHunterEntry
+from .models import LibraryImport, LibraryLegalDataHunterDocument, LibraryLegalDataHunterEntry, LibrarySettings
 from .providers import legal_data_hunter as provider
 from .providers.legal_data_hunter import (  # noqa: F401 - the host's names for these come from here
     BAD_KEY,
@@ -422,8 +422,9 @@ def start(host, owner_id, body, *, ack_at=None, previous=None):
     if not documents:
         raise Refused(409, "no_documents", provider.NO_DOCUMENTS)
     task_type = previous.task_type if previous is not None else entry.task_type
-    if previous is not None and previous.dataset_ref:
-        # It stopped after its Dataset was made (a sweep or restart during saving): Try again would make a second one.
+    if previous is not None and (previous.saved_path or previous.dataset_ref):
+        # It stopped once it reached saving (a sweep or restart then): its Dataset may exist, or be being made, so Try
+        # again could make a second one. The claim below checks this again, in the same statement.
         raise Refused(409, "already_saved", provider.ALREADY_SAVED)
     if previous is not None and previous.error_code == "too_large" and previous.failed_cap is not None:
         # Try again would pay for the same documents and stop at the same place.
@@ -456,8 +457,11 @@ def start(host, owner_id, body, *, ack_at=None, previous=None):
         citation = imports_module._pinned(_citation(entry.title), None, now)
     previous_ref = previous.id if previous is not None else None
     if previous_ref is not None and not _put_away(session, previous_ref, now):
-        # Another Try again (or a Put away) got there first.
+        # Another Try again (or a Put away) got there first, or a worker reached saving since the check above.
         session.rollback()
+        session.refresh(previous)
+        if previous.saved_path or previous.dataset_ref:
+            raise Refused(409, "already_saved", provider.ALREADY_SAVED)
         raise Refused(409, "not_retryable", provider.PUT_AWAY)
     record = LibraryImport(
         owner_id=owner_id, provider=PROVIDER, external_id=entry_ref, config=None, split=None, revision=None,
@@ -506,15 +510,17 @@ def active_key(owner_id, entry_ref):
 
 
 def _put_away(session, import_ref, now):
-    """Claim a paused import for Try again: put it away if it is still failed or cancelled and nobody has. One
-    conditional update, not committed; returns whether it matched. Its `updated_at` is kept, so its pause is not
-    lengthened if the retry is undone."""
+    """Claim a paused import for Try again: put it away if it is still failed or cancelled, nobody has, and it never
+    reached saving (a save that commits first wins). One conditional update, not committed; returns whether it
+    matched. Its `updated_at` is kept, so its pause is not lengthened if the retry is undone."""
     return bool(session.execute(
         sa.update(LibraryImport)
         .where(
             LibraryImport.id == import_ref,
             LibraryImport.dismissed_at.is_(None),
             LibraryImport.status.in_((imports_module.FAILED, imports_module.CANCELLED)),
+            LibraryImport.saved_path.is_(None),
+            LibraryImport.dataset_ref.is_(None),
         )
         .values(dismissed_at=now, updated_at=LibraryImport.updated_at)
         .execution_options(synchronize_session=False)
@@ -566,6 +572,9 @@ def fetch(session, record, key_for_owner, max_bytes=None):
     }
     # The bytes the kept documents' responses measured, so a resumed import cannot step past the cap a run at a time.
     total = sum(_paid(found) for found in done.values())
+    if max_bytes is not None and total > max_bytes:
+        # The cap was lowered since they were kept: even with nothing more to fetch, the import is over it.
+        raise ImportFailed("too_large", provider.too_large(max_bytes), failed_cap=max_bytes)
     waits = 0
     position = 0
     while position < len(documents):
@@ -574,6 +583,8 @@ def fetch(session, record, key_for_owner, max_bytes=None):
             continue
         ref = documents[position]
         _still_running(session, record)
+        # Before every request, a repeat after a per-minute wait too: under Hide nothing more is asked for.
+        still_allowed(session, record)
         # What is left of the cap: the response is read only this far.
         allowance = None if max_bytes is None else max(max_bytes - total, 0)
         try:
@@ -708,13 +719,65 @@ def _still_running(session, record):
 
 
 def discard(session, import_ref):
-    """Delete the documents an import fetched: it completed, or the student put it away."""
+    """Delete the documents an import fetched (it completed, or the student put it away), and a CSV it wrote but never
+    handed to the host."""
     session.execute(
         sa.delete(LibraryLegalDataHunterDocument)
         .where(LibraryLegalDataHunterDocument.import_id == import_ref)
         .execution_options(synchronize_session=False)
     )
     session.commit()
+    unstage(session, LibraryImport.id == import_ref)
+
+
+def unstage(session, *where):
+    """Delete the CSVs of the imports matching `where` that were written (`staging_path`) but never handed to the host
+    (`saved_path` null): the worker died, or was stopped, before saving. Each is claimed first, by setting its
+    `staging_path` to null while `saved_path` is still null, and committed, so a worker can no longer move to saving
+    with it (that move needs the CSV still staged); only then is the file deleted. A file whose import reached saving
+    is never deleted: it may be the host's Dataset's. Returns how many went."""
+    found = session.execute(
+        sa.select(LibraryImport.id, LibraryImport.staging_path).where(
+            LibraryImport.staging_path.is_not(None), LibraryImport.saved_path.is_(None), *where,
+        )
+    ).all()
+    claimed = []
+    for import_ref, path in found:
+        if session.execute(
+            sa.update(LibraryImport)
+            .where(
+                LibraryImport.id == import_ref,
+                LibraryImport.staging_path == path,
+                LibraryImport.saved_path.is_(None),
+            )
+            .values(staging_path=None, updated_at=LibraryImport.updated_at)
+            .execution_options(synchronize_session=False)
+        ).rowcount:
+            claimed.append(path)
+    session.commit()
+    for path in claimed:
+        imports_module._remove(path)
+    return len(claimed)
+
+
+def terms_not_hidden():
+    """A SQL condition: the admin has not set the terms to Hide, read from the policy row in the statement it is part
+    of (the move to saving), so a Hide committed first wins."""
+    chosen = LibrarySettings.license_policy[TERMS.id].as_string()
+    return ~sa.exists().where(LibrarySettings.id == 1, chosen == "hide")
+
+
+def not_saved(session, record):
+    """The move to saving did not happen: stop when the import ended elsewhere or its CSV was claimed (an erasure);
+    otherwise the terms were Hide, and it fails as `license_hidden`, discarding what it fetched."""
+    try:
+        session.refresh(record)
+    except Exception:  # noqa: BLE001 - a deleted row (account erasure) stops it as a cancel does
+        raise imports_module._Stopped() from None
+    if record.status in imports_module.TERMINAL or record.staging_path is None:
+        raise imports_module._Stopped()
+    discard(session, record.id)
+    raise imports_module.ImportFailed("license_hidden", provider.LICENSE_HIDDEN)
 
 
 def purge(session, *, now=None, keep=KEEP_FETCHED):
@@ -734,6 +797,8 @@ def purge(session, *, now=None, keep=KEEP_FETCHED):
         .execution_options(synchronize_session=False)
     ).rowcount
     session.commit()
+    # And the CSVs of those imports never handed to the host.
+    unstage(session, LibraryImport.provider == PROVIDER, LibraryImport.id.not_in(alive))
     return gone
 
 
@@ -744,7 +809,7 @@ def _resumable_or_running(now, keep):
             sa.and_(
                 LibraryImport.status == imports_module.FAILED,
                 LibraryImport.dismissed_at.is_(None),
-                LibraryImport.error_code.in_(RESUMABLE),
+                imports_module.resumable_clause(),
                 imports_module.paused_until_clause(now, keep),
             ),
         )
@@ -752,10 +817,12 @@ def _resumable_or_running(now, keep):
 
 
 def erase(session, owner_id):
-    """For a host erasing a user: delete the documents that user's imports fetched, and set `created_by` to null on
-    the entries they made (entries are course data, and stay). The imports are the host's to delete with the rest of
-    the user's data, before or after this call: documents whose import is already gone are deleted too. Returns how
-    many documents went."""
+    """For a host erasing a user: delete the documents that user's imports fetched, and the CSVs they wrote but never
+    handed to the host, and set `created_by` to null on the entries they made (entries are course data, and stay).
+    The imports are the host's to delete with the rest of the user's data, after this call (their CSVs are found from
+    them; a CSV that became a Dataset's file goes with the user's Datasets): documents whose import is already gone are
+    deleted too. Returns how many documents went."""
+    unstage(session, LibraryImport.owner_id == owner_id)
     owned = sa.select(LibraryImport.id).where(LibraryImport.owner_id == owner_id)
     every = sa.select(LibraryImport.id)
     gone = session.execute(

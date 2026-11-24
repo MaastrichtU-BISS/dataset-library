@@ -61,8 +61,16 @@ def forbidden(*args, **kwargs):
 
 @pytest.fixture
 def hunter(monkeypatch):
+    """Legal Data Hunter, as the transport adapter of every `requests.Session` made during the test."""
     fake = FakeLegalDataHunter()
-    monkeypatch.setattr(provider.requests, "request", fake.request)
+    real_init = requests.Session.__init__
+
+    def mounted(session, *args, **kwargs):
+        real_init(session, *args, **kwargs)
+        session.mount("https://", fake)
+        session.mount("http://", fake)
+
+    monkeypatch.setattr(requests.Session, "__init__", mounted)
     return fake
 
 
@@ -741,14 +749,14 @@ def test_a_per_minute_cap_that_does_not_lift_stops_the_import_as_busy_and_keeps_
     queued = start(client, entry)
     hunter.calls.clear()
     hunter.credits = 2  # two documents go through, then only per-minute refusals
-    original = hunter.request
+    original = hunter.send
 
     def minute_after_two(*args, **kwargs):
         if hunter.credits == 0:
             hunter.minute_limited = 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(provider.requests, "request", minute_after_two)
+    monkeypatch.setattr(hunter, "send", minute_after_two)
 
     stopped, _ = work(app, tmp_path, queued["id"])
 
@@ -1101,27 +1109,20 @@ def test_an_import_stops_at_the_download_cap_and_keeps_what_it_fetched(client, a
     assert kept(app, queued["id"]) == 1 and sink.calls == []
 
 
-def test_a_netrc_entry_cannot_replace_the_users_key(tmp_path, monkeypatch):
+def test_a_netrc_entry_cannot_replace_the_users_key(hunter, tmp_path, monkeypatch):
+    """On every hop: the key is applied to each request the provider prepares, a redirect's too."""
     netrc = tmp_path / "netrc"
     netrc.write_text("machine legaldatahunter.com login intruder password hunter2\n")
     netrc.chmod(0o600)
     monkeypatch.setenv("NETRC", str(netrc))
     assert requests.utils.get_netrc_auth(provider.ORIGIN + "/v1/search") == ("intruder", "hunter2")
-    sent = []
-
-    def send(self, request, **kwargs):
-        sent.append(request)
-        response = requests.models.Response()
-        response.status_code, response._content, response.url, response.request = 200, b'{"hits": []}', request.url, request
-        response._content_consumed = True
-        return response
-
-    monkeypatch.setattr(requests.Session, "send", send)
+    hunter.redirects["/v1/documents/NL/old"] = "/v1/documents/NL/rechtspraak?source_id=ECLI:NL:HR:2023:1234"
 
     provider.search(STUDENT_KEY, provider.check_query({"q": "x"}))
+    provider.document(STUDENT_KEY, {"country": "NL", "source": "old", "sourceId": "ECLI:NL:HR:2023:1234"})
 
-    [request] = sent
-    assert request.headers["Authorization"] == f"Bearer {STUDENT_KEY}"
+    assert [call["key"] for call in hunter.calls] == [STUDENT_KEY] * 3
+    assert all(response.request.headers["Authorization"] == f"Bearer {STUDENT_KEY}" for response in hunter.responses)
 
 
 def test_a_key_seam_that_raises_is_no_key_and_never_breaks_a_page(make_app, hunter, caplog):
@@ -1704,3 +1705,254 @@ def test_an_import_stopped_after_its_dataset_was_made_is_not_tried_again(client,
     assert refused.get_json()["error"] == provider.ALREADY_SAVED
     assert hunter.calls == []
     assert record_of(app, queued["id"]).dismissed_at is None
+
+
+# --- Council fixes, round 3 (#126 review) -----------------------------------------------------------------------
+
+
+def retry(client, ref):
+    return client.post(f"/api/library/imports/{ref}/retry", headers=ALICE)
+
+
+def test_a_queued_retry_nothing_picked_up_keeps_its_documents_and_resumes_from_them(client, app, hunter, tmp_path):
+    """1: the sweep fails it as `not_started`, which Try again resumes from."""
+    _, paused = pause(client, app, hunter, tmp_path)
+    retried = retry(client, paused["id"])
+    assert retried.status_code == 202, retried.get_json()
+    ref = retried.get_json()["id"]
+
+    with app.app_context():
+        session = app.db.session
+        later = imports._now() + timedelta(minutes=31)
+        assert imports.sweep(session, now=later) == [ref]
+        swept = session.get(LibraryImport, ref)
+        assert (swept.status, swept.error_code) == ("failed", "not_started")
+        listed = [found["id"] for found in imports.current(library(app), "alice", now=later + timedelta(days=2))]
+    assert kept(app, ref) == 2 and ref in listed
+
+    hunter.calls.clear()
+    again = retry(client, ref)
+    assert again.status_code == 202, again.get_json()
+    done, sink = work(app, tmp_path, again.get_json()["id"])
+
+    assert done["status"] == "completed" and len(sink.calls) == 1
+    fetched = hunter.documents_fetched()
+    assert len(fetched) == len(set(fetched)) == 3  # only the three it had not fetched
+
+
+def test_hide_committed_just_before_the_move_to_saving_makes_no_dataset(file_app, hunter, tmp_path, monkeypatch):
+    """2: the move to saving reads the terms in the same statement, so a Hide that commits after the last check wins."""
+    app = file_app
+    client = app.test_client()
+    queued = start(client, create(client))
+    real = imports._move
+
+    def hidden_first(session, record, state, *args, **kwargs):
+        if state == imports.SAVING:
+            assert settings(client, {"legal-data-hunter-terms": "hide"}).status_code == 200
+        return real(session, record, state, *args, **kwargs)
+
+    monkeypatch.setattr(imports, "_move", hidden_first)
+    done, sink = work(app, tmp_path, queued["id"])
+
+    assert (done["status"], done["code"], done["error"]) == ("failed", "license_hidden", provider.LICENSE_HIDDEN)
+    assert sink.calls == [] and done["datasetRef"] is None
+    assert record_of(app, queued["id"]).saved_path is None
+    assert kept(app, queued["id"]) == 0 and not csv_of(tmp_path, queued["id"]).exists()
+
+
+def test_hide_during_a_per_minute_wait_asks_legal_data_hunter_nothing_more(file_app, hunter, tmp_path, monkeypatch):
+    """2: the terms are checked before every request, the one repeated after a wait too."""
+    app = file_app
+    client = app.test_client()
+    queued = start(client, create(client))
+    hunter.calls.clear()
+    hunter.minute_limited = 1
+
+    def hidden_while_waiting(seconds):
+        assert settings(client, {"legal-data-hunter-terms": "hide"}).status_code == 200
+
+    monkeypatch.setattr(ldh, "_sleep", hidden_while_waiting)
+    done, sink = work(app, tmp_path, queued["id"])
+
+    assert (done["status"], done["code"]) == ("failed", "license_hidden") and sink.calls == []
+    assert len(hunter.documents_fetched()) == 1  # the one answered with the per-minute 429, never asked again
+    assert kept(app, queued["id"]) == 0
+
+
+def test_a_redirects_body_is_never_read_and_only_the_answers_body_counts(hunter):
+    """3: through a real `requests.Session`, its transport the fake: the 302's body is closed unread."""
+    hunter.redirect_body = "x" * 50_000
+    hunter.redirects["/v1/documents/NL/old"] = "/v1/documents/NL/rechtspraak?source_id=ECLI:NL:HR:2023:1234"
+    size = len(json.dumps(DOCUMENTS["NL/rechtspraak/ECLI:NL:HR:2023:1234"]).encode("utf-8"))
+
+    found = provider.document(STUDENT_KEY, {"country": "NL", "source": "old", "sourceId": "ECLI:NL:HR:2023:1234"},
+                              max_bytes=size)
+
+    moved, answered = hunter.responses
+    assert isinstance(moved, requests.Response)
+    assert moved.status_code == 302 and moved.bytes_read == 0 and moved.closed
+    assert answered.status_code == 200 and found.nbytes == answered.bytes_read == size
+    assert [call["stream"] for call in hunter.calls] == [True, True]
+
+
+@pytest.mark.parametrize("refusal, code", [(429, "out_of_credits"), (500, "provider_busy")])
+def test_an_error_body_near_the_cap_is_never_too_large(client, app, hunter, tmp_path, monkeypatch, refusal, code):
+    """4: with 49 bytes of the cap left, a 300-byte 429 (or 500) is read to say why, and not counted."""
+    queued = start(client, create(client))
+    hunter.padding = "." * 260
+    hunter.responses.clear()
+    original = hunter.send
+
+    def refused_after_one(*args, **kwargs):
+        if len(hunter.responses) == 1:
+            hunter.credits, hunter.busy = (0, False) if refusal == 429 else (None, True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(hunter, "send", refused_after_one)
+    done, sink = work(app, tmp_path, queued["id"], max_bytes=601 + 49)
+
+    first, refused = hunter.responses
+    assert first.bytes_read == 601 and refused.status_code == refusal and len(refused._bytes()) >= 300
+    assert (done["status"], done["code"]) == ("failed", code) and sink.calls == []
+    assert kept(app, queued["id"]) == 1
+
+
+def test_a_retry_while_the_worker_is_saving_is_refused_and_makes_one_dataset(file_app, hunter, tmp_path):
+    """5: swept while `create_dataset` runs, before its ref is recorded: Try again is refused by `saved_path`."""
+    app = file_app
+    client = app.test_client()
+    queued = start(client, create(client))
+    sink = Sink()
+    retried = []
+
+    def swept_and_retried_while_saving(*args):
+        with app.app_context():  # another process: its own session, as the student's request would have
+            assert imports.sweep(app.db.session, now=imports._now() + timedelta(minutes=5)) == [queued["id"]]
+            retried.append(retry(client, queued["id"]))
+        return sink(*args)
+
+    work(app, tmp_path, queued["id"], sink=swept_and_retried_while_saving)
+
+    [refused] = retried
+    assert refused.status_code == 409 and refused.get_json()["code"] == "already_saved"
+    assert refused.get_json()["error"] == provider.ALREADY_SAVED
+    assert len(sink.calls) == 1
+    with app.app_context():
+        assert app.db.session.query(LibraryImport).count() == 1
+
+
+def test_a_save_recorded_between_the_retry_check_and_its_claim_wins(file_app, hunter, tmp_path, monkeypatch):
+    """5: the claim itself requires no save, so a Dataset recorded after the first check still refuses Try again."""
+    app = file_app
+    client = app.test_client()
+    _, paused = pause(client, app, hunter, tmp_path)
+    real = imports._pinned
+
+    def saved_meanwhile(*args):
+        with app.app_context():
+            session = app.db.session
+            session.execute(
+                sa.update(LibraryImport).where(LibraryImport.id == paused["id"]).values(dataset_ref="dataset-meanwhile")
+            )
+            session.commit()
+        return real(*args)
+
+    monkeypatch.setattr(imports, "_pinned", saved_meanwhile)
+    refused = retry(client, paused["id"])
+
+    assert refused.status_code == 409 and refused.get_json()["code"] == "already_saved"
+    with app.app_context():
+        assert app.db.session.query(LibraryImport).count() == 1
+    assert record_of(app, paused["id"]).dismissed_at is None
+
+
+def test_an_import_stopped_while_saving_is_neither_listed_nor_kept_as_resumable(client, app, hunter, tmp_path):
+    """6: swept inside `create_dataset`, then the worker dies: `stopped`, but with `saved_path`, so not resumable."""
+    queued = start(client, create(client))
+    sink = Sink()
+
+    def made_swept_and_killed(*args):
+        sink(*args)
+        with app.app_context():
+            assert imports.sweep(app.db.session, now=imports._now() + timedelta(minutes=5)) == [queued["id"]]
+        raise KeyboardInterrupt  # the worker dies before the Dataset's ref is recorded
+
+    with pytest.raises(KeyboardInterrupt):
+        work(app, tmp_path, queued["id"], sink=made_swept_and_killed)
+
+    swept = record_of(app, queued["id"])
+    assert (swept.status, swept.error_code, swept.dataset_ref) == ("failed", "stopped", None)
+    with app.app_context():
+        now = imports._now()
+        listed = [found["id"] for found in imports.current(library(app), "alice", now=now + timedelta(days=2))]
+        ldh.purge(app.db.session, now=now)
+    assert queued["id"] not in listed
+    assert kept(app, queued["id"]) == 0
+    assert csv_of(tmp_path, queued["id"]).exists()  # handed to the host: the Dataset's file, never deleted here
+
+
+def test_a_retry_over_a_lowered_cap_fails_too_large_with_nothing_left_to_fetch(client, app, hunter, tmp_path, monkeypatch):
+    """7: 601 bytes kept, the cap lowered to 600: the retry stops before saving, though it fetches nothing."""
+    full = create(client)
+    entry = create(client, documents=full["documents"][:1])
+    queued = start(client, entry)
+    real = imports._advance
+
+    def killed_after_fetching(session, record, state, updates=None):
+        if state == imports.SAMPLING:
+            raise KeyboardInterrupt
+        return real(session, record, state, updates)
+
+    monkeypatch.setattr(imports, "_advance", killed_after_fetching)
+    with pytest.raises(KeyboardInterrupt):
+        work(app, tmp_path, queued["id"])
+    monkeypatch.setattr(imports, "_advance", real)
+    with app.app_context():
+        assert imports.sweep(app.db.session, now=imports._now() + timedelta(minutes=5)) == [queued["id"]]
+        [document] = app.db.session.query(LibraryLegalDataHunterDocument).filter_by(import_id=queued["id"])
+        assert document.nbytes == 601
+    retried = retry(client, queued["id"])
+    assert retried.status_code == 202, retried.get_json()
+    hunter.calls.clear()
+
+    done, sink = work(app, tmp_path, retried.get_json()["id"], max_bytes=600)
+
+    assert (done["status"], done["code"]) == ("failed", "too_large") and sink.calls == []
+    assert done["datasetRef"] is None and hunter.calls == []
+    assert record_of(app, retried.get_json()["id"]).failed_cap == 600
+
+
+@pytest.mark.parametrize("cleanup", ["erasure", "sweep and dismissal"])
+def test_a_csv_written_before_the_worker_died_is_deleted(client, app, hunter, tmp_path, monkeypatch, cleanup):
+    """8: `staging_path` is committed before the CSV is written; with no `saved_path`, the package deletes the file."""
+    queued = start(client, create(client))
+    real = ldh.write_csv
+
+    def written_then_killed(path, rows):
+        real(path, rows)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ldh, "write_csv", written_then_killed)
+    with pytest.raises(KeyboardInterrupt):
+        work(app, tmp_path, queued["id"])
+    path = csv_of(tmp_path, queued["id"])
+    assert path.exists()
+
+    if cleanup == "erasure":
+        with app.app_context():
+            ldh.erase(app.db.session, "alice")
+    else:
+        with app.app_context():
+            assert imports.sweep(app.db.session, now=imports._now() + timedelta(minutes=5)) == [queued["id"]]
+        assert client.post(f"/api/library/imports/{queued['id']}/dismiss", headers=ALICE).status_code == 200
+
+    assert not path.exists()
+    assert record_of(app, queued["id"]).staging_path is None
+
+
+def test_a_retry_after_with_leading_zeros_is_read_as_its_number():
+    """9: the zeros are stripped before the length guard."""
+    assert provider.retry_after("00000000007") == 7
+    assert provider.retry_after("0" * 40 + "120") == 120
+    assert provider.retry_after("0000") == 0

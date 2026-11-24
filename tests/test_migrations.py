@@ -63,7 +63,7 @@ def test_legal_data_hunter_adds_its_entries_fetched_documents_and_import_columns
     }
     assert schema["library_ldh_documents"][1] == [("import_id", "position")]
     assert schema["library_ldh_documents"][0]["nbytes"] == ("INTEGER", True)
-    for column in ("documents", "skipped", "missing", "resume_after", "saved_path", "failed_cap", "active_key"):
+    for column in ("documents", "skipped", "missing", "resume_after", "saved_path", "staging_path", "failed_cap", "active_key"):
         assert schema["library_imports"][0][column][1] is True, column
     assert _revision("dl_0010_legal_data_hunter").down_revision == "dl_0009_community_file"
 
@@ -100,7 +100,9 @@ def test_legal_data_hunter_downgrades_to_the_community_schema():
 
     schema = _schema(migrated)
     assert "library_ldh_entries" not in schema and "library_ldh_documents" not in schema
-    assert not {"documents", "skipped", "missing", "resume_after", "saved_path", "failed_cap", "active_key"} & set(
+    assert not {
+        "documents", "skipped", "missing", "resume_after", "saved_path", "staging_path", "failed_cap", "active_key",
+    } & set(
         schema["library_imports"][0]
     )
     assert "ix_library_imports_active_key" not in _indexes(migrated, "library_imports")

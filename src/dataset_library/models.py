@@ -164,8 +164,11 @@ class LibraryImport(LibraryBase):
     # The CSV it hands `create_dataset`, saved with the move to saving, before the Dataset exists: the publish block
     # matches it while `dataset_ref` is not yet recorded. `failed_cap` is the download cap it stopped under as
     # `too_large`; Try again is refused until the cap is higher. `active_key` is `owner:entry` while it is queued or
-    # running, null otherwise: a unique index allows one active import of an entry per owner.
+    # running, null otherwise: a unique index allows one active import of an entry per owner. `staging_path` is the
+    # CSV, committed before it is written: while `saved_path` is null the file was never handed to the host, so the
+    # package deletes it when the import is swept, put away, purged or erased. Once claimed for that it is null again.
     saved_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    staging_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     failed_cap: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     active_key: Mapped[str | None] = mapped_column(String(300), nullable=True, unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)

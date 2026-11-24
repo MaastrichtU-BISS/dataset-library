@@ -114,7 +114,11 @@ AFTER_RESET = timedelta(days=1)
 # The Legal Data Hunter failures Try again resumes from, keeping the documents fetched.
 # `too_large`: an admin may raise the download limit, and Try again then resumes past what was kept.
 # `stopped`: the sweep failed it because its worker went quiet (a restart), which says nothing against resuming.
-RESUMABLE = frozenset({"out_of_credits", "provider_busy", "bad_key", "needs_key", "too_large", "stopped"})
+# `not_started`: a queued retry nothing picked up holds the documents it took over. `unexpected`: a database blip.
+# None of them resumes once the import reached saving (`saved_path` or `dataset_ref` set): its Dataset may exist.
+RESUMABLE = frozenset({
+    "out_of_credits", "provider_busy", "bad_key", "needs_key", "too_large", "stopped", "not_started", "unexpected",
+})
 
 
 @dataclass
@@ -471,7 +475,7 @@ def current(host, owner_id, now=None):
                         LibraryImport.updated_at >= now - RECENT,
                         sa.and_(
                             LibraryImport.provider == LEGAL_DATA_HUNTER,
-                            LibraryImport.error_code.in_(RESUMABLE),
+                            resumable_clause(),
                             paused_until_clause(now, KEEP_FETCHED),
                         ),
                     ),
@@ -481,6 +485,16 @@ def current(host, owner_id, now=None):
         .order_by(LibraryImport.created_at.desc())
     )
     return [record.to_dict() for record in found]
+
+
+def resumable_clause():
+    """A failure Try again resumes from (RESUMABLE), of an import that never reached saving: once it did, its Dataset
+    may exist, and Try again is refused (`already_saved`)."""
+    return sa.and_(
+        LibraryImport.error_code.in_(RESUMABLE),
+        LibraryImport.saved_path.is_(None),
+        LibraryImport.dataset_ref.is_(None),
+    )
 
 
 def paused_until_clause(now, keep):
@@ -496,15 +510,16 @@ def paused_until_clause(now, keep):
     )
 
 
-def _move(session, record, state, from_states, **values):
-    """Move `record` to `state` if it is still in one of `from_states`, in one
-    conditional update. Returns whether it moved; `record` is refreshed. A move
-    to a terminal state frees the import's `active_key` in the same statement."""
+def _move(session, record, state, from_states, *, where=(), **values):
+    """Move `record` to `state` if it is still in one of `from_states`, and every
+    clause of `where` holds, in one conditional update. Returns whether it moved;
+    `record` is refreshed. A move to a terminal state frees the import's
+    `active_key` in the same statement."""
     if state in TERMINAL:
         values = {"active_key": None, **values}
     moved = session.execute(
         sa.update(LibraryImport)
-        .where(LibraryImport.id == record.id, LibraryImport.status.in_(from_states))
+        .where(LibraryImport.id == record.id, LibraryImport.status.in_(from_states), *where)
         .values(status=state, updated_at=_now(), **values)
         .execution_options(synchronize_session=False)
     ).rowcount
@@ -620,8 +635,12 @@ def sweep(session, *, stale_after=STALE_AFTER, queued_after=QUEUED_AFTER, now=No
         if _move(session, record, FAILED, {record.status}, error_code=code, error_message=message):
             _log(record, "swept", code=code)
             swept.append(record.id)
-    # Legal Data Hunter documents no import will resume from are deleted (#126).
     from . import legal_data_hunter
+
+    # A CSV a swept Legal Data Hunter import wrote but never handed to the host is deleted (#126), and so are the
+    # documents no import will resume from.
+    if swept:
+        legal_data_hunter.unstage(session, LibraryImport.id.in_(swept))
 
     legal_data_hunter.purge(session, now=now)
     return swept
@@ -809,11 +828,26 @@ def _run_legal_data_hunter(session, record, key_for_owner, create_dataset, csv, 
     _advance(session, record, SAMPLING, {"skipped": skipped, "missing": missing, "resume_after": None})
     if not rows:
         raise ImportFailed("no_usable_rows", ldh_provider.NO_TEXT)
-    _advance(session, record, VALIDATING, {"sample_method": "all", "sample_note": None})
+    # The CSV's path is committed before it is written: a worker that dies before saving leaves a file the package can
+    # find and delete (legal_data_hunter.unstage).
+    _advance(session, record, VALIDATING, {"sample_method": "all", "sample_note": None, "staging_path": csv.path})
     legal_data_hunter.write_csv(csv.path, rows)
-    # The last check of the terms before the Dataset is made: under Hide it is not made.
-    legal_data_hunter.still_allowed(session, record)
-    _advance(session, record, SAVING, {"saved_path": csv.path})
+    # The move to saving is the last check of the terms, in the same statement: a Hide committed before it wins, and no
+    # Dataset is made. It also needs the CSV still staged: one an erasure claimed is never saved.
+    try:
+        session.refresh(record)
+    except (ObjectDeletedError, InvalidRequestError):
+        raise _Stopped()
+    if record.status in TERMINAL:
+        raise _Stopped()
+    saving = _move(
+        session, record, SAVING, {record.status},
+        where=(legal_data_hunter.terms_not_hidden(), LibraryImport.staging_path == csv.path),
+        heartbeat_at=_now(), saved_path=csv.path,
+    )
+    if not saving:
+        legal_data_hunter.not_saved(session, record)
+    _log(record, SAVING)
     dataset_ref = _create(create_dataset, record, csv)
     # Before anything else, whatever the import's status: the publish block reads it (legal_data_hunter.publish_refusal).
     _record_dataset(session, record, dataset_ref)
