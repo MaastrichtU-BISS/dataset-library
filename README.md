@@ -140,7 +140,9 @@ every signed-in user as featured cards labelled "Legal Data Hunter".
 Each user imports with their **own** key. The host gives one seam,
 `legal_data_hunter_key(owner_id)`, returning the user's key (`sk-…`) or None; the package
 never stores, logs or returns a key. Without the seam, Legal Data Hunter is not offered; a seam
-that raises is read as no key (only the exception's type is logged), so no page breaks. The key
+that raises is read as no key (only the exception's type is logged), so no page breaks. In the
+worker the same holds: a seam that raises fails the import as `needs_key`, which Try again resumes
+from, and only the exception's type is logged. The key
 goes out through `requests`' `auth=`, so a `.netrc` entry for the host cannot replace it. Only
 `https://legaldatahunter.com` is called: redirects are followed by hand, only on that
 origin, and one to any other host is refused before anything is sent there.
@@ -156,16 +158,24 @@ the free plan does not. So:
   `PUT /admin/settings` refuses `allow` with "Choose Warn or Hide.", and an `allow` stored any
   other way is read as Warn. Every license now carries `levels`, the levels an admin may choose.
   Hide takes the entries out of the library, fails queued imports, and deletes the documents
-  every import not running fetched (no Try again may resume while the terms are hidden).
+  every import not running fetched (no Try again may resume while the terms are hidden). A
+  running import checks the terms before it writes each document and once more before it saves
+  the dataset: under Hide it fails as `license_hidden` and discards what it fetched. While the
+  terms are Hide, `imports.sweep` deletes the documents of every import not running, whatever
+  its failure.
   `GET /options` leaves the terms out of the student's license filter, and no Hugging Face
   dataset's tag ever resolves to them (`resolve_license` gives `unknown`);
 - a dataset built from Legal Data Hunter, and any model trained on one, must not be published.
   Its provenance says `publishable: false` with `publishRefusal`; the host refuses with
-  `legal_data_hunter.publish_refusal(session, dataset_ref, model=False|True)`, which returns
-  `DATASET_PUBLISH_REFUSED` or `MODEL_PUBLISH_REFUSED`, or None for any other dataset. The worker
-  records the Dataset on its import, in its own commit, the moment `create_dataset` returns, and
-  `publish_refusal` matches any Legal Data Hunter import that made it, whatever its status, so a
-  dataset whose worker died before completing is still refused. Provenance's `publishable` and
+  `legal_data_hunter.publish_refusal(session, dataset_ref, model=False|True, file_path=None)`,
+  which returns `DATASET_PUBLISH_REFUSED` or `MODEL_PUBLISH_REFUSED`, or None for any other
+  dataset. **Hosts should pass the Dataset's `file_path`** (the path `create_dataset` was given
+  and stored). The worker saves that path on its import (`saved_path`) in the same commit as the
+  move to saving, before `create_dataset` is called, and records the Dataset's ref, in its own
+  commit, the moment `create_dataset` returns. `publish_refusal` matches any Legal Data Hunter
+  import by `dataset_ref` or by `saved_path == file_path`, whatever its status, so a dataset
+  whose worker died before its ref was recorded is still refused by its file
+  (`from_legal_data_hunter(session, dataset_ref, file_path=None)` is the same check as a bool). Provenance's `publishable` and
   `publishRefusal` cover a provider's terms only, not licenses: a dataset under a share-alike or
   no-derivatives license says `publishable: true`, and the host still checks its license itself.
 
@@ -178,9 +188,16 @@ annotation dataset (it has no label). A document with no text is skipped (`skipp
 Legal Data Hunter no longer has (404) or refuses as malformed (400, 422) too (`missing`); both
 are counted on the import and in provenance. An import fetches at most the row cap's worth of
 documents, and its documents' responses together may not pass the worker's download cap (the
-`max_bytes` it passes to `run_import`, under the admin's cap): one that would fails as
-`too_large`, keeping the documents fetched before it, so Try again after an admin raises the limit
-resumes past them. A country keeps the case Legal Data Hunter
+`max_bytes` it passes to `run_import`, under the admin's cap). Each response body is read
+streamed, and reading stops within one chunk of what is left of the cap; the bytes each
+document's response measured (`nbytes`, also for one with no text or one gone) are kept with
+it, and a resumed import starts its total from them. An import that would pass the cap fails as
+`too_large`, keeping the documents fetched before it, and records the cap it stopped under
+(`failed_cap`). Try again resumes past them once an admin has raised the download limit; until
+then it is refused with 409 `cap_unchanged` ("This import stopped at the platform's download
+limit, so trying again now would stop at the same place. An admin has to raise the download
+limit first."), without calling Legal Data Hunter. The worker's `max_bytes` should be the
+host's `max_fetch_bytes`, which the retry compares with. A country keeps the case Legal Data Hunter
 gives it (`CoE`, `EU`, `INTL`); a search's country filter upper-cases two-letter codes only, and
 a hit whose source prefix (`FR/…`) disagrees with its `country` is left out.
 
@@ -188,20 +205,37 @@ Each document is kept as it is fetched (`library_ldh_documents`). A 429 for Lega
 per-minute cap (`limit_type: "minute"`, on every plan) is waited out (its `Retry-After`, at least a
 second and at most a minute), up to three times in a row, and the same document is asked for again;
 if it does not lift, the import fails as `provider_busy`. A `Retry-After` is read as ASCII digits or
-an HTTP date, and never as more than 31 days. When
+an HTTP date, and never as more than 31 days; more than ten digits is read as 31 days without
+being parsed. When
 the credits run out (a 429 for the day or the period) the import fails with code `out_of_credits` and "Fetched N of M — your Legal Data Hunter
 credits ran out. Try again when they reset.", and `resumeAfter` from `Retry-After`. Such a pause
 stays on the student's list (`GET /imports`), and resumable, until a week after it paused or a
-day after its credits reset, whichever is later. Try again (`/imports/<ref>/retry`) moves the
+day after its credits reset, whichever is later; any other failure Try again resumes from stays
+listed for the week its documents are kept. Try again (`/imports/<ref>/retry`) moves the
 fetched documents to the new import, which fetches only the rest, from the ids the first import
 was started with, all of them, even when the entry has since been deleted or the row cap
 lowered. It is refused with 409 `already_running` while another import of the same entry runs,
-and with 409 `not_retryable` once the import was put away; when the queue refuses the new
-import, the documents go back to the paused one. A document that arrives after the import was
-cancelled, put away or erased is never written.
+and with 409 `not_retryable` once the import was put away. A retry claims the paused import
+(puts it away, with one conditional update from not put away) in the same transaction that
+inserts the new import and moves the documents, so of two retries of one import exactly one
+starts and the other gets 409 `not_retryable`. When the queue refuses the new import, one commit
+fails it as `not_started` and puts it away, moves the documents back to the paused import and
+takes the paused import out of put away, so a sweep in between finds nothing to delete.
+
+At most one import of an entry per owner is queued or running: such an import holds
+`active_key` (`"<owner>:<entry>"`), which has a unique index, and every move to completed,
+failed or cancelled (a sweep, a cancel, a failure, a queue refusal) sets it to null in the same
+statement. A start that loses a race to another start of the same entry gets 409
+`already_running`. Hugging Face and Community imports leave it null.
+
+Each document is written with one statement that writes it only while its import is running and
+not put away (`INSERT … SELECT … WHERE EXISTS`), so a document that arrives after the import was
+cancelled, put away or erased, even between the worker's last check and its write, is never
+written.
 
 Fetched documents are kept only for a failure Try again resumes from (`out_of_credits`,
-`provider_busy`, `bad_key`, `needs_key`), for as long as above. They are deleted when the import
+`provider_busy`, `bad_key`, `needs_key`, `too_large`, and `stopped`, the sweep's code for an
+import whose worker went quiet, as on a restart), for as long as above. They are deleted when the import
 completes (best effort: a failed delete leaves them to the sweep, never the dataset's file), is
 cancelled or put away, or fails any other way, and `imports.sweep` deletes any left over. A host
 erasing a user calls `legal_data_hunter.erase(session, owner_id)`, before or after deleting the
@@ -232,18 +266,22 @@ Any signed-in user:
   `resumeAfter`). Refused: 404 `not_found` / `not_offered`, 403 `license_hidden`, 409
   `needs_key`, `needs_ack` (every time without the confirmation), `no_documents`, 400
   `bad_name`. The task type is the entry's. A queued or running import of the same entry →
-  200 and that one. Failure codes from the worker: `out_of_credits`, `bad_key`, `needs_key`,
-  `provider_busy`, `license_hidden`, `needs_ack`, `no_usable_rows`, `not_offered`, `too_large`.
+  200 and that one; a start that races another start of it → 409 `already_running`. Failure
+  codes from the worker: `out_of_credits`, `bad_key`, `needs_key`, `provider_busy`,
+  `license_hidden`, `needs_ack`, `no_usable_rows`, `not_offered`, `too_large`, and the sweep's
+  `stopped`.
 - `POST /api/library/imports/<ref>/retry` of a Legal Data Hunter import → 202 and the new
   import. Refused: 409 `already_running` ("Another import of this entry is still running. Wait
-  for it to finish, then try again."), 409 `not_retryable` (not failed or cancelled, or put
-  away). The paused import is put away only once a new import stands in for it; this holds for
-  every provider.
+  for it to finish, then try again."), 409 `not_retryable` (not failed or cancelled, put away,
+  or claimed by another retry), 409 `cap_unchanged` (it stopped as `too_large` and the download
+  limit is not higher yet). The paused import is put away only once a new import stands in for
+  it; this holds for every provider.
 
 Admins only (404 `not_offered` without the seam):
 
 - `POST /api/library/admin/legal-data-hunter/preview` with `{"q", "corpus"?: "case_law" |
-  "legislation" | "doctrine", "country"?: [..], "source"?: [..], "dateFrom"?, "dateTo"?
+  "legislation" | "doctrine" (case law only when missing or null; any other value must name
+  one), "country"?: [..], "source"?: [..], "dateFrom"?, "dateTo"?
   (YYYY-MM-DD), "limit"? (1–100, default 100)}` → `{"query", "hits": [{"country", "source",
   "sourceId", "title", "court", "date", "ecli", "language", "url", "snippet"}], "total", "max"}`,
   searched with the admin's own key (one credit).
@@ -261,7 +299,7 @@ Admins only (404 `not_offered` without the seam):
 - An entry: `ref`, `title`, `description`, `taskType`, `query`, `documents`, `documentCount`,
   `createdAt`, `updatedAt`, `refreshedAt`.
 - Errors: 400 `invalid` with `fields` (`query.q`, `query.corpus` (also for a corpus that is not
-  text), `query.dateFrom`, …), 409
+  text, such as `[]`, `{}`, `false`, `0` or `""`), `query.dateFrom`, …), 409
   `needs_key` (the admin has no key), 409 `bad_key`, 429 `out_of_credits` with `retryAfter` (or `slow_down` for the per-minute cap), 503
   `provider_unavailable` (also for a redirect off Legal Data Hunter's origin, or one with no
   `Location`), 404 `not_found`.
