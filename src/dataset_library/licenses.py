@@ -10,7 +10,7 @@ from search).
 from dataclasses import asdict, dataclass
 from typing import Optional
 
-GROUPS = ["Open", "Share-alike", "Non-commercial", "No-derivatives", "Unknown"]
+GROUPS = ["Open", "Share-alike", "Non-commercial", "No-derivatives", "Unknown", "Provider terms"]
 LEVELS = ["allow", "warn", "hide"]
 
 _NC_CONDITION = "{name} allows non-commercial use only. Coursework and research are fine; paid work for a client is not."
@@ -37,20 +37,27 @@ class License:
     unknown: bool = False
     condition: Optional[str] = None
     ack: Optional[str] = None
+    # A provider's terms of use, not a license (#126): always confirmed, so never Allow.
+    terms: bool = False
 
     @property
     def level(self):
         """The default policy: confirm anything with a condition a student could break."""
-        return "warn" if (self.nc or self.nd or self.unknown) else "allow"
+        return "warn" if (self.nc or self.nd or self.unknown or self.terms) else "allow"
+
+    @property
+    def levels(self):
+        """The levels an admin may choose for this entry: Warn or Hide for a provider's terms, else any."""
+        return [lvl for lvl in LEVELS if lvl != "allow"] if self.terms else list(LEVELS)
 
     def to_dict(self):
-        return {**asdict(self), "level": self.level}
+        return {**asdict(self), "level": self.level, "levels": self.levels}
 
     def at_level(self, level):
         """The license as this platform applies it. An admin can set a license
         with no condition of its own to warn; it then still gets words to
         confirm, so the student never ticks an empty checkbox."""
-        body = {**asdict(self), "level": level}
+        body = {**asdict(self), "level": level, "levels": self.levels}
         if level == "warn" and not self.ack:
             body["ack"] = _DEFAULT_ACK.format(name=self.name)
         return body
@@ -92,6 +99,21 @@ UNKNOWN = License(
     ack="I have checked that I may use this dataset, and I will not share or publish it.",
 )
 
+# Legal Data Hunter's terms (#126, decision L9): the words step 2 shows and the box the student ticks.
+LEGAL_DATA_HUNTER_TERMS = License(
+    id="legal-data-hunter-terms",
+    name="Legal Data Hunter terms",
+    group="Provider terms",
+    url="https://legaldatahunter.com/terms",
+    short="your plan's terms",
+    terms=True,
+    condition=(
+        "Legal Data Hunter's terms forbid storing full text or training models unless your plan allows it. "
+        "The free plan does not."
+    ),
+    ack="My Legal Data Hunter plan allows storing these documents and training models on them.",
+)
+
 LICENSES = {
     lic.id: lic
     for lic in [
@@ -113,6 +135,7 @@ LICENSES = {
             sa=True, condition=_SA_CONDITION,
         ),
         UNKNOWN,
+        LEGAL_DATA_HUNTER_TERMS,
     ]
 }
 

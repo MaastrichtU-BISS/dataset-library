@@ -6,7 +6,7 @@ from typing import Callable, Protocol
 from .licenses import License, resolve_license
 from .limits import DEFAULT_MAX_DOWNLOAD_MB, HARD_MAX_ROWS
 
-__version__ = "0.15.0"
+__version__ = "0.16.0"
 
 __all__ = ["Cache", "License", "init_dataset_library", "resolve_license"]
 
@@ -49,6 +49,8 @@ class _Host:
     community: object | None = None
     # The most an import downloads, when no admin cap is set; the admin's cap never goes above it (#122).
     max_fetch_bytes: int = DEFAULT_MAX_DOWNLOAD_MB * 1_000_000
+    # A user's Legal Data Hunter key, or None (#126): legal_data_hunter_key(owner_id). Without it, not offered.
+    legal_data_hunter_key: Callable[[str], str | None] | None = None
 
     def row_cap(self):
         """The cap a new dataset meets: the admin's, else the host's default."""
@@ -79,6 +81,7 @@ def init_dataset_library(
     community_base_url=None,
     community_enqueue_preview=None,
     community_preview_max_bytes=None,
+    legal_data_hunter_key=None,
     url_prefix="/api/library",
 ):
     """Mount the library API on a host Flask app.
@@ -129,6 +132,12 @@ def init_dataset_library(
     queued once per cache key, and the request answers "preparing". The worker reads a file of up to
     ``community_preview_max_bytes`` (default ``community.PREVIEW_MAX_BYTES``); a larger file is shown
     without its rows and stays importable within the import cap.
+
+    Legal Data Hunter entries (#126) need one seam: ``legal_data_hunter_key(owner_id)`` returns that user's Legal
+    Data Hunter key (``sk-…``), or None when they have none. The package never stores, logs or returns a key; it asks
+    the seam when a key is needed (an admin's preview or Refresh, a card saying whether Import is enabled) and sends
+    it only to ``https://legaldatahunter.com``. The worker passes the same seam to ``run_import``. Without it, Legal
+    Data Hunter is not offered.
     """
     from .routes import library_bp
 
@@ -163,5 +172,6 @@ def init_dataset_library(
         enqueue_snapshot=enqueue_snapshot,
         community=community_seams,
         max_fetch_bytes=max_fetch_bytes or DEFAULT_MAX_DOWNLOAD_MB * 1_000_000,
+        legal_data_hunter_key=legal_data_hunter_key,
     )
     app.register_blueprint(library_bp, url_prefix=url_prefix)

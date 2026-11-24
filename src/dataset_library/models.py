@@ -154,6 +154,13 @@ class LibraryImport(LibraryBase):
     publication_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     origin: Mapped[str | None] = mapped_column(String(200), nullable=True)
     file_key: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # A Legal Data Hunter import (#126): `external_id` is the entry, `documents` the ids it fetches, frozen when it
+    # was started (a Refresh of the entry never changes them), and what it skipped: documents with no text, and
+    # documents Legal Data Hunter no longer has. `resume_after` is when its credits reset, as Retry-After said.
+    documents: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    skipped: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    missing: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    resume_after: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
     imported_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -187,6 +194,51 @@ class LibraryImport(LibraryBase):
             "rows": self.rows,
             "source": self.source,
             "datasetRef": self.dataset_ref,
+            # Legal Data Hunter (#126): how many documents it fetches, and how many it skipped.
+            "documentCount": len(self.documents) if self.documents is not None else None,
+            "skipped": self.skipped,
+            "missing": self.missing,
+            "resumeAfter": self.resume_after.isoformat() + "Z" if self.resume_after else None,
             "createdAt": self.created_at.isoformat() + "Z" if self.created_at else None,
             "importedAt": self.imported_at.isoformat() + "Z" if self.imported_at else None,
         }
+
+
+class LibraryLegalDataHunterEntry(LibraryBase):
+    """A course admin's Legal Data Hunter entry (#126): a search, and the documents it found, frozen.
+
+    `query` is the search as the admin made it ({q, corpus, country, source, dateFrom, dateTo}); `documents`
+    the ids it found, at most 100, each {country, source, sourceId, title}. A Refresh runs the query again and
+    replaces them; an import copies them when it starts, so a Refresh never changes it. Entries are course data:
+    `created_by` only says who made it, and a host erasing a user keeps it or sets it to null."""
+
+    __tablename__ = "library_ldh_entries"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    title: Mapped[str] = mapped_column(String(120))
+    description: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    task_type: Mapped[str] = mapped_column(String(40), default="classification", server_default="classification")
+    query: Mapped[dict] = mapped_column(JSON)
+    documents: Mapped[list] = mapped_column(JSON)
+    created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+    refreshed_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class LibraryLegalDataHunterDocument(LibraryBase):
+    """One document a Legal Data Hunter import has fetched, or skipped, so Try again resumes without fetching it
+    again (#126, decision L12). `position` is its place in the import's frozen list; `row` is the dataset row (null
+    when skipped). Rows are deleted once the import completes or is put away, and by the sweep after a week; a host
+    erasing a user deletes the rows of that user's imports (`legal_data_hunter.erase`)."""
+
+    __tablename__ = "library_ldh_documents"
+    __table_args__ = (UniqueConstraint("import_id", "position", name="uq_library_ldh_documents_position"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    import_id: Mapped[str] = mapped_column(String(36), index=True)
+    position: Mapped[int] = mapped_column(Integer)
+    # "fetched", "no_text" or "missing".
+    outcome: Mapped[str] = mapped_column(String(20))
+    row: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)

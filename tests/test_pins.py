@@ -257,7 +257,7 @@ def test_search_results_carry_the_ref_of_their_pin(client):
 
 
 def test_the_featured_row_is_empty_for_a_fresh_course(client):
-    assert client.get("/api/library/featured", headers=ALICE).get_json() == {"featured": []}
+    assert client.get("/api/library/featured", headers=ALICE).get_json() == {"featured": [], "legalDataHunter": []}
 
 
 def test_a_pin_inserted_between_the_lookup_and_the_insert_is_returned(client, monkeypatch):
