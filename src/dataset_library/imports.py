@@ -44,6 +44,7 @@ from .limits import import_cap_bytes
 from .models import LibraryImport
 from .ner import spans, tokens_to_text
 from .providers import community as community_provider
+from .providers import legal_data_hunter as ldh_provider
 
 logger = logging.getLogger("dataset_library")
 
@@ -56,6 +57,8 @@ CANCELLABLE = {QUEUED, FETCHING, SAMPLING, VALIDATING}
 # Where an import's sample was read: Hugging Face, the platform's copy (#121), or a Zenodo record's file (#122).
 HUGGING_FACE, SNAPSHOT, ZENODO = "huggingface", "snapshot", "zenodo"
 COMMUNITY = community_provider.PROVIDER
+# A Legal Data Hunter entry (#126): its documents are fetched one by one with the student's own key.
+LEGAL_DATA_HUNTER = ldh_provider.PROVIDER
 
 UNEXPECTED = "The import stopped on our side. Try again, and tell your course staff if it keeps happening."
 BUSY = "Hugging Face is busy. Try again in a few minutes."
@@ -104,6 +107,18 @@ STALE_AFTER = timedelta(minutes=2)
 QUEUED_AFTER = timedelta(minutes=30)
 # How long a failed import stays on the student's list unless put away.
 RECENT = timedelta(days=1)
+# A Legal Data Hunter import paused for Try again (#126) keeps its fetched documents, and one paused as out of
+# credits stays on the list, this long; one out of credits also until a day after its credits reset (`resume_after`).
+KEEP_FETCHED = timedelta(days=7)
+AFTER_RESET = timedelta(days=1)
+# The Legal Data Hunter failures Try again resumes from, keeping the documents fetched.
+# `too_large`: an admin may raise the download limit, and Try again then resumes past what was kept.
+# `stopped`: the sweep failed it because its worker went quiet (a restart), which says nothing against resuming.
+# `not_started`: a queued retry nothing picked up holds the documents it took over. `unexpected`: a database blip.
+# None of them resumes once the import reached saving (`saved_path` or `dataset_ref` set): its Dataset may exist.
+RESUMABLE = frozenset({
+    "out_of_credits", "provider_busy", "bad_key", "needs_key", "too_large", "stopped", "not_started", "unexpected",
+})
 
 
 @dataclass
@@ -122,10 +137,12 @@ class Fetched:
 class ImportFailed(Exception):
     """A refusal the student can act on: `message` is shown as it is."""
 
-    def __init__(self, code, message):
+    def __init__(self, code, message, **updates):
         super().__init__(message)
         self.code = code
         self.message = message
+        # Columns saved with the failure (a Legal Data Hunter import's `resume_after`, #126).
+        self.updates = updates
 
 
 class Refused(Exception):
@@ -208,6 +225,10 @@ def start(host, owner_id, body, *, ack_at=None, pin=None):
     from .providers.huggingface import DATASET_ID_PATTERN, PrivateDataset
 
     provider = body.get("provider") or HUGGING_FACE
+    if provider == LEGAL_DATA_HUNTER:
+        from . import legal_data_hunter  # lazy: it imports this module
+
+        return legal_data_hunter.start(host, owner_id, body, ack_at=ack_at)
     external_id = body.get("dataset")
     if provider == COMMUNITY:
         if not isinstance(external_id, str) or not community_provider.RECORD_ID.match(external_id):
@@ -323,17 +344,29 @@ def start(host, owner_id, body, *, ack_at=None, pin=None):
     session.add(record)
     session.commit()
     _log(record, QUEUED, size=record.sample_size)
+    _enqueue(host, record)
+    return record.to_dict(), True
+
+
+def _enqueue(host, record, restore=None):
+    """Hand a stored import to the host's queue; when the queue refuses it, it fails as not started. `restore`, when
+    given, runs before that failure is committed, so whatever it puts back is committed with it, in one transaction."""
     try:
         host.enqueue(record.id)
     except Exception:  # noqa: BLE001 - whatever the queue raised, nothing will run it
         logger.exception(f"library.import.enqueue_failed import={record.id}")
+        session = host.db.session
         record.status, record.error_code, record.error_message = FAILED, "not_started", NOT_STARTED
+        record.active_key = None
+        if restore is not None:
+            restore()
         session.commit()
         raise Refused(503, "not_started", NOT_STARTED)
-    return record.to_dict(), True
 
 
 def _source(provider, copy):
+    if provider == LEGAL_DATA_HUNTER:
+        return LEGAL_DATA_HUNTER
     if provider == COMMUNITY:
         return ZENODO
     return HUGGING_FACE if copy is None else SNAPSHOT
@@ -387,7 +420,21 @@ def provenance(host, owner_id, dataset_ref):
         "sampleMethod": record.sample_method,
         "sampleNote": record.sample_note,
         "citation": record.citation,
+        # Whether the host may publish this Dataset, or a model trained on it, to Zenodo, and why not (#126, L10).
+        "publishable": record.provider != LEGAL_DATA_HUNTER,
+        "publishRefusal": ldh_provider.DATASET_PUBLISH_REFUSED if record.provider == LEGAL_DATA_HUNTER else None,
     }
+    if record.provider == LEGAL_DATA_HUNTER:
+        # The entry it was imported from, how many documents it fetched and skipped, and when the student confirmed
+        # their plan allows storing them and training models on them (`licenseAckAt`).
+        found["legalDataHunter"] = {
+            "entry": record.external_id,
+            "documents": len(record.documents or []),
+            "rows": record.rows,
+            "skipped": record.skipped or 0,
+            "missing": record.missing or 0,
+            "termsConfirmedAt": _iso(record.license_ack_at),
+        }
     if record.provider == COMMUNITY:
         # The DOI is the record's URL, so it is not stored twice.
         found["doi"] = (record.url or "").removeprefix(community_provider.DOI_PREFIX) or None
@@ -410,8 +457,11 @@ def _pinned(citation, revision, accessed):
 
 def current(host, owner_id, now=None):
     """What the student is still following: imports queued or running, and
-    failed ones from the last day not put away. Newest first."""
-    since = (now or _now()) - RECENT
+    failed ones from the last day not put away. A Legal Data Hunter import
+    paused by a failure Try again resumes from (#126, RESUMABLE) stays as long as
+    its documents are kept: a week, or for one out of credits a day after its
+    credits reset if that is later. Newest first."""
+    now = now or _now()
     found = (
         host.db.session.query(LibraryImport)
         .filter(
@@ -421,7 +471,14 @@ def current(host, owner_id, now=None):
                 sa.and_(
                     LibraryImport.status == FAILED,
                     LibraryImport.dismissed_at.is_(None),
-                    LibraryImport.updated_at >= since,
+                    sa.or_(
+                        LibraryImport.updated_at >= now - RECENT,
+                        sa.and_(
+                            LibraryImport.provider == LEGAL_DATA_HUNTER,
+                            resumable_clause(),
+                            paused_until_clause(now, KEEP_FETCHED),
+                        ),
+                    ),
                 ),
             ),
         )
@@ -430,12 +487,39 @@ def current(host, owner_id, now=None):
     return [record.to_dict() for record in found]
 
 
-def _move(session, record, state, from_states, **values):
-    """Move `record` to `state` if it is still in one of `from_states`, in one
-    conditional update. Returns whether it moved; `record` is refreshed."""
+def resumable_clause():
+    """A failure Try again resumes from (RESUMABLE), of an import that never reached saving: once it did, its Dataset
+    may exist, and Try again is refused (`already_saved`)."""
+    return sa.and_(
+        LibraryImport.error_code.in_(RESUMABLE),
+        LibraryImport.saved_path.is_(None),
+        LibraryImport.dataset_ref.is_(None),
+    )
+
+
+def paused_until_clause(now, keep):
+    """A failed import is still paused at `now`: before max(updated_at + keep, resume_after + AFTER_RESET), the
+    second only for one out of credits."""
+    return sa.or_(
+        LibraryImport.updated_at >= now - keep,
+        sa.and_(
+            LibraryImport.error_code == "out_of_credits",
+            LibraryImport.resume_after.is_not(None),
+            LibraryImport.resume_after >= now - AFTER_RESET,
+        ),
+    )
+
+
+def _move(session, record, state, from_states, *, where=(), **values):
+    """Move `record` to `state` if it is still in one of `from_states`, and every
+    clause of `where` holds, in one conditional update. Returns whether it moved;
+    `record` is refreshed. A move to a terminal state frees the import's
+    `active_key` in the same statement."""
+    if state in TERMINAL:
+        values = {"active_key": None, **values}
     moved = session.execute(
         sa.update(LibraryImport)
-        .where(LibraryImport.id == record.id, LibraryImport.status.in_(from_states))
+        .where(LibraryImport.id == record.id, LibraryImport.status.in_(from_states), *where)
         .values(status=state, updated_at=_now(), **values)
         .execution_options(synchronize_session=False)
     ).rowcount
@@ -456,6 +540,11 @@ def cancel(host, owner_id, import_ref):
         return None
     if record.status in CANCELLABLE and _move(host.db.session, record, CANCELLED, CANCELLABLE):
         _log(record, CANCELLED)
+        if record.provider == LEGAL_DATA_HUNTER:
+            # A cancel is final: nothing resumes from the documents it fetched (#126).
+            from . import legal_data_hunter  # lazy: it imports this module
+
+            legal_data_hunter.discard(host.db.session, record.id)
         return record.to_dict()
     if record.status == SAVING:
         raise Refused(409, "too_late", "It is already saving the dataset, so it can no longer be cancelled.")
@@ -472,6 +561,9 @@ def retry(host, owner_id, import_ref):
         return None
     if record.status not in (FAILED, CANCELLED):
         raise Refused(409, "not_retryable", "Only a failed or cancelled import can be tried again.")
+    if record.provider == LEGAL_DATA_HUNTER and record.dismissed_at is not None:
+        # Put away: its documents are gone, and it is not the student's to resume (#126).
+        raise Refused(409, "not_retryable", ldh_provider.PUT_AWAY)
     body = {
         "provider": record.provider,
         "dataset": record.external_id,
@@ -486,10 +578,20 @@ def retry(host, owner_id, import_ref):
         "name": record.name,
         "licenseAck": record.license_ack_at is not None,
     }
-    # A Community retry keeps the Publication, origin and file its import was started on, never a record id's other Publication (#122, fix 3).
-    pin = community.Pin(record.publication_id, record.origin, record.file_key) if record.provider == COMMUNITY else None
-    started, _ = start(host, owner_id, body, ack_at=record.license_ack_at, pin=pin)
-    if record.dismissed_at is None:
+    if record.provider == LEGAL_DATA_HUNTER:
+        # Try again keeps the documents it was started with and resumes after those it fetched (#126, L12). It claims
+        # the paused import (puts it away) in the same transaction as the new one, so of two retries only one starts.
+        from . import legal_data_hunter  # lazy: it imports this module
+
+        started, _ = legal_data_hunter.start(host, owner_id, body, ack_at=record.license_ack_at, previous=record)
+        _log(record, "retried", retry=started["id"])
+        return started
+    else:
+        # A Community retry keeps the Publication, origin and file its import was started on, never a record id's other Publication (#122, fix 3).
+        pin = community.Pin(record.publication_id, record.origin, record.file_key) if record.provider == COMMUNITY else None
+        started, created = start(host, owner_id, body, ack_at=record.license_ack_at, pin=pin)
+    # Put away only once a new import stands in for it: one already running is not its replacement.
+    if created and record.dismissed_at is None:
         record.dismissed_at = _now()
         host.db.session.commit()
     _log(record, "retried", retry=started["id"])
@@ -507,6 +609,11 @@ def dismiss(host, owner_id, import_ref):
     if record.dismissed_at is None:
         record.dismissed_at = _now()
         host.db.session.commit()
+    if record.provider == LEGAL_DATA_HUNTER:
+        # Put away: nothing will resume from the documents it fetched (#126).
+        from . import legal_data_hunter
+
+        legal_data_hunter.discard(host.db.session, record.id)
     return record.to_dict()
 
 
@@ -528,6 +635,14 @@ def sweep(session, *, stale_after=STALE_AFTER, queued_after=QUEUED_AFTER, now=No
         if _move(session, record, FAILED, {record.status}, error_code=code, error_message=message):
             _log(record, "swept", code=code)
             swept.append(record.id)
+    from . import legal_data_hunter
+
+    # A CSV a swept Legal Data Hunter import wrote but never handed to the host is deleted (#126), and so are the
+    # documents no import will resume from.
+    if swept:
+        legal_data_hunter.unstage(session, LibraryImport.id.in_(swept))
+
+    legal_data_hunter.purge(session, now=now)
     return swept
 
 
@@ -595,6 +710,7 @@ def run_import(
     community_base_url=None,
     community_record=None,
     community_download=None,
+    legal_data_hunter_key=None,
 ):
     """Drive one queued import to completed or failed. Safe to call twice.
     ``max_bytes`` is the worker's download cap; the admin's cap applies only up to it (#122).
@@ -602,11 +718,17 @@ def run_import(
     ``snapshot_dir`` is where the platform's copies live; without it, no copy is read.
     ``community_datasets``, ``community_base_url``, ``community_record`` and
     ``community_download`` are the Community seams (see ``init_dataset_library``); a Community
-    import needs all four, and checks its Publication, the source and the license again before it reads."""
+    import needs all four, and checks its Publication, the source and the license again before it reads.
+    ``legal_data_hunter_key(owner_id)`` returns a user's Legal Data Hunter key, or None (#126); without it a Legal
+    Data Hunter import fails as not offered."""
     record = session.get(LibraryImport, import_ref)
     if record is None or record.status != QUEUED:
         return
     max_bytes = import_cap_bytes(session, max_bytes)
+    # The claim: one conditional update from queued, so of two workers handed the same import only one runs it.
+    if not _move(session, record, FETCHING, {QUEUED}, heartbeat_at=_now()):
+        return
+    _log(record, FETCHING)
     seams = None
     if None not in (community_datasets, community_base_url, community_record, community_download):
         seams = community.Seams(
@@ -616,10 +738,14 @@ def run_import(
     work = os.path.join(data_dir, "library-imports", record.id)
     path = os.path.join(data_dir, f"library-{record.id}.csv")
     heartbeat = _Heartbeat(session.get_bind(), record.id, heartbeat_seconds) if heartbeat_seconds else None
+    # Once `create_dataset` returns, the CSV is the Dataset's file: nothing here may remove it, however the import ends.
+    csv = _Csv(path)
     try:
         if heartbeat:
             heartbeat.__enter__()
-        _advance(session, record, FETCHING)
+        if provider == LEGAL_DATA_HUNTER:
+            _run_legal_data_hunter(session, record, legal_data_hunter_key, create_dataset, csv, max_bytes)
+            return
         if provider == COMMUNITY:
             fetched, copy_updates = _fetch_community(session, record, seams, max_bytes, work), {}
         else:
@@ -632,10 +758,7 @@ def run_import(
         _write_csv(path, record, rows)
         # The last check before the Dataset is written: a cancel before this wins.
         _advance(session, record, SAVING)
-        try:
-            dataset_ref = create_dataset(record.owner_id, path, record.name, _description(record), record.task_type)
-        except ValueError as exc:
-            raise ImportFailed("invalid", str(exc)) from exc
+        dataset_ref = _create(create_dataset, record, csv)
         imported = _now()
         _advance(session, record, COMPLETED, {
             "dataset_ref": str(dataset_ref), "rows": len(rows), "imported_at": imported,
@@ -643,15 +766,15 @@ def run_import(
             "citation": _pinned(record.citation, None if provider == COMMUNITY else record.revision, imported),
         })
     except _Stopped:
-        _remove(path)
+        csv.remove()
     except ImportFailed as exc:
-        _remove(path)
-        _fail(session, record, exc.code, exc.message)
+        csv.remove()
+        _fail(session, record, exc.code, exc.message, **exc.updates)
     except ProviderError:
         _fail(session, record, "provider_busy", BUSY if provider == HUGGING_FACE else COMMUNITY_BUSY)
     except Exception:  # noqa: BLE001 - an import must end, whatever broke
         logger.exception(f"library.import.error import={record.id}")
-        _remove(path)
+        csv.remove()
         _fail(session, record, "unexpected", UNEXPECTED)
     finally:
         if heartbeat:
@@ -659,6 +782,87 @@ def run_import(
         shutil.rmtree(work, ignore_errors=True)
         if snapshot_dir is not None and provider == HUGGING_FACE:
             _release_copies(session, snapshot_dir, provider, external_id)
+
+
+class _Csv:
+    """The import's CSV, and whether the import still owns it: once `create_dataset` returns it is the Dataset's."""
+
+    def __init__(self, path):
+        self.path, self.owned = path, True
+
+    def remove(self):
+        if self.owned:
+            _remove(self.path)
+
+
+def _create(create_dataset, record, csv):
+    """Make the Dataset from the CSV. If `create_dataset` raises, the CSV is still the import's to remove; once it
+    returns, it is not."""
+    try:
+        dataset_ref = create_dataset(record.owner_id, csv.path, record.name, _description(record), record.task_type)
+    except ValueError as exc:
+        raise ImportFailed("invalid", str(exc)) from exc
+    csv.owned = False
+    return dataset_ref
+
+
+def _record_dataset(session, record, dataset_ref):
+    """Record the Dataset on its import, whatever the import's status, in its own commit."""
+    session.execute(
+        sa.update(LibraryImport)
+        .where(LibraryImport.id == record.id)
+        .values(dataset_ref=str(dataset_ref))
+        .execution_options(synchronize_session=False)
+    )
+    session.commit()
+
+
+def _run_legal_data_hunter(session, record, key_for_owner, create_dataset, csv, max_bytes=None):
+    """A Legal Data Hunter import from fetching to completed (#126): every document is fetched (or was, before a
+    pause), the rows are written in the entry's order, unlabelled, and the Dataset is made from them. The CSV's path
+    is saved with the move to saving, before `create_dataset` is called, and the Dataset is recorded the moment it
+    exists: publishing it is refused (by its file path, or its ref) even if the worker dies in between."""
+    from . import legal_data_hunter
+
+    rows, skipped, missing = legal_data_hunter.fetch(session, record, key_for_owner, max_bytes)
+    _advance(session, record, SAMPLING, {"skipped": skipped, "missing": missing, "resume_after": None})
+    if not rows:
+        raise ImportFailed("no_usable_rows", ldh_provider.NO_TEXT)
+    # The CSV's path is committed before it is written: a worker that dies before saving leaves a file the package can
+    # find and delete (legal_data_hunter.unstage).
+    _advance(session, record, VALIDATING, {"sample_method": "all", "sample_note": None, "staging_path": csv.path})
+    legal_data_hunter.write_csv(csv.path, rows)
+    # The move to saving is the last check of the terms, in the same statement: a Hide committed before it wins, and no
+    # Dataset is made. It also needs the CSV still staged: one an erasure claimed is never saved.
+    try:
+        session.refresh(record)
+    except (ObjectDeletedError, InvalidRequestError):
+        raise _Stopped()
+    if record.status in TERMINAL:
+        raise _Stopped()
+    saving = _move(
+        session, record, SAVING, {record.status},
+        where=(legal_data_hunter.terms_not_hidden(), LibraryImport.staging_path == csv.path),
+        heartbeat_at=_now(), saved_path=csv.path,
+    )
+    if not saving:
+        legal_data_hunter.not_saved(session, record)
+    _log(record, SAVING)
+    dataset_ref = _create(create_dataset, record, csv)
+    # Before anything else, whatever the import's status: the publish block reads it (legal_data_hunter.publish_refusal).
+    _record_dataset(session, record, dataset_ref)
+    imported = _now()
+    _advance(session, record, COMPLETED, {
+        "dataset_ref": str(dataset_ref), "rows": len(rows), "imported_at": imported,
+        "citation": _pinned(record.citation, None, imported),
+    })
+    # The dataset holds the rows now: the fetched documents are not kept beside it. Best effort: the import is done,
+    # its CSV must stay, and the sweep's purge deletes them later.
+    try:
+        legal_data_hunter.discard(session, record.id)
+    except Exception as failed:  # noqa: BLE001
+        session.rollback()
+        logger.warning(f"library.import.discard_failed import={record.id} error={type(failed).__name__}")
 
 
 def _fetch(session, record, fetch_shards, max_bytes, work, snapshot_dir):
@@ -804,9 +1008,9 @@ def _advance(session, record, state, updates=None):
     _log(record, state, **({"rows": record.rows} if state == COMPLETED else {}))
 
 
-def _fail(session, record, code, message):
+def _fail(session, record, code, message, **updates):
     session.rollback()
-    if _move(session, record, FAILED, RUNNING, error_code=code, error_message=message):
+    if _move(session, record, FAILED, RUNNING, error_code=code, error_message=message, **updates):
         _log(record, FAILED, code=code)
 
 
@@ -1208,6 +1412,8 @@ def _write_csv(path, record, rows):
 
 
 def _description(record):
+    if record.provider == LEGAL_DATA_HUNTER:
+        return f"{len(record.documents or [])} documents from Legal Data Hunter, unlabelled"
     if record.provider == COMMUNITY:
         method = "A sample that keeps the label balance" if record.sample_method == "stratified" else "A random sample"
         return f"{method}, from Zenodo: {record.url or record.external_id}"

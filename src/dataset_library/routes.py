@@ -5,6 +5,7 @@ from . import admin as admin_module
 from . import community as community_module
 from . import imports as imports_module
 from . import labels as labels_module
+from . import legal_data_hunter as ldh_module
 from . import pins as pins_module
 from . import policy as policy_module
 from . import preview as preview_module
@@ -13,6 +14,7 @@ from . import search as search_module
 from . import snapshots as snapshots_module
 from .licenses import GROUPS, LICENSES
 from .providers import community as community_provider
+from .providers import legal_data_hunter as ldh_provider
 from .providers.huggingface import DATASET_ID_PATTERN, PrivateDataset
 from .tasks import hugging_face_filter
 
@@ -73,14 +75,19 @@ TASK_LABELS = {"classification": "Classification", "ner": "Named entities", "sum
 
 @library_bp.route("/options", methods=["GET"])
 def options():
-    """The filter choices, and the license table with this platform's levels."""
+    """The filter choices, and the license table with this platform's levels. A provider's terms (#126) are not a
+    license a dataset in search can have, so they are left out here; the admin's settings still list them."""
     host = _host()
     policy = policy_module.overrides(host.db)
     licenses = []
     for license in LICENSES.values():
+        if license.terms:
+            continue
         level = policy_module.level(license, policy)
         if level != "hide":
             licenses.append(license.at_level(level))
+    terms_groups = {license.group for license in LICENSES.values() if license.terms}
+    groups = [group for group in GROUPS if group not in terms_groups]
     return jsonify(
         {
             "tasks": [
@@ -89,11 +96,19 @@ def options():
                 if hugging_face_filter(task)
             ],
             "licenses": licenses,
-            "groups": GROUPS,
+            "groups": groups,
             "admin": bool(host.is_admin()),
             "importable": host.enqueue is not None,
             "maxRows": host.row_cap(),
             "sources": _source_choices(host),
+            # Legal Data Hunter entries (#126): whether they are offered, whether this user has a key, and why not.
+            "legalDataHunter": {
+                "offered": ldh_module.offered(host),
+                "hasKey": ldh_module.has_key(host, host.current_owner()),
+                "needsKey": ldh_provider.NEEDS_KEY,
+                "corpora": [{"value": value, "label": label} for value, label in ldh_provider.CORPORA.items()],
+                "maxDocuments": ldh_provider.MAX_DOCUMENTS,
+            },
         }
     )
 
@@ -200,8 +215,37 @@ def provenance(dataset_ref):
 
 @library_bp.route("/featured", methods=["GET"])
 def featured():
-    """The course's featured pins, for the row any signed-in user sees."""
-    return jsonify({"featured": pins_module.featured(_host())})
+    """The course's featured pins, for the row any signed-in user sees, and its Legal Data Hunter entries (#126), each
+    a featured card that says whether this user can import it."""
+    host = _host()
+    return jsonify({
+        "featured": pins_module.featured(host),
+        "legalDataHunter": ldh_module.cards(host, host.current_owner()),
+    })
+
+
+@library_bp.route("/legal-data-hunter/entries", methods=["GET"])
+def ldh_cards():
+    """The Legal Data Hunter entries as featured cards, and whether the signed-in user has a key (#126)."""
+    host = _host()
+    has_key = ldh_module.has_key(host, host.current_owner())
+    return jsonify({
+        "entries": ldh_module.cards(host, host.current_owner(), keyed=has_key),
+        "offered": ldh_module.offered(host),
+        "hasKey": has_key,
+        "needsKey": None if has_key else ldh_provider.NEEDS_KEY,
+    })
+
+
+# Not `<entry_id>`: a host may refuse `*_id` URL parameters that are not its own UUIDs.
+@library_bp.route("/datasets/legal_data_hunter/<entry_ref>", methods=["GET"])
+def ldh_dataset(entry_ref):
+    """One Legal Data Hunter entry's card, with the confirmation step 2 asks for (#126)."""
+    host = _host()
+    try:
+        return jsonify(ldh_module.view(host, host.current_owner(), entry_ref))
+    except ldh_module.NotFound:
+        raise ApiError(404, ldh_provider.NOT_IN_LIBRARY, "not_found")
 
 
 def _require_admin():
@@ -321,6 +365,9 @@ def put_settings():
     # A copy is kept only while its license is Allow: a changed level removes the copies it no longer allows (#121).
     if changes["licenses_changed"]:
         pins_module.reconcile_copies(host)
+        # Legal Data Hunter's terms set to Hide: no import may resume, so what they fetched goes (#126).
+        if ldh_module.TERMS.id in changes["licenses_changed"]:
+            ldh_module.hidden(host.db.session)
     host.audit("library.settings_saved", **changes)
     return jsonify({**admin_module.current(host.db, host), "groups": GROUPS})
 
@@ -412,3 +459,92 @@ def dismiss_import(import_ref):
     """Put away a failed or cancelled import (409 `running` while it runs)."""
     _importing()
     return _found(_starting(imports_module.dismiss, import_ref))
+
+
+# --- Legal Data Hunter entries, for a course admin (#126) -------------------------------------------------------
+
+
+def _ldh_admin():
+    _require_admin()
+    if not ldh_module.offered(_host()):
+        raise ApiError(404, ldh_provider.NOT_OFFERED, "not_offered")
+
+
+def _ldh_call(action, *args):
+    """Run an admin's Legal Data Hunter action, turning its refusals into answers. A key is never in an answer."""
+    host = _host()
+    try:
+        return action(host, *args)
+    except ldh_module.NotFound:
+        raise ApiError(404, "No such entry.", "not_found")
+    except ldh_module.NotOffered:
+        raise ApiError(404, ldh_provider.NOT_OFFERED, "not_offered")
+    except ldh_module.NeedsKey:
+        raise ApiError(409, ldh_provider.NEEDS_KEY, "needs_key")
+    except ldh_module.Invalid as invalid:
+        host.db.session.rollback()
+        raise ApiError(400, "Some fields need fixing.", "invalid", fields=invalid.fields)
+    except ldh_provider.InvalidQuery as invalid:
+        raise ApiError(400, "Some fields need fixing.", "invalid", fields={f"query.{k}": v for k, v in invalid.fields.items()})
+    except ldh_provider.BadKey:
+        raise ApiError(409, ldh_provider.BAD_KEY, "bad_key")
+    except ldh_provider.OutOfCredits as ran_out:
+        if ran_out.per_minute:
+            raise ApiError(429, ldh_provider.SLOW_DOWN, "slow_down", retryAfter=ran_out.retry_after)
+        raise ApiError(429, ldh_provider.CREDITS_RAN_OUT, "out_of_credits", retryAfter=ran_out.retry_after)
+    except ProviderError:
+        raise ApiError(503, ldh_provider.BUSY, "provider_unavailable")
+
+
+def _json_object():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        raise ApiError(400, "Send a JSON object.", "bad_request")
+    return body
+
+
+@library_bp.route("/admin/legal-data-hunter/preview", methods=["POST"])
+def ldh_preview():
+    """Search Legal Data Hunter with the admin's own key: {q, corpus, country, source, dateFrom, dateTo, limit}."""
+    _ldh_admin()
+    return jsonify(_ldh_call(ldh_module.preview, _json_object()))
+
+
+@library_bp.route("/admin/legal-data-hunter/entries", methods=["GET"])
+def ldh_list():
+    _ldh_admin()
+    return jsonify({"entries": ldh_module.list_all(_host()), "max": ldh_provider.MAX_DOCUMENTS})
+
+
+@library_bp.route("/admin/legal-data-hunter/entries", methods=["POST"])
+def ldh_create():
+    """Save an entry: {title, description, taskType, query, documents}; up to 100 documents."""
+    _ldh_admin()
+    return jsonify(_ldh_call(ldh_module.create, _json_object())), 201
+
+
+@library_bp.route("/admin/legal-data-hunter/entries/<entry_ref>", methods=["GET"])
+def ldh_get(entry_ref):
+    _ldh_admin()
+    return jsonify(_ldh_call(ldh_module.get, entry_ref))
+
+
+@library_bp.route("/admin/legal-data-hunter/entries/<entry_ref>", methods=["PATCH"])
+def ldh_update(entry_ref):
+    """Change an entry's title, description or task type."""
+    _ldh_admin()
+    return jsonify(_ldh_call(ldh_module.update, entry_ref, _json_object()))
+
+
+@library_bp.route("/admin/legal-data-hunter/entries/<entry_ref>/refresh", methods=["POST"])
+def ldh_refresh(entry_ref):
+    """Run the entry's query again with the admin's key and replace its documents; past imports are untouched."""
+    _ldh_admin()
+    return jsonify(_ldh_call(ldh_module.refresh, entry_ref))
+
+
+@library_bp.route("/admin/legal-data-hunter/entries/<entry_ref>", methods=["DELETE"])
+def ldh_remove(entry_ref):
+    _ldh_admin()
+    _ldh_call(ldh_module.remove, entry_ref)
+    return "", 204

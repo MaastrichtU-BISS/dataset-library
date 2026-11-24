@@ -16,4 +16,6 @@ def for_session(session):
 
 
 def level(license, policy):
-    return policy.get(license.id, license.level)
+    """The level a license is applied at. A provider's terms are never Allow, whatever was stored (#126)."""
+    chosen = policy.get(license.id, license.level)
+    return chosen if chosen in license.levels else license.level

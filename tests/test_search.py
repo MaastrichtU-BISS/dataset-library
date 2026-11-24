@@ -182,6 +182,7 @@ def test_options_list_the_filters_and_the_license_table(app, client):
     assert "mit" not in licenses
     assert licenses["cc-by-4.0"]["level"] == "warn"
     assert licenses["unknown"]["group"] == "Unknown"
+    # A provider's terms are not a dataset license: the student's filter leaves out their group (#126).
     assert body["groups"] == ["Open", "Share-alike", "Non-commercial", "No-derivatives", "Unknown"]
     assert body["sources"] == [{"value": "coastalcph", "label": "coastalcph", "provider": "huggingface"}]
 
