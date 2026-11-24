@@ -38,6 +38,9 @@ def search(host, *, query, task, license_id, source):
     policy = policy_module.overrides(host.db)
     if license_id and policy.get(license_id) == "hide":
         return _body("ok", [])
+    # A provider's terms (#126) are never a dataset's license here, so nothing is asked for.
+    if license_id and LICENSES.get(license_id, UNKNOWN).terms:
+        return _body("ok", [])
     results, status = [], "ok"
     if source != community_provider.SOURCE:
         results, status = _hugging_face(host, query, task, license_id, source, policy)

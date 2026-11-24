@@ -1,0 +1,36 @@
+{
+  "case_law": {
+    "query": "unfair contract terms consumer",
+    "hits": [
+      {"source": "rechtspraak", "source_id": "ECLI:NL:HR:2023:1234", "score": 0.91, "title": "Hoge Raad 14 april 2023, oneerlijk beding", "snippet": "Een beding in algemene voorwaarden dat de consument onredelijk bezwaart…", "url": "https://uitspraken.rechtspraak.nl/details?id=ECLI:NL:HR:2023:1234", "country": "NL", "court": "Hoge Raad", "court_tier": 1, "date": "2023-04-14", "jurisdiction": "NL", "language": "nl", "ecli": "ECLI:NL:HR:2023:1234", "case_number": "22/01234"},
+      {"source": "FR/Judilibre", "source_id": "6543a1b2c3d4e5f6", "score": 0.88, "title": "Cour de cassation, 1re civ., 15 mars 2023, clause abusive", "snippet": "La clause qui crée un déséquilibre significatif…", "url": "https://www.courdecassation.fr/decision/6543a1b2c3d4e5f6", "country": "FR", "court": "Cour de cassation", "court_tier": 1, "date": "2023-03-15", "jurisdiction": "FR", "language": "fr", "ecli": "ECLI:FR:CCASS:2023:C100123", "case_number": "21-12.345"},
+      {"source": "bverfg", "source_id": "1 BvR 123/20", "score": 0.84, "title": "BVerfG, Beschluss vom 2. Februar 2022, 1 BvR 123/20", "snippet": "Allgemeine Geschäftsbedingungen im Verbrauchervertrag…", "url": "https://www.bundesverfassungsgericht.de/e/rk20220202_1bvr012320.html", "country": "DE", "court": "Bundesverfassungsgericht", "court_tier": 1, "date": "2022-02-02", "jurisdiction": "DE", "language": "de", "ecli": "ECLI:DE:BVerfG:2022:rk20220202.1bvr012320", "case_number": "1 BvR 123/20"},
+      {"source": "rechtspraak", "source_id": "ECLI:NL:RBAMS:2022:999", "score": 0.80, "title": "Rechtbank Amsterdam 3 maart 2022", "snippet": "", "url": "https://uitspraken.rechtspraak.nl/details?id=ECLI:NL:RBAMS:2022:999", "country": "NL", "court": "Rechtbank Amsterdam", "court_tier": 3, "date": "2022-03-03", "jurisdiction": "NL", "language": "nl", "ecli": "ECLI:NL:RBAMS:2022:999", "case_number": "C/13/700000"},
+      {"source": "rechtspraak", "source_id": "ECLI:NL:GHARL:2021:42", "score": 0.77, "title": "Gerechtshof Arnhem-Leeuwarden 5 januari 2021", "snippet": "…", "url": "https://uitspraken.rechtspraak.nl/details?id=ECLI:NL:GHARL:2021:42", "country": "NL", "court": "Gerechtshof Arnhem-Leeuwarden", "court_tier": 2, "date": "2021-01-05", "jurisdiction": "NL", "language": "nl", "ecli": "ECLI:NL:GHARL:2021:42", "case_number": "200.000.001"},
+      {"source": "rechtspraak", "score": 0.70, "title": "A hit with no source id", "country": "NL"}
+    ],
+    "total_hits": 1287,
+    "alpha": 0.7,
+    "namespace": "case_law",
+    "elapsed_ms": 412
+  },
+  "legislation": {
+    "query": "data protection",
+    "hits": [
+      {"source": "eurlex", "source_id": "32016R0679", "score": 0.95, "title": "Regulation (EU) 2016/679 (General Data Protection Regulation)", "snippet": "on the protection of natural persons with regard to the processing of personal data…", "url": "https://eur-lex.europa.eu/eli/reg/2016/679/oj", "country": "EU", "date": "2016-04-27", "jurisdiction": "EU", "language": "en"},
+      {"source": "CoE/conventions", "source_id": "ETS-108", "score": 0.81, "title": "Convention for the Protection of Individuals with regard to Automatic Processing of Personal Data", "snippet": "to secure in the territory of each Party for every individual…", "url": "https://www.coe.int/en/web/conventions/full-list?module=treaty-detail&treatynum=108", "country": "CoE", "date": "1981-01-28", "jurisdiction": "CoE", "language": "en"}
+    ],
+    "total_hits": 2,
+    "alpha": 0.9,
+    "namespace": "legislation",
+    "elapsed_ms": 230
+  },
+  "doctrine": {
+    "query": "anything",
+    "hits": [],
+    "total_hits": 0,
+    "alpha": 0.7,
+    "namespace": "doctrine",
+    "elapsed_ms": 101
+  }
+}

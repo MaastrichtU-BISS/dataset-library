@@ -24,6 +24,8 @@ def current(db, host):
         "sources": [s.to_dict() for s in sources],
         # Offered only where the host gave the Community seams (#122); the admin switches it on or off.
         "community": {"available": host.community is not None, "enabled": community_module.switched_on(db.session)},
+        # Offered where the host gave the key seam (#126); its entries are managed under /admin/legal-data-hunter.
+        "legalDataHunter": {"available": getattr(host, "legal_data_hunter_key", None) is not None},
         "licenses": [
             {**lic.at_level(level(lic, policy)), "default": lic.level} for lic in LICENSES.values()
         ],
@@ -65,6 +67,9 @@ def save(db, body, hard_max_rows=limits_module.HARD_MAX_ROWS, community_availabl
             fields[f"license_policy.{license_id}"] = "Not a license the library knows."
         elif chosen not in LEVELS:
             fields[f"license_policy.{license_id}"] = "Choose Allow, Warn or Hide."
+        elif chosen not in LICENSES[license_id].levels:
+            # A provider's terms differ for each user's plan, so they are never Allow (#126).
+            fields[f"license_policy.{license_id}"] = "Choose Warn or Hide."
 
     limits = body.get("limits")
     if limits is not None:

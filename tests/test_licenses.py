@@ -55,7 +55,7 @@ def test_every_license_defaults_to_warn_exactly_when_it_is_nc_nd_or_unknown():
     from dataset_library.licenses import LICENSES
 
     for license in LICENSES.values():
-        expected = "warn" if (license.nc or license.nd or license.unknown) else "allow"
+        expected = "warn" if (license.nc or license.nd or license.unknown or license.terms) else "allow"
         assert license.level == expected, license.id
     assert LICENSES["cc-by-nc-4.0"].level == "warn"
     assert LICENSES["cc-by-sa-4.0"].level == "allow"
