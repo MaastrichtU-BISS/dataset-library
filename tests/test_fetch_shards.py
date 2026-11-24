@@ -1,4 +1,5 @@
 """Fetching a split's Parquet shards from Hugging Face (#113), from recorded listings."""
+import io
 import json
 import pathlib
 from urllib.parse import unquote
@@ -16,30 +17,65 @@ MB = 1_000_000
 
 
 class Response:
-    def __init__(self, status_code, body=None, content=b"", headers=None):
+    def __init__(self, status_code, body=None, content=b"", headers=None, served=None):
         self.status_code = status_code
         self._body = body
         self._content = content
         self.headers = headers or {}
+        self._served = served  # called with each chunk's length as it is sent
+        self.closed = False
 
     def json(self):
         return self._body
 
     def iter_content(self, chunk_size):
         for i in range(0, len(self._content), chunk_size):
-            yield self._content[i : i + chunk_size]
+            chunk = self._content[i : i + chunk_size]
+            if self._served:
+                self._served(len(chunk))
+            yield chunk
 
     def close(self):
-        pass
+        self.closed = True
+
+
+def parquet_shard(shard, groups, rows_per_group, text_bytes, labels=("a", "b")):
+    """A real Parquet shard as Hugging Face writes one, uncompressed so its size
+    is predictable: `groups` row groups of `rows_per_group` rows, each text
+    naming its shard and row ("s3-r17 ...") so a test can tell where a row came
+    from. ClassLabel names are in the schema metadata."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    rows = groups * rows_per_group
+    texts = [f"s{shard}-r{r} " + format(r * 7919 + shard, "x").rjust(8, "0") * (text_bytes // 8) for r in range(rows)]
+    features = {
+        "text": {"dtype": "string", "_type": "Value"},
+        "label": {"names": list(labels), "_type": "ClassLabel"},
+    }
+    table = pa.table({"text": texts, "label": [r % len(labels) for r in range(rows)]})
+    table = table.replace_schema_metadata({"huggingface": json.dumps({"info": {"features": features}})})
+    sink = io.BytesIO()
+    pq.write_table(table, sink, row_group_size=rows_per_group, compression="none", use_dictionary=False, write_statistics=False)
+    return sink.getvalue()
+
+
+def default_shard(path):
+    """What a recorded listing's shard serves: a small real Parquet file."""
+    return parquet_shard(int(path.rsplit("/", 1)[1].split(".")[0]), groups=3, rows_per_group=4, text_bytes=16)
 
 
 class FakeHuggingFace:
-    """The viewer's /parquet, the Hub's datasets and refs, from recordings; a
-    shard's bytes are its URL, so a test can tell which shards were downloaded
-    from where."""
+    """The viewer's /parquet, the Hub's datasets and refs, from recordings, and
+    the shards themselves: real Parquet files, served by range as the Hub serves
+    them. A recorded listing's shards are small files made here, and the listing
+    and paths-info give their real sizes; `add_dataset` adds one made of the
+    shards a test passes. Every byte of a shard sent is logged."""
 
     def __init__(self):
-        self.downloads = []
+        self.downloads = []  # the shard URLs read from, in order, each once
+        self.ranges = []  # (url, first byte, last byte) per range asked
+        self.served = 0  # shard bytes sent
         self.failures = []  # statuses answered before the real one, per call
         self.refs_failures = []  # statuses the refs endpoint answers before the real one
         self.refs_bodies = {}  # dataset id: body answered instead of the recorded one
@@ -51,30 +87,58 @@ class FakeHuggingFace:
         self.build_status = 200
         self.build_missing = set()  # paths the pinned build does not have
         self.head_failures = []  # statuses the Hub's dataset record answers before the real one
+        self.ignore_ranges = False  # answer a range with 200 and the whole shard
+        self.extra_bytes = 0  # sent past the asked range
+        self.listings = {key: recorded for key, recorded in LISTINGS.items()}
+        self.files = {}  # path in the build: bytes, made on first use
+
+    def add_dataset(self, dataset, config, split, shards, revision="1" * 40, commit="2" * 40):
+        files = [
+            {"dataset": dataset, "config": config, "split": split, "filename": f"{n:04}.parquet", "size": len(data),
+             "url": f"https://huggingface.co/datasets/{dataset}/resolve/{parquet.ENCODED_CONVERT}/{config}/{split}/{n:04}.parquet"}
+            for n, data in enumerate(shards)
+        ]
+        for n, data in enumerate(shards):
+            self.files[f"{config}/{split}/{n:04}.parquet"] = data
+        self.listings[f"{dataset}?config={config}"] = {"status": 200, "body": {"parquet_files": files}, "headers": {"X-Revision": revision}}
+        self.refs_bodies[dataset] = {"tags": [], "branches": [], "converts": [{"name": "parquet", "ref": parquet.CONVERT, "targetCommit": commit}]}
+
+    def file(self, path):
+        if path not in self.files:
+            self.files[path] = default_shard(path)
+        return self.files[path]
+
+    def listing(self, key):
+        recorded = self.listings[key]
+        files = recorded["body"].get("parquet_files")
+        if not files:
+            return recorded
+        sized = [{**f, "size": len(self.file(parquet._in_build(f["url"])))} for f in files]
+        return {**recorded, "body": {**recorded["body"], "parquet_files": sized}}
 
     def post(self, url, data=None, timeout=None, **kwargs):
-        # paths-info at the pinned build, as the listings recorded its files.
+        # paths-info at the pinned build, as the listings give its files.
         assert url.startswith(parquet.HUB) and "/paths-info/" in url
         self.hub_calls.append(url)
         dataset = url.removeprefix(parquet.HUB).split("/paths-info/", 1)[0]
         sizes = {
             parquet._in_build(s["url"]): s["size"]
-            for key, recorded in LISTINGS.items() if key.startswith(dataset + "?")
-            for s in (recorded["body"].get("parquet_files") or [])
+            for key in self.listings if key.startswith(dataset + "?")
+            for s in (self.listing(key)["body"].get("parquet_files") or [])
         }
         sizes.update(self.build_sizes)
         body = [{"type": "file", "path": p, "size": sizes[p]} for p in data["paths"] if p in sizes and p not in self.build_missing]
         return Response(self.build_status, body)
 
-    def get(self, url, params=None, timeout=None, stream=False, **kwargs):
+    def get(self, url, params=None, timeout=None, stream=False, headers=None, **kwargs):
         if self.failures:
             return Response(self.failures.pop(0), {"error": "busy"})
         if url == parquet.LISTING:
-            recorded = LISTINGS[f"{params['dataset']}?config={params['config']}"]
-            headers = {} if self.no_revision else recorded.get("headers")
+            recorded = self.listing(f"{params['dataset']}?config={params['config']}")
+            answered = {} if self.no_revision else recorded.get("headers")
             if self.listing_revisions:
-                headers = {"X-Revision": self.listing_revisions.pop(0)}
-            return Response(recorded["status"], recorded["body"], headers=headers)
+                answered = {"X-Revision": self.listing_revisions.pop(0)}
+            return Response(recorded["status"], recorded["body"], headers=answered)
         if url.startswith(parquet.HUB):
             self.hub_calls.append(url)
             if url.endswith("/refs"):
@@ -90,8 +154,19 @@ class FakeHuggingFace:
             recorded = HUB.get(url.removeprefix(parquet.HUB), {"status": 404, "body": {"error": "Repository not found"}})
             return Response(recorded["status"], recorded["body"])
         assert stream, "shards are streamed"
-        self.downloads.append(url)
-        return Response(200, content=url.encode())
+        if url not in self.downloads:
+            self.downloads.append(url)
+        data = self.file(url.split("/resolve/", 1)[1].split("/", 1)[1])
+        asked = (headers or {}).get("Range")
+        if self.ignore_ranges or asked is None:
+            return Response(200, content=data, served=self.count)
+        first, last = (int(n) for n in asked.removeprefix("bytes=").split("-"))
+        self.ranges.append((url, first, last))
+        content = data[first : last + 1 + self.extra_bytes]
+        return Response(206, content=content, headers={"Content-Range": f"bytes {first}-{last}/{len(data)}"}, served=self.count)
+
+    def count(self, n):
+        self.served += n
 
 
 @pytest.fixture
@@ -115,14 +190,20 @@ DWARF_LISTED = "18d016c41417e9beb85fb83a94b4fbf866805cce"
 DWARF_HEAD = "f5a645c5f00fe5acfe939d15e00c2faa3cb85375"
 
 
-def test_the_chosen_splits_shards_are_downloaded_from_the_converts_commit(hf, tmp_path):
-    # The listing's URLs name the moving refs/convert/parquet branch; every shard
-    # is downloaded from the commit the Hub says that branch points at, so the
-    # bytes cannot change under a conversion rebuilt while the import reads.
+def test_the_chosen_splits_shards_are_read_from_the_converts_commit(hf, tmp_path):
+    # The listing's URLs name the moving refs/convert/parquet branch; every range
+    # is read from the commit the Hub says that branch points at, so the bytes
+    # cannot change under a conversion rebuilt while the import reads.
+    import pyarrow.parquet as pq
+
     fetched = fetch(tmp_path, "coastalcph/lex_glue", "ledgar", "train")
 
-    assert hf.downloads == [f"https://huggingface.co/datasets/coastalcph/lex_glue/resolve/{LEX_CONVERSION}/ledgar/train/0000.parquet"]
-    assert [pathlib.Path(p).read_bytes() for p in fetched.paths] == [hf.downloads[0].encode()]
+    pinned = f"https://huggingface.co/datasets/coastalcph/lex_glue/resolve/{LEX_CONVERSION}/ledgar/train/0000.parquet"
+    assert hf.downloads == [pinned]
+    assert {url for url, _, _ in hf.ranges} == {pinned}
+    # The local file holds the shard's rows, read from its row groups.
+    served = pq.read_table(io.BytesIO(hf.file("ledgar/train/0000.parquet")))
+    assert [pq.read_table(p).to_pydict() for p in fetched.paths] == [served.to_pydict()]
 
 
 def test_the_import_records_the_revision_the_rows_were_read_from(hf, tmp_path):
@@ -306,22 +387,239 @@ def test_the_convert_branch_is_asked_again_through_5xx_and_429(hf, tmp_path):
         fetch(tmp_path, "coastalcph/lex_glue", "ledgar", "train")
 
 
-def test_shards_are_downloaded_until_the_byte_cap(hf, tmp_path):
-    # Shards of 198 MB, 228 MB, 236 MB, …: a 450 MB cap takes the first two.
-    fetched = fetch(tmp_path, "isaacus/open-australian-legal-corpus", "corpus", "corpus", max_bytes=450 * MB)
+# --- Reading only what a sample needs (#178) ----------------------------------------
+#
+# FineFineWeb's conversion is 10 shards of 263-292 MB against a 200 MB default
+# cap. These fakes keep its shape at a thousandth of the size: 10 shards of about
+# 270 KB, each of 12 row groups of about 22 KB, against a 200 KB cap. Shards are
+# over the cap; their row groups are well under it.
+SCALED_CAP = 200_000
+FINE = "m-a-p/FineFineWeb"
 
-    assert len(fetched.paths) == 2
-    assert [u.rsplit("/", 1)[1] for u in hf.downloads] == ["0000.parquet", "0001.parquet"]
-    assert all("/resolve/ef6ae142f81f5c135978cde1fd0d7c9c4c765555/" in u for u in hf.downloads)
+
+def fine_shards(n=10, groups=12, rows_per_group=40, text_bytes=544):
+    return [parquet_shard(s, groups, rows_per_group, text_bytes) for s in range(n)]
 
 
-def test_a_first_shard_over_the_cap_is_too_large_to_sample(hf, tmp_path):
+@pytest.fixture
+def fine(hf):
+    hf.add_dataset(FINE, "default", "train", fine_shards())
+    return hf
+
+
+def shards_read(paths):
+    """Which shards the local files' rows came from, by the shard each text names."""
+    import pyarrow.parquet as pq
+
+    return {text.split("-", 1)[0] for p in paths for text in pq.read_table(p).column("text").to_pylist()}
+
+
+def test_a_dataset_whose_every_shard_is_over_the_cap_imports_a_sample(fine, tmp_path):
+    import pyarrow.parquet as pq
+
+    sizes = [len(fine.file(f"default/train/{n:04}.parquet")) for n in range(10)]
+    assert min(sizes) > SCALED_CAP
+
+    fetched = fetch(tmp_path, FINE, "default", "train", max_bytes=SCALED_CAP)
+
+    rows = sum(pq.ParquetFile(p).metadata.num_rows for p in fetched.paths)
+    assert rows >= 200
+    assert fetched.revision == "1" * 40
+    assert all(f"/resolve/{'2' * 40}/" in url for url in fine.downloads)
+
+
+@pytest.mark.parametrize("cap", [SCALED_CAP, 60_000, 30_000, 1_000_000, 5_000_000])
+def test_an_import_reads_at_most_the_cap_footers_and_row_groups_included(fine, tmp_path, cap):
+    fetch(tmp_path, FINE, "default", "train", max_bytes=cap)
+
+    assert 0 < fine.served <= cap
+    # Every range asked was a footer or row groups: nothing was read twice.
+    assert fine.served == sum(last + 1 - first for _, first, last in fine.ranges)
+
+
+def test_a_cap_over_the_whole_split_reads_every_row(fine, tmp_path):
+    import pyarrow.parquet as pq
+
+    fetched = fetch(tmp_path, FINE, "default", "train", max_bytes=10**9)
+
+    assert sum(pq.ParquetFile(p).metadata.num_rows for p in fetched.paths) == 10 * 12 * 40
+    assert fine.served < sum(len(fine.file(f"default/train/{n:04}.parquet")) for n in range(10))
+
+
+def test_the_sample_draws_from_every_shard_the_cap_allows(fine, tmp_path):
+    # Ten footers of about 2 KB leave room for seven row groups: one from each
+    # of seven shards, not seven from the first.
+    fetched = fetch(tmp_path, FINE, "default", "train", max_bytes=SCALED_CAP)
+
+    assert len(fetched.paths) == 7
+    assert shards_read(fetched.paths) == {f"s{n}" for n in range(7)}
+
+
+def test_a_shard_s_row_groups_are_spread_across_it(fine, tmp_path):
+    # Room for 21 row groups across ten shards: the first shard gives three,
+    # from its start, its middle and its first quarter, not its first three.
+    import pyarrow.parquet as pq
+
+    fetched = fetch(tmp_path, FINE, "default", "train", max_bytes=500_000)
+
+    first = pq.read_table(fetched.paths[0]).column("text").to_pylist()
+    assert {int(t.split("-r", 1)[1].split(" ", 1)[0]) // 40 for t in first} == {0, 6, 3}
+
+
+def test_shards_are_spread_across_a_long_split():
+    shards = [{"n": n} for n in range(100)]
+
+    picked = [s["n"] for s in parquet._spread_shards(shards)]
+
+    assert len(picked) == parquet.MAX_SHARDS
+    assert picked[0] == 0 and picked[-1] > 90
+
+
+def test_the_spread_order_visits_every_index_once():
+    assert parquet._spread(8) == [0, 4, 2, 6, 1, 3, 5, 7]
+    for n in range(0, 40):
+        assert sorted(parquet._spread(n)) == list(range(n))
+
+
+def test_the_class_label_names_reach_the_local_files(fine, tmp_path):
+    from dataset_library.imports import _label_names
+    import pyarrow.parquet as pq
+
+    fetched = fetch(tmp_path, FINE, "default", "train", max_bytes=SCALED_CAP)
+
+    assert _label_names(pq.ParquetFile(fetched.paths[0]), "label") == ["a", "b"]
+
+
+def test_an_import_samples_rows_from_several_shards(app, fine, tmp_path):
+    # Through run_import with the real fetch, at the default sample method: the
+    # random sample (#113) is not just the head of shard 0.
+    from dataset_library import imports
+    from dataset_library.models import LibraryImport
+    from test_import import FakeCreateDataset
+
+    def real_fetch(external_id, config, split, max_bytes, dest_dir, **kwargs):
+        return parquet.fetch_shards(external_id, config, split, SCALED_CAP, dest_dir, sleep=lambda s: None, **kwargs)
+
+    create = FakeCreateDataset()
+    with app.app_context():
+        session = app.db.session
+        record = LibraryImport(
+            owner_id="alice", provider="huggingface", external_id=FINE,
+            config="default", split="train", revision="1" * 40,
+            text_column="text", label_column="label", task_type="classification",
+            sample_size=200, max_rows=1000, name="FineFineWeb", license="odc-by",
+            url=f"https://huggingface.co/datasets/{FINE}", status="queued",
+        )
+        session.add(record)
+        session.commit()
+        ref = record.id
+        imports.run_import(ref, session=session, fetch_shards=real_fetch, create_dataset=create, data_dir=str(tmp_path / "data"), seed=7)
+        found = session.get(LibraryImport, ref).to_dict()
+
+    assert found["status"] == "completed", found
+    assert found["rows"] == 200
+    assert len({row["text"].split("-", 1)[0] for row in create.calls[0]["rows"]}) > 1
+    assert fine.served <= SCALED_CAP
+
+
+def test_a_row_group_over_the_cap_is_too_large_to_sample(hf, tmp_path):
+    # Only the footers are read: no row group fits, and none is downloaded.
+    hf.add_dataset(FINE, "default", "train", fine_shards(n=2, groups=2, rows_per_group=400))
+
     with pytest.raises(ImportFailed) as refused:
-        fetch(tmp_path, "isaacus/open-australian-legal-corpus", "corpus", "corpus", max_bytes=100 * MB)
+        fetch(tmp_path, FINE, "default", "train", max_bytes=SCALED_CAP)
 
     assert refused.value.code == "too_large"
-    assert refused.value.message == "Too large to sample here: even one part of this dataset is over the download limit."
-    assert hf.downloads == []
+    assert refused.value.message == parquet.TOO_LARGE
+    footers = sum(last + 1 - first for _, first, last in hf.ranges)
+    assert hf.served == footers < 10_000
+
+
+def test_a_footer_over_the_cap_is_too_large_to_sample(fine, tmp_path):
+    with pytest.raises(ImportFailed) as refused:
+        fetch(tmp_path, FINE, "default", "train", max_bytes=1_000)
+
+    assert refused.value.code == "too_large"
+    assert refused.value.message == parquet.TOO_LARGE
+    # Only the 8 bytes that gave the first footer's length.
+    assert fine.served == 8 and len(fine.ranges) == 1
+
+
+def test_a_server_that_ignores_range_is_closed_before_the_shard_is_read(fine, tmp_path):
+    fine.ignore_ranges = True
+
+    with pytest.raises(ProviderUnavailable) as refused:
+        fetch(tmp_path, FINE, "default", "train", max_bytes=SCALED_CAP)
+
+    assert str(refused.value) == parquet.NO_RANGES
+    assert fine.served == 0
+
+
+def test_a_server_that_sends_more_than_the_range_is_refused(fine, tmp_path):
+    fine.extra_bytes = 100
+
+    with pytest.raises(ProviderUnavailable) as refused:
+        fetch(tmp_path, FINE, "default", "train", max_bytes=SCALED_CAP)
+
+    assert str(refused.value) == parquet.WRONG_RANGE
+    # The trailer ends the file, so it came whole; the footer after it came
+    # with 100 bytes too many, and nothing was read after that.
+    assert len(fine.ranges) == 2
+
+
+def test_a_server_that_names_another_range_is_refused(fine, tmp_path, monkeypatch):
+    real = fine.get
+
+    def wrong(url, **kwargs):
+        response = real(url, **kwargs)
+        if response.status_code == 206:
+            response.headers["Content-Range"] = "bytes 0-7/1"
+        return response
+
+    monkeypatch.setattr(parquet.requests, "get", wrong)
+
+    with pytest.raises(ProviderUnavailable) as refused:
+        fetch(tmp_path, FINE, "default", "train", max_bytes=SCALED_CAP)
+
+    assert str(refused.value) == parquet.WRONG_RANGE
+
+
+def test_a_file_that_is_not_parquet_is_refused(hf, tmp_path):
+    hf.add_dataset(FINE, "default", "train", [b"not a parquet file at all, just text"])
+
+    with pytest.raises(ProviderUnavailable) as refused:
+        fetch(tmp_path, FINE, "default", "train", max_bytes=SCALED_CAP)
+
+    assert str(refused.value) == parquet.NOT_PARQUET
+
+
+def test_a_file_too_short_to_hold_a_footer_is_refused(hf, tmp_path):
+    hf.add_dataset(FINE, "default", "train", [b"PAR1"])
+
+    with pytest.raises(ProviderUnavailable) as refused:
+        fetch(tmp_path, FINE, "default", "train", max_bytes=SCALED_CAP)
+
+    assert str(refused.value) == parquet.NOT_PARQUET
+    assert hf.served == 0
+
+
+def test_an_import_queued_at_another_revision_reads_no_footer(fine, tmp_path):
+    # #174: the refusal comes before any byte of a shard, footers included.
+    with pytest.raises(ImportFailed) as refused:
+        fetch(tmp_path, FINE, "default", "train", max_bytes=SCALED_CAP, expected_revision="a" * 40)
+
+    assert refused.value.code == "changed"
+    assert fine.served == 0 and fine.ranges == []
+
+
+def test_the_build_check_names_the_shards_whose_footers_are_read(fine, tmp_path):
+    fine.build_sizes = {"default/train/0005.parquet": 1}
+
+    with pytest.raises(ProviderUnavailable) as waiting:
+        fetch(tmp_path, FINE, "default", "train", max_bytes=SCALED_CAP)
+
+    assert str(waiting.value) == parquet.REBUILDING
+    assert fine.served == 0
 
 
 def test_a_dataset_the_viewer_cannot_convert_is_refused_plainly(hf, tmp_path):

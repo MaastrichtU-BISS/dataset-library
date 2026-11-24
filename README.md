@@ -54,10 +54,17 @@ run_import(ref, session=db.session, fetch_shards=fetch_shards,
            community_datasets=..., community_base_url=..., community_record=..., community_download=...)
 ```
 
+The built-in `fetch_shards` does not download whole shards: it reads each chosen
+shard's Parquet footer with HTTP range requests, then only the row groups that
+fit under `max_bytes` (footers count too), drawn from across the split's shards,
+and writes them as local Parquet files (#178). A dataset is refused as
+`too_large` only when not even one row group fits; retrying cannot help, so a
+host should say an admin can raise the download limit instead of offering a retry.
+
 The same worker takes copy refs off `library_snapshot_queue` and runs
 `dataset_library.snapshots.run_copy(ref, session=db.session, fetch_shards=fetch_shards,
 snapshot_dir=..., max_bytes=...)`, which makes a pinned dataset's copy: the same
-parts an import would download, up to the same byte cap, in one Parquet file.
+parts an import would read, up to the same byte cap, in one Parquet file.
 The worker calls `snapshots.sweep(db.session, snapshot_dir)` with the import
 sweep (failing copies a worker left queued or building for thirty minutes, and
 deleting removed copies no import reads), and `snapshots.check_upstream(db.session)`

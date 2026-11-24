@@ -8,6 +8,36 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-24
+
+### Fixed
+
+- A dataset whose Parquet shards are each bigger than the import's byte cap can be imported (#178,
+  BAIGLE #178). `fetch_shards` downloaded whole shards and refused with `too_large` when even the
+  first was over the cap (200 MB by default), so FineFineWeb (`m-a-p/FineFineWeb`, ten shards of
+  263–292 MB) could never be imported, although an import keeps at most 5000 rows.
+  - `fetch_shards` now reads each chosen shard's footer with HTTP range requests (the last 8 bytes,
+    then the footer), and then only the row groups that fit under the cap, taken one shard at a time
+    and spread across each shard, so a sample is not just the head of shard 0. Up to 16 shards,
+    spread across the split, are read from. Footers and row groups both count against the cap.
+  - What was read is written as one local Parquet file per shard, with the shard's schema and its
+    `huggingface` metadata, so `Fetched.paths`, imports, label balance and copies (#121) read it as
+    before.
+  - `too_large` is raised only when not even one row group, with the footers read, fits under the
+    cap; its message is now `parquet.TOO_LARGE` ("Too large to sample here: even one block of rows
+    in this dataset is over the download limit."). Retrying cannot help, so a host should not offer
+    Try again for `too_large`.
+  - A server that answers a range request with the whole file (200) is closed before its body is
+    read, and one that sends another range or more bytes than asked is cut off; both raise
+    `ProviderUnavailable` (`parquet.NO_RANGES`, `parquet.WRONG_RANGE`). A shard whose footer cannot
+    be read raises `ProviderUnavailable` (`parquet.NOT_PARQUET`). The old "bigger than Hugging Face
+    said" `too_large` is gone with whole-shard downloads.
+  - #168 and #174 are kept: every range is read from the shard URL pinned to the convert commit, the
+    build check covers every shard whose footer is read, and a refusal for the revision comes before
+    any byte of a shard, footers included.
+- `fetch_shards`'s signature and `Fetched` are unchanged; hosts need no code change.
+- `dataset_library.__version__` is 0.17.0.
+
 ## [0.15.0] - 2026-11-23
 
 ### Fixed

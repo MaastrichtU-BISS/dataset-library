@@ -1,17 +1,27 @@
-"""Downloading one split's Parquet shards from Hugging Face, for an import (#113).
+"""Reading a sample of one split's Parquet shards from Hugging Face, for an import (#113).
 
-The viewer lists the shards it converted (``/parquet``); they are downloaded in
-order, streamed, until the next would pass the byte cap. The listing answers
-with ``X-Revision``, the commit of the dataset its conversion was built from
-(#168), so the import records what its rows were read from, not the Hub's
-current head. Every shard is then downloaded from the commit the Hub's
+The viewer lists the shards it converted (``/parquet``). Whole shards are not
+downloaded (#178): a shard can be bigger than the byte cap while an import keeps
+a few thousand rows. Up to ``MAX_SHARDS`` shards, spread across the split, have
+their footers read with HTTP range requests (the last 8 bytes, then the footer);
+then row groups are taken one shard at a time, each spread across its shard,
+while the cap allows, and only their byte ranges are read. Footers and row
+groups both count against the cap. Each shard's row groups are written as a
+local Parquet file, so what an import or a copy reads is unchanged. A server
+that answers a range with the whole file is closed before its body is read.
+The only size refusal left, ``too_large``, is not even one row group fitting.
+
+The listing answers with ``X-Revision``, the commit of the dataset its
+conversion was built from (#168), so the import records what its rows were read
+from, not the Hub's current head. Every range is read from the commit the Hub's
 ``refs/convert/parquet`` branch points at, so a conversion rebuilt between the
-listing and the download cannot mix two builds' files, and one rebuilt while
-the listing is read is not imported until it settles. Only huggingface.co and
+listing and the read cannot mix two builds' files, and one rebuilt while the
+listing is read is not imported until it settles. Only huggingface.co and
 datasets-server.huggingface.co are called. 429 and 5xx are retried three times
 with backoff, then the provider is unavailable. An import queued at another
-revision is refused, with the same refusal ``imports`` makes, before any shard
-is downloaded (``expected_revision``, #174)."""
+revision is refused, with the same refusal ``imports`` makes, before any byte
+of a shard is read, footers included (``expected_revision``, #174)."""
+import io
 import os
 import re
 import time
@@ -39,6 +49,19 @@ REBUILDING = "Hugging Face is rebuilding this dataset's converted files"
 UNPINNABLE = "Hugging Face listed a file we cannot pin to one build of this dataset"
 # A dataset revision as the Hub names one (providers/huggingface keeps the same).
 REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+# Reading only what a sample needs (#178): a shard's footer is found from its
+# last 8 bytes, a 4-byte length and the magic.
+MAGIC = b"PAR1"
+TRAILER = 8
+# The most shards whose footers are read, spread across the split.
+MAX_SHARDS = 16
+# The one refusal for size left: not even one row group, with its shard's
+# footer, fits under the download limit. Retrying cannot help; an admin can
+# raise the limit.
+TOO_LARGE = "Too large to sample here: even one block of rows in this dataset is over the download limit."
+NO_RANGES = "Hugging Face sent a whole file when asked for part of it, so it was not downloaded"
+WRONG_RANGE = "Hugging Face sent a different part of a file than the one asked for"
+NOT_PARQUET = "Hugging Face listed a file that is not a Parquet file we can read"
 
 
 def _get(url, sleep, **kwargs):
@@ -76,15 +99,9 @@ def fetch_shards(external_id, config, split, max_bytes, dest_dir, *, expected_re
     shards = [s for s in listing.json().get("parquet_files") or [] if s.get("config") == config and s.get("split") == split]
     if not shards:
         raise ImportFailed("not_importable", "Hugging Face has no files for this part of the dataset.")
-
-    chosen, total = [], 0
-    for shard in shards:
-        if total + shard["size"] > max_bytes:
-            break
-        chosen.append(shard)
-        total += shard["size"]
-    if not chosen:
-        raise ImportFailed("too_large", "Too large to sample here: even one part of this dataset is over the download limit.")
+    # A shard's size only says where its footer is: what is read is decided by
+    # the footers, so a shard over the cap no longer stops an import (#178).
+    chosen = _spread_shards(shards)
 
     # The convert branch is read on both sides of a second listing: the same
     # commit both times, and the same source revision as the first listing,
@@ -97,22 +114,253 @@ def fetch_shards(external_id, config, split, max_bytes, dest_dir, *, expected_re
         raise ProviderUnavailable(REBUILDING)
     # The listing can be cached while the branch has moved on: every chosen file
     # must be in the pinned build at the size the listing gives, or the listing
-    # describes another build.
+    # describes another build. The footers are found from these sizes.
     _check_build(external_id, commit, chosen, sleep)
     head = _head(external_id, sleep) if revision else None
-    # An import queued at another revision is refused before any shard is
-    # downloaded (#174), with the refusal `imports` makes after a fetch.
+    # An import queued at another revision is refused before any byte of a
+    # shard is read, footers included (#174), with the refusal `imports` makes
+    # after a fetch.
     refusal = refusal_for(expected_revision, revision, head)
     if refusal is not None:
         raise refusal
 
+    budget = _Budget(max_bytes)
+    urls = [_pinned(shard["url"], commit) for shard in chosen]
+    footers = _read_footers(urls, [shard["size"] for shard in chosen], budget, sleep)
+    plan = _plan(footers, budget)
+
     os.makedirs(dest_dir, exist_ok=True)
     paths = []
-    for n, shard in enumerate(chosen):
+    for n, (i, groups) in enumerate(plan):
         path = os.path.join(dest_dir, f"{n:05}.parquet")
-        _download(_pinned(shard["url"], commit), path, shard["size"], sleep)
+        _write_row_groups(urls[i], footers[i], groups, path, sleep)
         paths.append(path)
     return Fetched(paths=paths, revision=revision, head=head)
+
+
+class _Budget:
+    """The bytes an import may still read: footers and row groups both count."""
+
+    def __init__(self, cap):
+        self.cap, self.spent = cap, 0
+
+    def fits(self, n):
+        return self.spent + n <= self.cap
+
+    def spend(self, n):
+        self.spent += n
+
+
+class _Footer:
+    """A shard's parsed footer: its size, its metadata, and each row group's
+    rows and byte range in the shard."""
+
+    def __init__(self, size, metadata, data_end):
+        self.size, self.metadata = size, metadata
+        self.groups = [_group_range(metadata.row_group(i), data_end) for i in range(metadata.num_row_groups)]
+
+
+def _spread_shards(shards):
+    """At most MAX_SHARDS shards, spread evenly from first to last, so a sample
+    is not only the head of the split."""
+    k = min(len(shards), MAX_SHARDS)
+    return [shards[i * len(shards) // k] for i in range(k)]
+
+
+def _spread(n):
+    """0..n-1 in an order that halves the gaps: 0, n/2, n/4, 3n/4, ... so the
+    first row groups taken from a shard come from all over it."""
+    order, seen, parts = [], set(), 1
+    while len(order) < n:
+        for j in range(parts):
+            i = j * n // parts
+            if i not in seen:
+                seen.add(i)
+                order.append(i)
+        parts *= 2
+    return order
+
+
+def _read_footers(urls, sizes, budget, sleep):
+    """Each shard's footer, read with two ranges: the last 8 bytes, which give
+    its length, then the footer. The first may use the whole budget. Later ones
+    stop at half of it, and never take the room the smallest row group read so
+    far needs, so a later footer cannot make an import too large. The footers
+    read, in order."""
+    import pyarrow.parquet as pq
+
+    footers = []
+    for url, size in zip(urls, sizes):
+        limit = budget.cap
+        if footers:
+            smallest = min((end - start for f in footers for rows, start, end in f.groups if rows), default=0)
+            limit = min(budget.cap // 2, budget.cap - smallest)
+        if size < len(MAGIC) + TRAILER:
+            raise ProviderUnavailable(NOT_PARQUET)
+        if budget.spent + TRAILER > limit:
+            break
+        trailer = _read_range(url, size - TRAILER, size, budget, sleep)
+        length = int.from_bytes(trailer[:4], "little")
+        if trailer[4:] != MAGIC or length > size - TRAILER - len(MAGIC):
+            raise ProviderUnavailable(NOT_PARQUET)
+        if budget.spent + length > limit:
+            break
+        data_end = size - TRAILER - length
+        footer = _read_range(url, data_end, size - TRAILER, budget, sleep)
+        try:
+            metadata = pq.read_metadata(io.BytesIO(footer + trailer))
+        except Exception as broken:  # noqa: BLE001 - whatever pyarrow raised, the footer cannot be read
+            raise ProviderUnavailable(NOT_PARQUET) from broken
+        footers.append(_Footer(size, metadata, data_end))
+    if not footers:
+        raise ImportFailed("too_large", TOO_LARGE)
+    return footers
+
+
+def _group_range(group, data_end):
+    """The bytes [start, end) of one row group: from its first column chunk's
+    first page to its last one's end. Outside the shard's data, the footer
+    is not one we trust."""
+    start, end = None, None
+    for c in range(group.num_columns):
+        column = group.column(c)
+        first = column.data_page_offset
+        if column.has_dictionary_page and column.dictionary_page_offset:
+            first = min(first, column.dictionary_page_offset)
+        last = first + column.total_compressed_size
+        start = first if start is None else min(start, first)
+        end = last if end is None else max(end, last)
+    if start is None or start < len(MAGIC) or end > data_end:
+        raise ProviderUnavailable(NOT_PARQUET)
+    return group.num_rows, start, end
+
+
+def _plan(footers, budget):
+    """The row groups to read, by shard: one from each shard in turn, spread
+    across it, while the budget allows. Returns [(footer index, [row group
+    indexes])] for shards with any taken."""
+    queues = [[g for g in _spread(len(f.groups)) if f.groups[g][0] > 0] for f in footers]
+    if not any(queues):
+        raise ImportFailed("not_importable", "Hugging Face has no rows for this part of the dataset.")
+    taken = [[] for _ in footers]
+    while any(queues):
+        for i, queue in enumerate(queues):
+            if not queue:
+                continue
+            g = queue.pop(0)
+            _, start, end = footers[i].groups[g]
+            if budget.fits(end - start):
+                budget.spend(end - start)
+                taken[i].append(g)
+    if not any(taken):
+        raise ImportFailed("too_large", TOO_LARGE)
+    return [(i, sorted(groups)) for i, groups in enumerate(taken) if groups]
+
+
+def _write_row_groups(url, footer, groups, path, sleep):
+    """Read `groups` of one shard, adjacent ones in one range, into a spool
+    file next to `path`, then write them to `path` as a Parquet file of their
+    own. The spool holds only the ranges read."""
+    import pyarrow.parquet as pq
+
+    ranges = []
+    for g in groups:
+        _, start, end = footer.groups[g]
+        if ranges and ranges[-1][1] == start:
+            ranges[-1][1] = end
+        else:
+            ranges.append([start, end])
+    spool_path = path + ".ranges"
+    try:
+        with open(spool_path, "w+b") as spool:
+            segments = []
+            for start, end in ranges:
+                segments.append((start, end, spool.tell()))
+                _stream_range(url, start, end, spool.write, sleep)
+            source = _Ranges(spool, segments, footer.size)
+            reader = pq.ParquetFile(source, metadata=footer.metadata, pre_buffer=False)
+            writer = pq.ParquetWriter(path, reader.schema_arrow)
+            try:
+                for g in groups:
+                    writer.write_table(reader.read_row_group(g))
+            finally:
+                writer.close()
+    finally:
+        try:
+            os.remove(spool_path)
+        except FileNotFoundError:
+            pass
+
+
+class _Ranges(io.RawIOBase):
+    """A shard as pyarrow reads it, holding only the ranges read: a read
+    outside them is an error, never a download."""
+
+    def __init__(self, spool, segments, size):
+        super().__init__()
+        self._spool, self._segments, self._size, self._pos = spool, segments, size, 0
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self._pos
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        base = {io.SEEK_SET: 0, io.SEEK_CUR: self._pos, io.SEEK_END: self._size}[whence]
+        self._pos = base + offset
+        return self._pos
+
+    def readinto(self, buffer):
+        n = min(len(buffer), self._size - self._pos)
+        if n <= 0:
+            return 0
+        for start, end, local in self._segments:
+            if start <= self._pos and self._pos + n <= end:
+                self._spool.seek(local + self._pos - start)
+                data = self._spool.read(n)
+                buffer[: len(data)] = data
+                self._pos += len(data)
+                return len(data)
+        raise OSError(f"bytes {self._pos}-{self._pos + n} of the shard were not read")
+
+
+def _read_range(url, start, end, budget, sleep):
+    """Bytes [start, end) of a pinned shard, counted against the budget."""
+    parts = []
+    _stream_range(url, start, end, parts.append, sleep)
+    budget.spend(end - start)
+    return b"".join(parts)
+
+
+def _stream_range(url, start, end, sink, sleep):
+    """Bytes [start, end) of a pinned shard, passed to `sink` as they come. A
+    server that answers with the whole file (200) is closed before its body is
+    read; one that sends more or less than asked is refused, and never past
+    what was asked."""
+    want = end - start
+    response = _get(url, sleep, stream=True, headers={"Range": f"bytes={start}-{end - 1}"})
+    try:
+        if response.status_code == 200:
+            raise ProviderUnavailable(NO_RANGES)
+        if response.status_code != 206:
+            raise ProviderUnavailable(f"Hugging Face answered {response.status_code} for a part of a shard")
+        named = response.headers.get("Content-Range")
+        if named is not None and not named.startswith(f"bytes {start}-{end - 1}/"):
+            raise ProviderUnavailable(WRONG_RANGE)
+        got = 0
+        for chunk in response.iter_content(CHUNK):
+            if got + len(chunk) > want:
+                raise ProviderUnavailable(WRONG_RANGE)
+            sink(chunk)
+            got += len(chunk)
+        if got != want:
+            raise ProviderUnavailable(WRONG_RANGE)
+    finally:
+        response.close()
 
 
 def _source_revision(listing):
@@ -187,17 +435,3 @@ def _pinned(url, commit):
     if marker not in url:
         raise ProviderUnavailable(UNPINNABLE)
     return url.replace(marker, f"/resolve/{commit}/", 1)
-
-
-def _download(url, path, expected, sleep):
-    response = _get(url, sleep, stream=True)
-    if response.status_code != 200:
-        raise ProviderUnavailable(f"Hugging Face answered {response.status_code} for a shard")
-    written = 0
-    with open(path, "wb") as f:
-        for chunk in response.iter_content(CHUNK):
-            written += len(chunk)
-            # A shard larger than listed is not trusted past a small margin.
-            if written > expected * 1.1 + CHUNK:
-                raise ImportFailed("too_large", "Too large to sample here: a part of this dataset is bigger than Hugging Face said.")
-            f.write(chunk)

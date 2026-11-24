@@ -227,6 +227,40 @@ def test_the_worker_keeps_the_copy_with_its_revision_rows_license_and_columns(cl
     assert listed["snapshot"] == {"status": "ready", "error": None, "revision": SHA, "rows": 3}
 
 
+def test_a_copy_is_made_with_the_range_read_fetch_from_shards_over_the_cap(client, app, snapshot_dir, tmp_path, monkeypatch):
+    # #178: the built-in fetch reads row groups, not whole shards, and writes
+    # them as local Parquet files a copy is made from as before (#121). Every
+    # shard here is over the copy's cap.
+    from dataset_library.providers import parquet
+    from test_fetch_shards import FakeHuggingFace, parquet_shard
+
+    pinned = pin_as_admin(client)
+    copy = copy_row(app, pinned["ref"])
+    fake = FakeHuggingFace()
+    shards = [parquet_shard(s, groups=6, rows_per_group=20, text_bytes=200) for s in range(3)]
+    fake.add_dataset(GREEK, copy["config"], copy["split"], shards, revision=SHA)
+    cap = 20_000
+    assert min(len(shard) for shard in shards) > cap
+
+    def fetch_shards(external_id, config, split, max_bytes, dest_dir, **kwargs):
+        return parquet.fetch_shards(external_id, config, split, max_bytes, dest_dir, sleep=lambda s: None, **kwargs)
+
+    with monkeypatch.context() as hub:
+        hub.setattr(parquet.requests, "get", fake.get)
+        hub.setattr(parquet.requests, "post", fake.post)
+        with app.app_context():
+            snapshots.run_copy(copy["id"], session=app.db.session, fetch_shards=fetch_shards, snapshot_dir=snapshot_dir, max_bytes=cap)
+
+    copy = copy_row(app, pinned["ref"])
+    assert copy["status"] == "ready", copy
+    assert copy["revision"] == SHA
+    texts = pq.read_table(os.path.join(snapshot_dir, copy["file_path"])).column("text").to_pylist()
+    assert copy["row_count"] == len(texts) > 0
+    assert {text.split("-", 1)[0] for text in texts} == {"s0", "s1", "s2"}
+    assert copy["columns"] == [{"name": "text", "type": "string"}, {"name": "label", "type": "int64"}]
+    assert 0 < fake.served <= cap
+
+
 @pytest.mark.parametrize(
     "error, code, message",
     [
