@@ -54,20 +54,26 @@ run_import(ref, session=db.session, fetch_shards=fetch_shards,
            community_datasets=..., community_base_url=..., community_record=..., community_download=...)
 ```
 
-The built-in `fetch_shards` does not download whole shards: it reads each chosen
-shard's Parquet footer with HTTP range requests, then only the row groups that
-fit under `max_bytes` (footers count too), drawn from across the split's shards,
-and writes them as local Parquet files (#178). Given `max_rows`, the rows the
-import keeps, it stops once it has `max(3 * max_rows, max_rows + 1000)` rows
-rather than filling `max_bytes`; `run_import` passes it to any `fetch_shards`
-that accepts the keyword, and a host's own fetch without it is called as before.
+The built-in `fetch_shards` does not download whole shards: with HTTP range
+requests it reads every chosen shard's last 8 bytes, which give its footer's
+length, then the footers, cheapest first and each only while it leaves room for
+the cheapest row group found so far, then only the row groups that fit under
+`max_bytes` (footers count too, and no byte is read twice), drawn from across
+the split's shards, and writes them as local Parquet files (#178). It follows
+the Hub's redirects to its CDN itself, closing each with its body unread, at
+most five and only over https. Given `max_rows`, the rows the import keeps, it
+stops once it has `max(3 * max_rows, max_rows + 1000)` rows from two shards (or
+from one, when no other shard's row group fits) rather than filling
+`max_bytes`; `run_import` passes it to any `fetch_shards` that accepts the
+keyword, and a host's own fetch without it is called as before.
 A dataset is refused as `too_large` only when no row group of any shard whose
 footer was read fits; retrying cannot help, so a host should say an admin can
 raise the download limit instead of offering a retry. A shard that is not
 Parquet it can read raises `errors.NotParquet`, which an import refuses as
-`not_importable`; a server that ignores `Range`, answers with another range or
-size, or sends more or less than asked raises `ProviderUnavailable`, so an
-import may still fall back to a copy.
+`not_importable` and a copy fails as `no_rows`; a server that ignores `Range`,
+answers with another range or size, redirects too often or off https, or sends
+more or less than asked raises `ProviderUnavailable`, so an import may still
+fall back to a copy. A local disk error is raised as its own `OSError`.
 
 The same worker takes copy refs off `library_snapshot_queue` and runs
 `dataset_library.snapshots.run_copy(ref, session=db.session, fetch_shards=fetch_shards,
