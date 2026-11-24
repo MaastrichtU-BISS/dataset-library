@@ -30,27 +30,50 @@ While the version is 0.x, minor releases may contain breaking changes.
     `GET /v1/documents/{country}/{source}?source_id=` with the student's key (waiting out a 429 for the
     per-minute cap rather than pausing as out of credits), writes one unlabelled row
     per document (`text, court, date, country, language, ecli, eli, source_url, text_truncated`), and counts
-    documents with no text (`skipped`) and documents gone (`missing`).
+    documents with no text (`skipped`) and documents gone or refused as malformed (404, 400, 422:
+    `missing`). Its documents' responses together may not pass the worker's download cap: past it
+    the import fails as `too_large`, keeping what it fetched. A country keeps Legal Data Hunter's
+    case (`CoE`, `EU`, `INTL`); the search filter upper-cases two-letter codes only.
   - Out of credits (429): the import fails as `out_of_credits` with "Fetched N of M — your Legal Data
     Hunter credits ran out. Try again when they reset." and `resumeAfter`; the documents it fetched are
-    kept, and Try again fetches only the rest.
+    kept, and Try again fetches only the rest, from the import's own documents even after the entry is
+    deleted or the row cap lowered. The pause stays listed and resumable until a week after it paused or
+    a day after the credits reset, whichever is later. Try again is refused with 409 `already_running`
+    while another import of the entry runs, and with 409 `not_retryable` once the import was put away.
+  - Fetched documents are kept only for a failure Try again resumes from (`out_of_credits`,
+    `provider_busy`, `bad_key`, `needs_key`); a cancel, another failure, completion, Put away, or an
+    admin setting the terms to Hide deletes them. A document answered after a cancel, Put away or
+    erasure is never written.
   - The license table has "Legal Data Hunter terms" (`legal-data-hunter-terms`, new group "Provider
     terms"): Warn or Hide, never Allow. Every license dict now carries `levels`, the levels an admin may
     choose.
   - Provenance carries `publishable` and `publishRefusal` for every import, and `legalDataHunter` for an
     entry's. `legal_data_hunter.publish_refusal(session, dataset_ref, model=)` gives the host the reason to
-    refuse publishing a dataset built from Legal Data Hunter, or a model trained on one, to Zenodo.
-  - Only `https://legaldatahunter.com` is called; a redirect to another host is refused. Tests use
+    refuse publishing a dataset built from Legal Data Hunter, or a model trained on one, to Zenodo. The
+    Dataset is recorded on its import the moment it is saved, and the refusal matches any import that made
+    it, whatever its status. `publishable` covers a provider's terms only, not licenses.
+  - The key is sent through `requests`' `auth=`, so a `.netrc` entry cannot replace it; a key seam that
+    raises is read as no key. A `Retry-After` is ASCII digits or a date, at most 31 days.
+  - Only `https://legaldatahunter.com` is called; a redirect to another host, or one with no
+    `Location`, is refused. Tests use
     recorded responses (`tests/fake_legal_data_hunter.py`), never the live API.
 - Migration `dl_0010_legal_data_hunter`: tables `library_ldh_entries` and `library_ldh_documents`, and
   `library_imports.documents`, `skipped`, `missing`, `resume_after`.
-- `legal_data_hunter.erase(session, owner_id)` for a host erasing a user; `imports.sweep` also deletes
-  fetched documents no import will resume from.
+- `legal_data_hunter.erase(session, owner_id)` for a host erasing a user, before or after it deletes the
+  user's imports: it also deletes documents whose import is gone, and sets the user's entries'
+  `created_by` to null. `imports.sweep` also deletes fetched documents no import will resume from.
 
 ### Changed
 
 - `GET /featured` answers `{"featured": [...], "legalDataHunter": [...]}`; `GET /options` and `GET
   /admin/settings` carry `legalDataHunter`.
+- `GET /options` leaves provider terms (`legal-data-hunter-terms`) and the "Provider terms" group out of
+  the student's license filter; `GET /admin/settings` keeps them. `GET /search?license=legal-data-hunter-terms`
+  asks Hugging Face nothing and answers no results, and `resolve_license` never gives a provider's terms.
+- An admin's entry made from chosen documents stores their number as `query.limit`, so Refresh keeps its
+  size; a Refresh that finds nothing is refused (400 `invalid`) and leaves the entry as it was.
+- `run_import` claims an import with one conditional update from `queued`, so of two workers given the
+  same ref only one runs it (every provider). A retry puts the old import away only when it made a new one.
 - `dataset_library.__version__` is 0.16.0.
 
 ## [0.15.0] - 2026-11-23
