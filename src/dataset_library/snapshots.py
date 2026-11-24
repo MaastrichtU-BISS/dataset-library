@@ -31,7 +31,7 @@ import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 
 from . import policy as policy_module
-from .errors import ProviderError, ProviderRateLimited
+from .errors import NotParquet, ProviderError, ProviderRateLimited
 from .licenses import LICENSES, UNKNOWN
 from .limits import download_cap_bytes
 from .models import LibraryImport, LibraryPin, LibrarySnapshot
@@ -182,6 +182,9 @@ def run_copy(copy_ref, *, session, fetch_shards, snapshot_dir, max_bytes, heartb
             _log(copy_id, external_id, READY, rows=rows)
     except (ImportFailed, CopyFailed) as exc:
         _fail(session, copy_id, external_id, exc.code, exc.message)
+    except NotParquet:
+        # A shard that cannot be read: asking again cannot help, so it is not busy.
+        _fail(session, copy_id, external_id, "no_rows", NO_ROWS)
     except ProviderError:
         _fail(session, copy_id, external_id, "provider_busy", BUSY)
     except OSError as exc:

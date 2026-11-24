@@ -15,11 +15,14 @@ whose worker went quiet, and queued imports nothing picked up.
 
 The host supplies how shards are fetched (``fetch_shards``, which takes the
 revision the import was queued at as the keyword ``expected_revision`` and
-refuses a conversion at another revision before it downloads anything (#174))
+refuses a conversion at another revision before it downloads anything (#174);
+a ``fetch_shards`` that takes the keyword ``max_rows`` is also told the rows
+the import keeps, so it can stop reading once it has enough (#178))
 and how a file becomes a Dataset (``create_dataset``, which raises
 ``ValueError`` with a student-readable message for every refusal).
 """
 import csv
+import inspect
 import json
 import logging
 import math
@@ -38,7 +41,7 @@ from sqlalchemy.orm.exc import ObjectDeletedError
 from . import community
 from . import policy as policy_module
 from . import snapshots as snapshots_module
-from .errors import ProviderError
+from .errors import NotParquet, ProviderError
 from .licenses import LICENSES, UNKNOWN, resolve_license
 from .limits import import_cap_bytes
 from .models import LibraryImport
@@ -879,11 +882,17 @@ def _fetch(session, record, fetch_shards, max_bytes, work, snapshot_dir):
         if copy is None or snapshot_dir is None:
             raise ImportFailed("copy_gone", COPY_GONE)
         return _from_copy(snapshot_dir, copy), {}
+    # Told the rows the import keeps, a fetch can stop reading long before the
+    # byte cap (#178); a host's own fetch without the keyword is called as before.
+    extra = {"max_rows": record.sample_size} if _takes(fetch_shards, "max_rows") else {}
     try:
         fetched = fetch_shards(
             record.external_id, record.config, record.split, max_bytes, work,
-            expected_revision=record.revision,
+            expected_revision=record.revision, **extra,
         )
+    except NotParquet as unreadable:
+        # Asking again cannot help, and no copy is read for a file that cannot be.
+        raise ImportFailed("not_importable", str(unreadable)) from unreadable
     except ProviderError:
         copy = snapshots_module.fallback_for(session, record, snapshot_dir)
         if copy is None:
@@ -895,6 +904,18 @@ def _fetch(session, record, fetch_shards, max_bytes, work, snapshot_dir):
     if refusal is not None:
         raise refusal
     return fetched, {}
+
+
+def _takes(fn, name):
+    """Whether `fn` can be passed the keyword `name`."""
+    try:
+        parameters = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        p.kind is p.VAR_KEYWORD or (p.name == name and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY))
+        for p in parameters
+    )
 
 
 def _fetch_community(session, record, seams, max_bytes, work):

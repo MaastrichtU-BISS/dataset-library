@@ -227,6 +227,94 @@ def test_the_worker_keeps_the_copy_with_its_revision_rows_license_and_columns(cl
     assert listed["snapshot"] == {"status": "ready", "error": None, "revision": SHA, "rows": 3}
 
 
+def test_a_copy_is_made_with_the_range_read_fetch_from_shards_over_the_cap(client, app, snapshot_dir, tmp_path, monkeypatch):
+    # #178: the built-in fetch reads row groups, not whole shards, and writes
+    # them as local Parquet files a copy is made from as before (#121). Every
+    # shard here is over the copy's cap.
+    from dataset_library.providers import parquet
+    from test_fetch_shards import FakeHuggingFace, parquet_shard
+
+    pinned = pin_as_admin(client)
+    copy = copy_row(app, pinned["ref"])
+    fake = FakeHuggingFace()
+    shards = [parquet_shard(s, groups=6, rows_per_group=1, text_bytes=4400) for s in range(3)]
+    fake.add_dataset(GREEK, copy["config"], copy["split"], shards, revision=SHA)
+    cap = 20_000
+    assert min(len(shard) for shard in shards) > cap
+
+    def fetch_shards(external_id, config, split, max_bytes, dest_dir, **kwargs):
+        return parquet.fetch_shards(external_id, config, split, max_bytes, dest_dir, sleep=lambda s: None, **kwargs)
+
+    with monkeypatch.context() as hub:
+        fake.install(hub)
+        with app.app_context():
+            snapshots.run_copy(copy["id"], session=app.db.session, fetch_shards=fetch_shards, snapshot_dir=snapshot_dir, max_bytes=cap)
+
+    copy = copy_row(app, pinned["ref"])
+    assert copy["status"] == "ready", copy
+    assert copy["revision"] == SHA
+    texts = pq.read_table(os.path.join(snapshot_dir, copy["file_path"])).column("text").to_pylist()
+    assert copy["row_count"] == len(texts) > 0
+    assert {text.split("-", 1)[0] for text in texts} == {"s0", "s1", "s2"}
+    assert copy["columns"] == [{"name": "text", "type": "string"}, {"name": "label", "type": "int64"}]
+    assert 0 < fake.served <= cap
+
+
+@pytest.mark.parametrize(
+    "error, code",
+    [(errno.ENOSPC, "storage_full"), (errno.EIO, "write_failed")],
+)
+def test_a_range_read_fetch_that_cannot_write_its_files_fails_the_copy_as_a_write(client, app, snapshot_dir, monkeypatch, error, code):
+    # #178: a local file the fetch cannot write raises its own OSError, not
+    # Hugging Face being busy, so the copy says what went wrong.
+    from dataset_library.providers import parquet
+    from test_fetch_shards import FakeHuggingFace, parquet_shard
+
+    pinned = pin_as_admin(client)
+    copy = copy_row(app, pinned["ref"])
+    fake = FakeHuggingFace()
+    fake.add_dataset(GREEK, copy["config"], copy["split"], [parquet_shard(0, groups=2, rows_per_group=2, text_bytes=64)], revision=SHA)
+
+    def cannot_write(self, table, *args, **kwargs):
+        raise OSError(error, os.strerror(error))
+
+    def fetch_shards(external_id, config, split, max_bytes, dest_dir, **kwargs):
+        return parquet.fetch_shards(external_id, config, split, max_bytes, dest_dir, sleep=lambda s: None, **kwargs)
+
+    with monkeypatch.context() as hub:
+        fake.install(hub)
+        hub.setattr(pq.ParquetWriter, "write_table", cannot_write)
+        with app.app_context():
+            snapshots.run_copy(copy["id"], session=app.db.session, fetch_shards=fetch_shards, snapshot_dir=snapshot_dir, max_bytes=10**9)
+
+    copy = copy_row(app, pinned["ref"])
+    assert (copy["status"], copy["error_code"]) == ("failed", code), copy
+
+
+def test_a_copy_of_a_shard_that_is_not_parquet_is_refused_not_busy(client, app, snapshot_dir, monkeypatch):
+    # #178: asking again cannot help, so the copy says its rows cannot be read
+    # rather than that Hugging Face is busy.
+    from dataset_library.providers import parquet
+    from test_fetch_shards import FakeHuggingFace
+
+    pinned = pin_as_admin(client)
+    copy = copy_row(app, pinned["ref"])
+    fake = FakeHuggingFace()
+    fake.add_dataset(GREEK, copy["config"], copy["split"], [b"not a parquet file at all, just text"], revision=SHA)
+
+    def fetch_shards(external_id, config, split, max_bytes, dest_dir, **kwargs):
+        return parquet.fetch_shards(external_id, config, split, max_bytes, dest_dir, sleep=lambda s: None, **kwargs)
+
+    with monkeypatch.context() as hub:
+        fake.install(hub)
+        with app.app_context():
+            snapshots.run_copy(copy["id"], session=app.db.session, fetch_shards=fetch_shards, snapshot_dir=snapshot_dir, max_bytes=10**9)
+
+    copy = copy_row(app, pinned["ref"])
+    assert (copy["status"], copy["error_code"], copy["error_message"]) == ("failed", "no_rows", snapshots.NO_ROWS)
+    assert not os.path.exists(snapshot_dir) or copy_files(snapshot_dir) == []
+
+
 @pytest.mark.parametrize(
     "error, code, message",
     [

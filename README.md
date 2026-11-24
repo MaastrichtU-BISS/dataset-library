@@ -56,10 +56,31 @@ run_import(ref, session=db.session, fetch_shards=fetch_shards,
            legal_data_hunter_key=legal_data_hunter_key)  # #126: the same seam as the API's
 ```
 
+The built-in `fetch_shards` does not download whole shards: with HTTP range
+requests it reads every chosen shard's last 8 bytes, which give its footer's
+length, then the footers, cheapest first and each only while it leaves room for
+the cheapest row group found so far, then only the row groups that fit under
+`max_bytes` (footers count too, and no byte is read twice), drawn from across
+the split's shards, and writes them as local Parquet files (#178). It follows
+the Hub's redirects to its CDN itself, closing each with its body unread, at
+most five and only over https. Given `max_rows`, the rows the import keeps, it
+stops once it has `max(3 * max_rows, max_rows + 1000)` rows from two shards (or
+from one, when no other shard's row group fits) rather than filling
+`max_bytes`; `run_import` passes it to any `fetch_shards` that accepts the
+keyword, and a host's own fetch without it is called as before.
+A dataset is refused as `too_large` only when no row group of any shard whose
+footer was read fits; retrying cannot help, so a host should say an admin can
+raise the download limit instead of offering a retry. A shard that is not
+Parquet it can read raises `errors.NotParquet`, which an import refuses as
+`not_importable` and a copy fails as `no_rows`; a server that ignores `Range`,
+answers with another range or size, redirects too often or off https, or sends
+more or less than asked raises `ProviderUnavailable`, so an import may still
+fall back to a copy. A local disk error is raised as its own `OSError`.
+
 The same worker takes copy refs off `library_snapshot_queue` and runs
 `dataset_library.snapshots.run_copy(ref, session=db.session, fetch_shards=fetch_shards,
 snapshot_dir=..., max_bytes=...)`, which makes a pinned dataset's copy: the same
-parts an import would download, up to the same byte cap, in one Parquet file.
+parts an import would read, up to the same byte cap, in one Parquet file.
 The worker calls `snapshots.sweep(db.session, snapshot_dir)` with the import
 sweep (failing copies a worker left queued or building for thirty minutes, and
 deleting removed copies no import reads), and `snapshots.check_upstream(db.session)`
