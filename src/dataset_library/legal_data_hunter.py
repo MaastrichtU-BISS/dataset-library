@@ -17,11 +17,15 @@ user's key or None; it is asked when the key is needed, by the request or by the
 import logging
 import json
 import time
+import uuid
+from collections import namedtuple
 from datetime import timedelta
 
 import sqlalchemy as sa
+from sqlalchemy.exc import IntegrityError
 
 from . import imports as imports_module
+from . import limits as limits_module
 from . import policy as policy_module
 from .errors import ProviderError
 from .licenses import LEGAL_DATA_HUNTER_TERMS
@@ -62,6 +66,8 @@ MINUTE_WAIT_SECONDS = 60
 MINUTE_WAITS = 3
 FETCHED, NO_TEXT, MISSING = "fetched", "no_text", "missing"
 TERMS = LEGAL_DATA_HUNTER_TERMS
+# A document an import kept: its outcome, its row (None unless fetched) and its response's size in bytes.
+_Kept = namedtuple("_Kept", "outcome row nbytes")
 
 
 class NotOffered(Exception):
@@ -379,7 +385,12 @@ def start(host, owner_id, body, *, ack_at=None, previous=None):
     (`ack_at`). The import copies the entry's documents, up to the row cap; a retry (`previous`) keeps its import's,
     and takes over the documents it already fetched, so Try again fetches none of them again. A retry needs no entry:
     it resumes from its import's own documents even when the admin has since deleted the entry, and never cuts them
-    to a lowered row cap. Returns the import as JSON and whether it is new; raises imports.Refused."""
+    to a lowered row cap. A retry of an import that stopped at the download cap is refused until the cap is higher.
+
+    At most one import of an entry per owner is queued or running: the new import holds `active_key` (unique). A retry
+    claims its paused import (puts it away, if no one has) in the same transaction that inserts the new import and
+    moves the documents, so of two retries of one import only one starts. Returns the import as JSON and whether it is
+    new; raises imports.Refused."""
     Refused = imports_module.Refused
     if not offered(host):
         raise Refused(404, "not_offered", provider.NOT_OFFERED)
@@ -411,6 +422,10 @@ def start(host, owner_id, body, *, ack_at=None, previous=None):
     if not documents:
         raise Refused(409, "no_documents", provider.NO_DOCUMENTS)
     task_type = previous.task_type if previous is not None else entry.task_type
+    if previous is not None and previous.error_code == "too_large" and previous.failed_cap is not None:
+        # Try again would pay for the same documents and stop at the same place.
+        if limits_module.import_cap_bytes(session, host.max_fetch_bytes) <= previous.failed_cap:
+            raise Refused(409, "cap_unchanged", provider.CAP_UNCHANGED)
     running = (
         session.query(LibraryImport)
         .filter(
@@ -436,6 +451,11 @@ def start(host, owner_id, body, *, ack_at=None, previous=None):
         earlier = session.query(LibraryImport).filter_by(owner_id=owner_id, provider=PROVIDER, external_id=entry.id).count()
         record_name = name or (entry.title if not earlier else f"{entry.title} ({earlier + 1})")
         citation = imports_module._pinned(_citation(entry.title), None, now)
+    previous_ref = previous.id if previous is not None else None
+    if previous_ref is not None and not _put_away(session, previous_ref, now):
+        # Another Try again (or a Put away) got there first.
+        session.rollback()
+        raise Refused(409, "not_retryable", provider.PUT_AWAY)
     record = LibraryImport(
         owner_id=owner_id, provider=PROVIDER, external_id=entry_ref, config=None, split=None, revision=None,
         url=provider.ORIGIN, license=TERMS.id, license_ack_at=ack_at or now,
@@ -443,26 +463,59 @@ def start(host, owner_id, body, *, ack_at=None, previous=None):
         sample_size=len(documents), max_rows=max_rows, balance=False,
         name=record_name, citation=citation,
         source=PROVIDER, documents=documents, skipped=0, missing=0,
-        status=imports_module.QUEUED,
+        status=imports_module.QUEUED, active_key=active_key(owner_id, entry_ref),
     )
     session.add(record)
-    session.flush()
-    if previous is not None:
+    try:
+        session.flush()
+    except IntegrityError:
+        # Another import of the entry was queued between the check above and this insert.
+        session.rollback()
+        raise Refused(409, "already_running", provider.ALREADY_RUNNING) from None
+    if previous_ref is not None:
         # Try again: the documents already fetched move to the new import, so they are not fetched (or paid for) again.
-        _move_documents(session, previous.id, record.id)
+        _move_documents(session, previous_ref, record.id)
     session.commit()
     imports_module._log(record, imports_module.QUEUED, size=record.sample_size)
-    try:
-        imports_module._enqueue(host, record)
-    except Refused:
-        if previous is not None:
-            # Nothing will run the new import: the paused one keeps its documents, and the new one is put away.
-            session.rollback()
-            _move_documents(session, record.id, previous.id)
+    restore = None
+    if previous_ref is not None:
+        record_ref = record.id
+
+        def restore():
+            # Nothing will run the new import: in the same commit that fails it, it is put away, and the paused one
+            # gets its documents back and is no longer put away, so Try again still resumes from them.
             record.dismissed_at = imports_module._now()
-            session.commit()
-        raise
+            _move_documents(session, record_ref, previous_ref)
+            session.execute(
+                sa.update(LibraryImport)
+                .where(LibraryImport.id == previous_ref)
+                .values(dismissed_at=None, updated_at=LibraryImport.updated_at)
+                .execution_options(synchronize_session=False)
+            )
+
+    imports_module._enqueue(host, record, restore)
     return record.to_dict(), True
+
+
+def active_key(owner_id, entry_ref):
+    """What an active (queued or running) import of an entry holds, unique per owner and entry."""
+    return f"{owner_id}:{entry_ref}"
+
+
+def _put_away(session, import_ref, now):
+    """Claim a paused import for Try again: put it away if it is still failed or cancelled and nobody has. One
+    conditional update, not committed; returns whether it matched. Its `updated_at` is kept, so its pause is not
+    lengthened if the retry is undone."""
+    return bool(session.execute(
+        sa.update(LibraryImport)
+        .where(
+            LibraryImport.id == import_ref,
+            LibraryImport.dismissed_at.is_(None),
+            LibraryImport.status.in_((imports_module.FAILED, imports_module.CANCELLED)),
+        )
+        .values(dismissed_at=now, updated_at=LibraryImport.updated_at)
+        .execution_options(synchronize_session=False)
+    ).rowcount)
 
 
 def _move_documents(session, from_ref, to_ref):
@@ -481,8 +534,11 @@ def fetch(session, record, key_for_owner, max_bytes=None):
     A document with no text is skipped and counted (`skipped`); one Legal Data Hunter no longer has (404), or refuses
     as malformed (400, 422), is too (`missing`). When the credits run out (429) the import fails as `out_of_credits`
     with "Fetched N of M…", keeping what it fetched for Try again. `max_bytes` is the worker's download cap: the
-    documents' responses together may not pass it (`too_large`, keeping those fetched). Raises imports.ImportFailed,
-    or imports._Stopped when the import ended elsewhere (cancelled, put away, or its row erased)."""
+    documents' responses together may not pass it (`too_large`, keeping those fetched and recording the cap as
+    `failed_cap`); each response is read only as far as what is left of it. A key seam that raises is no key
+    (`needs_key`, resumable). Terms set to Hide while it runs fail it as `license_hidden`, discarding what it fetched.
+    Raises imports.ImportFailed, or imports._Stopped when the import ended elsewhere (cancelled, put away, or its row
+    erased), even between the last check and a document's write."""
     ImportFailed = imports_module.ImportFailed
     level = policy_module.level(TERMS, policy_module.for_session(session))
     refusal = None
@@ -496,17 +552,17 @@ def fetch(session, record, key_for_owner, max_bytes=None):
         # Nothing will resume from what an earlier run fetched: the import cannot run here.
         discard(session, record.id)
         raise refusal
-    key = key_for_owner(record.owner_id)
-    key = key.strip() if isinstance(key, str) and key.strip() else None
+    key = _worker_key(key_for_owner, record)
     if key is None:
+        # Resumable: the documents kept are not lost to a missing key, or a seam that broke.
         raise ImportFailed("needs_key", NEEDS_KEY)
     documents = list(record.documents or [])
     done = {
-        found.position: found
+        found.position: _Kept(found.outcome, found.row, found.nbytes)
         for found in session.query(LibraryLegalDataHunterDocument).filter_by(import_id=record.id)
     }
-    # What the documents already kept weigh, so a resumed import cannot step past the cap a run at a time.
-    total = sum(_weight(found.row) for found in done.values() if found.row is not None)
+    # The bytes the kept documents' responses measured, so a resumed import cannot step past the cap a run at a time.
+    total = sum(_paid(found) for found in done.values())
     waits = 0
     position = 0
     while position < len(documents):
@@ -515,11 +571,14 @@ def fetch(session, record, key_for_owner, max_bytes=None):
             continue
         ref = documents[position]
         _still_running(session, record)
-        size = 0
+        # What is left of the cap: the response is read only this far.
+        allowance = None if max_bytes is None else max(max_bytes - total, 0)
         try:
-            found = provider.document(key, ref)
-        except (DocumentNotFound, DocumentRejected):
-            outcome, row = MISSING, None
+            found = provider.document(key, ref, max_bytes=allowance)
+        except provider.TooLarge:
+            raise ImportFailed("too_large", provider.too_large(max_bytes), failed_cap=max_bytes) from None
+        except (DocumentNotFound, DocumentRejected) as gone:
+            outcome, row, size = MISSING, None, getattr(gone, "nbytes", 0) or 0
         except OutOfCredits as ran_out:
             if ran_out.per_minute and waits < MINUTE_WAITS:
                 # Only the per-minute cap: wait it out and ask for the same document again.
@@ -538,24 +597,77 @@ def fetch(session, record, key_for_owner, max_bytes=None):
         except ProviderError:
             raise ImportFailed("provider_busy", provider.BUSY) from None
         else:
-            size = getattr(found, "nbytes", 0) or _weight(found)
+            size = getattr(found, "nbytes", None)
+            size = _weight(found) if size is None else size
             row = provider.row(found, ref)
             outcome = FETCHED if row is not None else NO_TEXT
         if max_bytes is not None and total + size > max_bytes:
-            raise ImportFailed("too_large", provider.too_large(max_bytes))
+            raise ImportFailed("too_large", provider.too_large(max_bytes), failed_cap=max_bytes)
         total += size
-        # A cancel, a Put away or an erasure while Legal Data Hunter answered: its text is never written.
+        # A cancel, a Put away, an erasure or Hide while Legal Data Hunter answered: its text is never written.
         _still_wanted(session, record)
-        kept = LibraryLegalDataHunterDocument(import_id=record.id, position=position, outcome=outcome, row=row)
-        session.add(kept)
-        session.commit()
-        done[position] = kept
+        # And one that lands after that check: the write itself checks the import again, in the same statement.
+        if not _write(session, record.id, position, outcome, row, size):
+            raise imports_module._Stopped()
+        done[position] = _Kept(outcome, row, size)
         waits = 0
         position += 1
     rows = [done[p].row for p in sorted(done) if done[p].outcome == FETCHED and p < len(documents)]
     skipped = sum(1 for p in done if done[p].outcome == NO_TEXT and p < len(documents))
     missing = sum(1 for p in done if done[p].outcome == MISSING and p < len(documents))
     return rows, skipped, missing
+
+
+def _worker_key(key_for_owner, record):
+    """The owner's key from the worker's seam, or None. A seam that raises is no key: only the exception's type is
+    logged, never its message, which could hold the key."""
+    try:
+        key = key_for_owner(record.owner_id)
+    except Exception as failed:  # noqa: BLE001
+        broken = type(failed).__name__
+    else:
+        return key.strip() if isinstance(key, str) and key.strip() else None
+    logger.warning("library.ldh.key_seam_failed import=%s error=%s", record.id, broken)
+    return None
+
+
+def _paid(kept):
+    """The bytes a kept document's response measured; for a row kept without that, its own size."""
+    if kept.nbytes is not None:
+        return kept.nbytes
+    return _weight(kept.row) if kept.row is not None else 0
+
+
+def _write(session, import_ref, position, outcome, row, nbytes):
+    """Keep one document, in one statement that writes it only while the import is running and not put away (an
+    INSERT … SELECT … WHERE EXISTS), and commit. Returns whether it was written: a cancel, Put away or erasure that
+    committed after the worker's last check leaves nothing behind."""
+    table = LibraryLegalDataHunterDocument
+    value = sa.null() if row is None else sa.literal(row, sa.JSON)
+    if row is not None and session.get_bind().dialect.name != "sqlite":
+        # A bare parameter in a select list is text to PostgreSQL; SQLite would read CAST(… AS JSON) as a number.
+        value = sa.cast(value, sa.JSON)
+    alive = sa.exists().where(
+        LibraryImport.id == import_ref,
+        LibraryImport.status.in_(imports_module.RUNNING),
+        LibraryImport.dismissed_at.is_(None),
+    )
+    chosen = sa.select(
+        sa.literal(str(uuid.uuid4()), sa.String),
+        sa.literal(import_ref, sa.String),
+        sa.literal(position, sa.Integer),
+        sa.literal(outcome, sa.String),
+        value,
+        sa.literal(nbytes, sa.Integer),
+        sa.literal(imports_module._now(), sa.DateTime),
+    ).where(alive)
+    written = session.execute(
+        sa.insert(table).from_select(
+            [table.id, table.import_id, table.position, table.outcome, table.row, table.nbytes, table.created_at], chosen,
+        )
+    ).rowcount
+    session.commit()
+    return written == 1
 
 
 def _sleep(seconds):
@@ -568,10 +680,18 @@ def _weight(value):
 
 
 def _still_wanted(session, record):
-    """Stop as `_still_running` does, and also when the import was put away."""
+    """Stop as `_still_running` does, and also when the import was put away, or fail it when the terms are now Hide."""
     _still_running(session, record)
     if record.dismissed_at is not None:
         raise imports_module._Stopped()
+    still_allowed(session, record)
+
+
+def still_allowed(session, record):
+    """Fail the import as `license_hidden`, discarding what it fetched, once an admin set the terms to Hide."""
+    if policy_module.level(TERMS, policy_module.for_session(session)) == "hide":
+        discard(session, record.id)
+        raise imports_module.ImportFailed("license_hidden", provider.LICENSE_HIDDEN)
 
 
 def _still_running(session, record):
@@ -598,9 +718,24 @@ def purge(session, *, now=None, keep=KEEP_FETCHED):
     """Delete fetched documents no import will resume from. Kept: those of a running import, and of a failed one not
     put away whose failure Try again resumes from (RESUMABLE), for `keep` after it failed, or, out of credits, until a
     day after its credits reset if that is later. Everything else goes: completed, cancelled, put away, other
-    failures, and documents whose import is gone. Run by `imports.sweep`. Returns how many went."""
+    failures, and documents whose import is gone. While the terms are Hide, only a running import's are kept: its worker
+    stops itself. Run by `imports.sweep`. Returns how many went."""
     now = now or imports_module._now()
-    alive = sa.select(LibraryImport.id).where(
+    if policy_module.level(TERMS, policy_module.for_session(session)) == "hide":
+        alive = sa.select(LibraryImport.id).where(LibraryImport.status.in_(imports_module.RUNNING))
+    else:
+        alive = _resumable_or_running(now, keep)
+    gone = session.execute(
+        sa.delete(LibraryLegalDataHunterDocument)
+        .where(LibraryLegalDataHunterDocument.import_id.not_in(alive))
+        .execution_options(synchronize_session=False)
+    ).rowcount
+    session.commit()
+    return gone
+
+
+def _resumable_or_running(now, keep):
+    return sa.select(LibraryImport.id).where(
         sa.or_(
             LibraryImport.status.in_(imports_module.RUNNING),
             sa.and_(
@@ -611,13 +746,6 @@ def purge(session, *, now=None, keep=KEEP_FETCHED):
             ),
         )
     )
-    gone = session.execute(
-        sa.delete(LibraryLegalDataHunterDocument)
-        .where(LibraryLegalDataHunterDocument.import_id.not_in(alive))
-        .execution_options(synchronize_session=False)
-    ).rowcount
-    session.commit()
-    return gone
 
 
 def erase(session, owner_id):
@@ -681,21 +809,24 @@ def _cell(value):
     return "" if value is None else value
 
 
-def from_legal_data_hunter(session, dataset_ref):
-    """Whether an import of Legal Data Hunter made this Dataset, whatever its status: the worker records the Dataset
-    the moment it is saved, so one whose worker died before completing is still caught. The host checks it before
-    publishing the dataset, or a model trained on it, to Zenodo (decision L10)."""
-    return session.query(
-        sa.exists().where(
-            LibraryImport.dataset_ref == str(dataset_ref),
-            LibraryImport.provider == PROVIDER,
-        )
-    ).scalar()
+def from_legal_data_hunter(session, dataset_ref, file_path=None):
+    """Whether an import of Legal Data Hunter made this Dataset, whatever its status. It matches the Dataset's ref, or
+    its `file_path`: the import saves the CSV's path before `create_dataset` is called, so a Dataset whose worker died
+    before its ref was recorded is still caught by its file. The host checks it before publishing the dataset, or a
+    model trained on it, to Zenodo (decision L10), and should pass the Dataset's `file_path`."""
+    matches = []
+    if dataset_ref is not None:
+        matches.append(LibraryImport.dataset_ref == str(dataset_ref))
+    if file_path is not None:
+        matches.append(LibraryImport.saved_path == str(file_path))
+    if not matches:
+        return False
+    return session.query(sa.exists().where(LibraryImport.provider == PROVIDER, sa.or_(*matches))).scalar()
 
 
-def publish_refusal(session, dataset_ref, *, model=False):
+def publish_refusal(session, dataset_ref, *, model=False, file_path=None):
     """Why a dataset, or a model trained on it (`model=True`), cannot be published, or None when Legal Data Hunter's
-    terms do not stand in the way."""
-    if not from_legal_data_hunter(session, dataset_ref):
+    terms do not stand in the way. Pass the Dataset's `file_path` too: it is matched before the ref is recorded."""
+    if not from_legal_data_hunter(session, dataset_ref, file_path):
         return None
     return MODEL_PUBLISH_REFUSED if model else DATASET_PUBLISH_REFUSED

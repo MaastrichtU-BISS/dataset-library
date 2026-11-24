@@ -28,6 +28,10 @@ TIMEOUT = 30
 MAX_REDIRECTS = 3
 # The longest Retry-After believed: a longer one (or a date further off) is read as this.
 MAX_RETRY_AFTER = 31 * 86_400
+# A Retry-After of more digits than this is read as MAX_RETRY_AFTER without being parsed.
+MAX_RETRY_AFTER_DIGITS = 10
+# A response body is read this many bytes at a time, so a byte cap stops it within one chunk of the cap.
+CHUNK = 16_384
 # An entry holds at most this many documents (decision L8): each costs one credit per import.
 MAX_DOCUMENTS = 100
 # The corpora a search may look in (decision L15), as Legal Data Hunter names them (`namespace`).
@@ -88,6 +92,10 @@ def too_large(max_bytes):
 
 ALREADY_RUNNING = "Another import of this entry is still running. Wait for it to finish, then try again."
 PUT_AWAY = "This import was put away, so it cannot be tried again. Start a new import instead."
+CAP_UNCHANGED = (
+    "This import stopped at the platform's download limit, so trying again now would stop at the same place. "
+    "An admin has to raise the download limit first."
+)
 
 
 def out_of_credits(fetched, total):
@@ -119,11 +127,25 @@ class OffOrigin(ProviderUnavailable):
 
 
 class DocumentNotFound(ProviderError):
-    """Legal Data Hunter no longer has this document (404): its source may have been removed."""
+    """Legal Data Hunter no longer has this document (404): its source may have been removed. `nbytes` is the size of
+    its response body."""
+
+    nbytes = 0
 
 
 class DocumentRejected(ProviderError):
-    """Legal Data Hunter refused the request for this document as malformed (400 or 422): asking again cannot help."""
+    """Legal Data Hunter refused the request for this document as malformed (400 or 422): asking again cannot help.
+    `nbytes` is the size of its response body."""
+
+    nbytes = 0
+
+
+class TooLarge(ProviderError):
+    """A response body passed the bytes it was allowed; reading stopped there. `nbytes` is how much was read."""
+
+    def __init__(self, nbytes):
+        super().__init__("Legal Data Hunter's answer was larger than the download cap allows")
+        self.nbytes = nbytes
 
 
 class Answer(dict):
@@ -146,8 +168,9 @@ class _Bearer(AuthBase):
         return "_Bearer(…)"
 
 
-def _request(method, path, key, *, params=None, body=None):
-    """One call to Legal Data Hunter, as JSON. Redirects are followed by hand, and only on its origin."""
+def _request(method, path, key, *, params=None, body=None, max_bytes=None):
+    """One call to Legal Data Hunter, as JSON. Redirects are followed by hand, and only on its origin. The body is
+    read streamed: past `max_bytes` it stops reading and raises TooLarge."""
     if not isinstance(key, str) or not key.strip():
         raise BadKey("No key")
     url = ORIGIN + path
@@ -157,12 +180,13 @@ def _request(method, path, key, *, params=None, body=None):
         try:
             response = requests.request(
                 method, url, params=params, json=body, headers=headers, auth=auth, timeout=TIMEOUT,
-                allow_redirects=False,
+                allow_redirects=False, stream=True,
             )
         except requests.RequestException as failed:
             raise ProviderUnavailable(f"Legal Data Hunter did not answer: {type(failed).__name__}") from None
         status = response.status_code
         if status in (301, 302, 303, 307, 308):
+            _close(response)
             location = (response.headers.get("Location") or "").strip()
             if not location:
                 raise ProviderUnavailable(f"Legal Data Hunter answered {status} with nowhere to go")
@@ -174,41 +198,59 @@ def _request(method, path, key, *, params=None, body=None):
             url, params = target, None
             continue
         if status in (401, 403):
+            _close(response)
             raise BadKey(f"Legal Data Hunter answered {status}")
-        if status == 404:
-            raise DocumentNotFound("Legal Data Hunter answered 404")
-        if status in (400, 422):
-            raise DocumentRejected(f"Legal Data Hunter answered {status}")
+        data = _read(response, max_bytes)
+        if status in (404, 400, 422):
+            gone = DocumentNotFound("Legal Data Hunter answered 404") if status == 404 else DocumentRejected(
+                f"Legal Data Hunter answered {status}"
+            )
+            gone.nbytes = len(data)
+            raise gone
         if status == 429:
-            raise OutOfCredits(retry_after(response.headers.get("Retry-After")), _limit_type(response))
+            raise OutOfCredits(retry_after(response.headers.get("Retry-After")), _limit_type(data))
         if status != 200:
             raise ProviderUnavailable(f"Legal Data Hunter answered {status}")
-        try:
-            found = response.json()
-        except ValueError:
-            raise ProviderUnavailable("Legal Data Hunter answered with something unreadable") from None
+        found = _json(data)
         if not isinstance(found, dict):
             raise ProviderUnavailable("Legal Data Hunter answered with something unreadable")
         answer = Answer(found)
-        answer.nbytes = _size(response, found)
+        answer.nbytes = len(data)
         return answer
     raise ProviderUnavailable("Legal Data Hunter redirected too many times")
 
 
-def _size(response, found):
-    """The response body's size in bytes; the JSON's own size when the response cannot say."""
-    content = getattr(response, "content", None)
-    if isinstance(content, (bytes, bytearray)):
-        return len(content)
-    return len(json.dumps(found, ensure_ascii=False).encode("utf-8"))
-
-
-def _limit_type(response):
-    """Which window a 429 is for (`minute`, `day` or `period`), from its error body; None when it does not say."""
+def _read(response, max_bytes=None):
+    """The response body, read a chunk at a time; past `max_bytes` it stops at once and raises TooLarge."""
+    data = bytearray()
     try:
-        found = response.json()
-    except ValueError:
+        for chunk in response.iter_content(chunk_size=CHUNK):
+            data += chunk
+            if max_bytes is not None and len(data) > max_bytes:
+                raise TooLarge(len(data))
+    except requests.RequestException as failed:
+        raise ProviderUnavailable(f"Legal Data Hunter did not answer: {type(failed).__name__}") from None
+    finally:
+        _close(response)
+    return bytes(data)
+
+
+def _close(response):
+    close = getattr(response, "close", None)
+    if close is not None:
+        close()
+
+
+def _json(data):
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
         return None
+
+
+def _limit_type(data):
+    """Which window a 429 is for (`minute`, `day` or `period`), from its error body; None when it does not say."""
+    found = _json(data)
     error = found.get("error") if isinstance(found, dict) else None
     kind = error.get("limit_type") if isinstance(error, dict) else None
     return kind if kind in ("minute", "day", "period") else None
@@ -219,6 +261,9 @@ def retry_after(value, now=None):
     MAX_RETRY_AFTER. None when it says neither."""
     text = str(value or "").strip()
     if text.isascii() and text.isdigit():
+        # Never parsed when it is this long: past Python's digit limit, int() would raise.
+        if len(text) > MAX_RETRY_AFTER_DIGITS:
+            return MAX_RETRY_AFTER
         return min(int(text), MAX_RETRY_AFTER)
     try:
         when = parsedate_to_datetime(text)
@@ -274,7 +319,10 @@ def check_query(body):
     q = q.strip() if isinstance(q, str) else ""
     if not q or len(q) > MAX_QUERY:
         fields["q"] = f"Type what to search for, up to {MAX_QUERY} characters."
-    corpus = body.get("corpus") or DEFAULT_CORPUS
+    # Case law only when no corpus is given; anything else must name one.
+    corpus = body.get("corpus")
+    if corpus is None:
+        corpus = DEFAULT_CORPUS
     if not isinstance(corpus, str) or corpus not in CORPORA:
         fields["corpus"] = "Choose case law, legislation or doctrine."
     country = _list_of(body.get("country"), COUNTRY, "country", fields, upper=True)
@@ -376,10 +424,11 @@ def document_ref(value):
     return ref
 
 
-def document(key, ref):
-    """One document's JSON, by its id. Raises DocumentNotFound when Legal Data Hunter no longer has it."""
+def document(key, ref, max_bytes=None):
+    """One document's JSON, by its id, with `nbytes`. Raises DocumentNotFound when Legal Data Hunter no longer has it,
+    and TooLarge, without reading further, once its response passes `max_bytes`."""
     path = f"/v1/documents/{quote(ref['country'], safe='')}/{quote(ref['source'], safe='')}"
-    return _request("GET", path, key, params={"source_id": ref["sourceId"]})
+    return _request("GET", path, key, params={"source_id": ref["sourceId"]}, max_bytes=max_bytes)
 
 
 def row(found, ref=None):

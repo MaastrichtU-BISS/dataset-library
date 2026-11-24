@@ -1,5 +1,6 @@
 """Legal Data Hunter entries (#126): an admin's search and its frozen document ids, the documents an import has
-fetched so Try again resumes, and what an import of an entry fetches and skips."""
+fetched so Try again resumes (with each response's size), and what an import of an entry fetches and skips: the CSV
+it saves, the download cap it stopped under, and the key that allows one active import of an entry per owner."""
 import sqlalchemy as sa
 from alembic import op
 
@@ -30,6 +31,7 @@ def upgrade():
         sa.Column("position", sa.Integer(), nullable=False),
         sa.Column("outcome", sa.String(length=20), nullable=False),
         sa.Column("row", sa.JSON(), nullable=True),
+        sa.Column("nbytes", sa.Integer(), nullable=True),
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.UniqueConstraint("import_id", "position", name="uq_library_ldh_documents_position"),
     )
@@ -38,9 +40,18 @@ def upgrade():
     op.add_column("library_imports", sa.Column("skipped", sa.Integer(), nullable=True))
     op.add_column("library_imports", sa.Column("missing", sa.Integer(), nullable=True))
     op.add_column("library_imports", sa.Column("resume_after", sa.DateTime(), nullable=True))
+    op.add_column("library_imports", sa.Column("saved_path", sa.String(length=1000), nullable=True))
+    op.add_column("library_imports", sa.Column("failed_cap", sa.BigInteger(), nullable=True))
+    op.add_column("library_imports", sa.Column("active_key", sa.String(length=300), nullable=True))
+    # Unique, and null for every import not active: PostgreSQL and SQLite both allow many nulls.
+    op.create_index("ix_library_imports_active_key", "library_imports", ["active_key"], unique=True)
 
 
 def downgrade():
+    op.drop_index("ix_library_imports_active_key", table_name="library_imports")
+    op.drop_column("library_imports", "active_key")
+    op.drop_column("library_imports", "failed_cap")
+    op.drop_column("library_imports", "saved_path")
     op.drop_column("library_imports", "resume_after")
     op.drop_column("library_imports", "missing")
     op.drop_column("library_imports", "skipped")

@@ -3,7 +3,7 @@ from the package's migrations."""
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Boolean, DateTime, Integer, String, UniqueConstraint, false
+from sqlalchemy import JSON, BigInteger, Boolean, DateTime, Integer, String, UniqueConstraint, false
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -161,6 +161,13 @@ class LibraryImport(LibraryBase):
     skipped: Mapped[int | None] = mapped_column(Integer, nullable=True)
     missing: Mapped[int | None] = mapped_column(Integer, nullable=True)
     resume_after: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # The CSV it hands `create_dataset`, saved with the move to saving, before the Dataset exists: the publish block
+    # matches it while `dataset_ref` is not yet recorded. `failed_cap` is the download cap it stopped under as
+    # `too_large`; Try again is refused until the cap is higher. `active_key` is `owner:entry` while it is queued or
+    # running, null otherwise: a unique index allows one active import of an entry per owner.
+    saved_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    failed_cap: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    active_key: Mapped[str | None] = mapped_column(String(300), nullable=True, unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
     imported_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -241,4 +248,6 @@ class LibraryLegalDataHunterDocument(LibraryBase):
     # "fetched", "no_text" or "missing".
     outcome: Mapped[str] = mapped_column(String(20))
     row: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # The response's body size in bytes, whatever the outcome: a retry counts what was already paid for.
+    nbytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)

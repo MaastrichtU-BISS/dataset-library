@@ -20,20 +20,39 @@ STUDENT_KEY = "sk-student-1111111111111111"
 
 
 class Response:
+    """A response whose body is read as `requests` streams it, a chunk at a time; `bytes_read` counts what was read."""
+
     def __init__(self, status_code, body=None, headers=None):
         self.status_code = status_code
         self._body = body
         self.headers = headers or {}
+        self.bytes_read = 0
+        self.closed = False
 
     def json(self):
         if isinstance(self._body, str):
             raise ValueError("not JSON")
         return self._body
 
-    @property
-    def content(self):
+    def _bytes(self):
         body = self._body if isinstance(self._body, str) else json.dumps(self._body)
         return (body or "").encode("utf-8")
+
+    @property
+    def content(self):
+        data = self._bytes()
+        self.bytes_read += len(data)
+        return data
+
+    def iter_content(self, chunk_size=1):
+        data = self._bytes()
+        for start in range(0, len(data), chunk_size):
+            chunk = data[start:start + chunk_size]
+            self.bytes_read += len(chunk)
+            yield chunk
+
+    def close(self):
+        self.closed = True
 
 
 class _Prepared:
@@ -55,8 +74,14 @@ class FakeLegalDataHunter:
         self.minute_limited = 0  # requests answered with a per-minute 429 before the next one goes through
         self.minute_retry_after = "7"  # the per-minute 429's Retry-After
         self.calls = []  # {method, url, path, params, json, key}
+        self.responses = []  # every Response given, in call order
 
-    def request(self, method, url, params=None, json=None, headers=None, timeout=None, allow_redirects=True, auth=None, **kwargs):
+    def request(self, *args, **kwargs):
+        response = self._answer(*args, **kwargs)
+        self.responses.append(response)
+        return response
+
+    def _answer(self, method, url, params=None, json=None, headers=None, timeout=None, allow_redirects=True, auth=None, **kwargs):
         prepared = _Prepared(headers)
         if auth is not None:
             auth(prepared)
@@ -67,7 +92,7 @@ class FakeLegalDataHunter:
         self.calls.append({
             "method": method, "url": url, "origin": f"{parts.scheme}://{parts.netloc}", "path": parts.path,
             "params": dict(params or {}), "json": copy.deepcopy(json), "key": auth.removeprefix("Bearer "),
-            "allow_redirects": allow_redirects, "timeout": timeout,
+            "allow_redirects": allow_redirects, "timeout": timeout, "stream": kwargs.get("stream", False),
         })
         assert allow_redirects is False, "the provider follows redirects itself, on Legal Data Hunter's origin only"
         if f"{parts.scheme}://{parts.netloc}" != provider.ORIGIN:

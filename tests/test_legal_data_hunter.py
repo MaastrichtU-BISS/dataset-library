@@ -549,8 +549,8 @@ def test_a_cancel_stops_the_fetch_before_the_next_document(client, app, hunter, 
     queued = start(client, entry)
     real = provider.document
 
-    def cancel_after_first(key, ref):
-        found = real(key, ref)
+    def cancel_after_first(key, ref, **options):
+        found = real(key, ref, **options)
         with app.app_context():
             imports.cancel(app.extensions["dataset_library"], "alice", queued["id"])
         return found
@@ -864,8 +864,8 @@ def test_a_cancel_mid_fetch_discards_what_the_import_fetched(client, app, hunter
     real = provider.document
     answered = []
 
-    def cancel_at_the_third(key, ref):
-        found = real(key, ref)
+    def cancel_at_the_third(key, ref, **options):
+        found = real(key, ref, **options)
         answered.append(ref)
         if len(answered) == 3:
             assert kept(app, queued["id"]) == 2
@@ -885,8 +885,8 @@ def test_a_document_answered_after_the_import_was_erased_is_never_written(client
     queued = start(client, entry)
     real = provider.document
 
-    def erase_after_first(key, ref):
-        found = real(key, ref)
+    def erase_after_first(key, ref, **options):
+        found = real(key, ref, **options)
         with app.app_context():
             app.db.session.query(LibraryImport).filter_by(id=queued["id"]).delete()
             app.db.session.commit()
@@ -1113,6 +1113,7 @@ def test_a_netrc_entry_cannot_replace_the_users_key(tmp_path, monkeypatch):
         sent.append(request)
         response = requests.models.Response()
         response.status_code, response._content, response.url, response.request = 200, b'{"hits": []}', request.url, request
+        response._content_consumed = True
         return response
 
     monkeypatch.setattr(requests.Session, "send", send)
@@ -1216,3 +1217,471 @@ def test_recorded_documents_make_rows_with_the_fields_the_import_reads(country):
     if country == "coe":
         assert row["court"] == "European Court of Human Rights"
         assert row["ecli"].startswith("ECLI:CE:ECHR:")
+
+
+# --- The council's second round -----------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def file_app(make_app, hunter, keys, queue, tmp_path):
+    """The app on a database file, so two sessions (two app contexts) hold two connections, as two processes would."""
+    app = make_app(
+        legal_data_hunter_key=lambda owner: keys.get(owner), enqueue=queue, max_rows=lambda: 300,
+        config={"SQLALCHEMY_DATABASE_URI": f"sqlite:///{tmp_path / 'library.db'}"},
+    )
+    app.hunter = hunter
+    return app
+
+
+def csv_of(tmp_path, ref):
+    return tmp_path / "data" / f"library-{ref}.csv"
+
+
+def record_of(app, ref):
+    with app.app_context():
+        record = app.db.session.get(LibraryImport, ref)
+        app.db.session.expunge(record)
+        return record
+
+
+def test_a_dataset_made_before_its_ref_was_recorded_is_refused_publishing_by_its_file(client, app, hunter, tmp_path, monkeypatch):
+    """A: the CSV's path is committed with the move to saving, before `create_dataset` runs."""
+    queued = start(client, create(client))
+
+    def killed(session, record, dataset_ref):
+        raise KeyboardInterrupt  # the host committed the Dataset; the worker dies before recording it
+
+    monkeypatch.setattr(imports, "_record_dataset", killed)
+    with pytest.raises(KeyboardInterrupt):
+        work(app, tmp_path, queued["id"])
+    path = str(csv_of(tmp_path, queued["id"]))
+
+    with app.app_context():
+        session = app.db.session
+        assert imports.sweep(session, now=imports._now() + timedelta(minutes=5)) == [queued["id"]]
+        swept = session.get(LibraryImport, queued["id"])
+        assert (swept.status, swept.dataset_ref, swept.saved_path) == ("failed", None, path)
+        assert ldh.publish_refusal(session, "dataset-1", file_path=path) == ldh.DATASET_PUBLISH_REFUSED
+        assert ldh.publish_refusal(session, "dataset-1", model=True, file_path=path) == ldh.MODEL_PUBLISH_REFUSED
+        assert ldh.from_legal_data_hunter(session, None, file_path=path) is True
+        assert ldh.publish_refusal(session, "dataset-1") is None  # its ref was never recorded
+        assert ldh.publish_refusal(session, "dataset-2", file_path=str(tmp_path / "other.csv")) is None
+    assert csv_of(tmp_path, queued["id"]).exists()
+
+
+def test_a_sweep_during_create_dataset_never_removes_the_datasets_csv(client, app, hunter, tmp_path):
+    """B: once `create_dataset` returns, the CSV is the Dataset's, even when `_advance(COMPLETED)` is stopped."""
+    queued = start(client, create(client))
+    sink = Sink()
+
+    def made_then_swept(*args):
+        made = sink(*args)
+        with app.app_context():
+            assert imports.sweep(app.db.session, now=imports._now() + timedelta(minutes=5)) == [queued["id"]]
+        return made
+
+    done, _ = work(app, tmp_path, queued["id"], sink=made_then_swept)
+
+    assert (done["status"], done["code"], done["datasetRef"]) == ("failed", "stopped", "dataset-1")
+    assert csv_of(tmp_path, queued["id"]).exists()
+
+
+def test_a_database_error_on_completing_never_removes_the_datasets_csv(client, app, hunter, tmp_path, monkeypatch):
+    queued = start(client, create(client))
+    real = imports._advance
+
+    def broken(session, record, state, updates=None):
+        if state == imports.COMPLETED:
+            raise sa.exc.OperationalError("UPDATE library_imports", {}, Exception("the database went away"))
+        return real(session, record, state, updates)
+
+    monkeypatch.setattr(imports, "_advance", broken)
+    done, sink = work(app, tmp_path, queued["id"])
+
+    assert (done["status"], done["code"], done["datasetRef"]) == ("failed", "unexpected", "dataset-1")
+    assert len(sink.calls) == 1 and csv_of(tmp_path, queued["id"]).exists()
+
+
+def test_a_create_dataset_that_raises_still_removes_the_csv(client, app, hunter, tmp_path):
+    queued = start(client, create(client))
+
+    def refuses(*args):
+        raise ValueError("The file has no rows.")
+
+    done, _ = work(app, tmp_path, queued["id"], sink=refuses)
+
+    assert (done["status"], done["code"]) == ("failed", "invalid")
+    assert not csv_of(tmp_path, queued["id"]).exists()
+
+
+def test_a_worker_key_seam_that_raises_pauses_as_needs_key_and_logs_no_secret(client, app, hunter, tmp_path, caplog):
+    """C: only the exception's type is logged; the import keeps its documents for Try again."""
+    _, queued = pause(client, app, hunter, tmp_path)
+    again = client.post(f"/api/library/imports/{queued['id']}/retry", headers=ALICE).get_json()
+
+    def seam(owner):
+        raise RuntimeError("the vault said sk-secret-9999")
+
+    with caplog.at_level(logging.DEBUG):
+        done, _ = work(app, tmp_path, again["id"], seam=seam)
+
+    assert (done["status"], done["code"], done["error"]) == ("failed", "needs_key", NEEDS_KEY)
+    formatter = logging.Formatter("%(message)s")
+    for record in caplog.records:
+        assert "sk-secret" not in formatter.format(record)  # the message and any exc_info
+        assert record.exc_info is None or "sk-secret" not in str(record.exc_info[1])
+    assert "RuntimeError" in caplog.text
+    with app.app_context():
+        imports.sweep(app.db.session)
+    assert kept(app, again["id"]) == 2
+
+
+def test_a_worker_restart_keeps_what_it_fetched_and_try_again_fetches_only_the_rest(client, app, hunter, tmp_path, monkeypatch):
+    """D: the sweep's `stopped` is resumable."""
+    queued = start(client, create(client))
+    real = provider.document
+    asked = []
+
+    def dies_at_the_third(key, ref, **options):
+        asked.append(ref)
+        if len(asked) == 3:
+            raise KeyboardInterrupt  # the worker restarts
+        return real(key, ref, **options)
+
+    monkeypatch.setattr(provider, "document", dies_at_the_third)
+    with pytest.raises(KeyboardInterrupt):
+        work(app, tmp_path, queued["id"])
+    monkeypatch.setattr(provider, "document", real)
+    assert kept(app, queued["id"]) == 2
+
+    with app.app_context():
+        assert imports.sweep(app.db.session, now=imports._now() + timedelta(minutes=5)) == [queued["id"]]
+    assert record_of(app, queued["id"]).error_code == "stopped"
+    assert kept(app, queued["id"]) == 2
+    assert queued["id"] in [r["id"] for r in client.get("/api/library/imports?current=true", headers=ALICE).get_json()["imports"]]
+    hunter.calls.clear()
+
+    retried = client.post(f"/api/library/imports/{queued['id']}/retry", headers=ALICE)
+    assert retried.status_code == 202, retried.get_json()
+    done, sink = work(app, tmp_path, retried.get_json()["id"])
+
+    assert done["status"] == "completed", done
+    assert len(hunter.documents_fetched()) == 3
+
+
+def test_a_too_large_import_is_tried_again_only_once_the_cap_is_raised(make_app, hunter, keys, queue, tmp_path):
+    """E and K: 601 + 540 bytes pass a 1,140-byte cap; Try again at that cap is refused without a call. Raised to
+    1,500, the retry counts the 601 bytes already paid for, not the kept row's smaller size."""
+    app = make_app(legal_data_hunter_key=keys.get, enqueue=queue, max_rows=lambda: 300, max_fetch_bytes=1140)
+    client = app.test_client()
+    queued = start(client, create(client))
+
+    done, sink = work(app, tmp_path, queued["id"], max_bytes=1140)
+
+    assert (done["status"], done["code"]) == ("failed", "too_large") and sink.calls == []
+    assert record_of(app, queued["id"]).failed_cap == 1140
+    with app.app_context():
+        [first] = app.db.session.query(LibraryLegalDataHunterDocument).filter_by(import_id=queued["id"]).all()
+        assert (first.position, first.nbytes) == (0, 601)
+    hunter.calls.clear()
+    queue.refs.clear()
+
+    refused = client.post(f"/api/library/imports/{queued['id']}/retry", headers=ALICE)
+
+    assert refused.status_code == 409 and refused.get_json()["code"] == "cap_unchanged"
+    assert refused.get_json()["error"] == provider.CAP_UNCHANGED
+    assert hunter.calls == [] and queue.refs == []
+    assert record_of(app, queued["id"]).dismissed_at is None and kept(app, queued["id"]) == 1
+
+    library(app).max_fetch_bytes = 1500
+    retried = client.post(f"/api/library/imports/{queued['id']}/retry", headers=ALICE)
+    assert retried.status_code == 202, retried.get_json()
+    again = retried.get_json()["id"]
+    done, sink = work(app, tmp_path, again, max_bytes=1500)
+
+    # 601 + 540 = 1,141 kept; the next 453 would pass 1,500. Counted by the rows' sizes (353 + 540 + 453), it would not.
+    assert (done["status"], done["code"]) == ("failed", "too_large")
+    assert kept(app, again) == 2
+    assert hunter.documents_fetched()[0] == "FR/Judilibre/6543a1b2c3d4e5f6"
+
+
+def test_an_oversized_response_is_read_no_further_than_the_cap_and_one_chunk(client, app, hunter, tmp_path, monkeypatch):
+    """K: the body is streamed, and reading stops as soon as it passes what is left of the cap."""
+    monkeypatch.setattr(provider, "CHUNK", 64)
+    queued = start(client, create(client))
+    hunter.calls.clear()
+    hunter.responses.clear()
+
+    done, _ = work(app, tmp_path, queued["id"], max_bytes=100)
+
+    assert (done["status"], done["code"]) == ("failed", "too_large")
+    assert kept(app, queued["id"]) == 0
+    [call] = hunter.calls
+    [response] = hunter.responses
+    assert call["stream"] is True
+    assert 100 < response.bytes_read <= 100 + 64 < 601
+    assert response.closed
+
+
+def test_every_kept_document_records_its_response_bytes(client, app, hunter, tmp_path, monkeypatch):
+    """K: a document with no text and a 404 are measured and kept with their sizes too."""
+    queued = start(client, create(client))
+    hunter.responses.clear()
+    monkeypatch.setattr(ldh, "discard", lambda session, ref: None)  # keep them past completion, to look
+
+    done, _ = work(app, tmp_path, queued["id"])
+
+    assert done["status"] == "completed"
+    with app.app_context():
+        found = app.db.session.query(LibraryLegalDataHunterDocument).filter_by(import_id=queued["id"])
+        stored = {d.position: (d.outcome, d.nbytes) for d in found}
+    sizes = [len(response._bytes()) for response in hunter.responses]
+    assert stored == {
+        0: ("fetched", 601), 1: ("fetched", 540), 2: ("fetched", 453), 3: ("no_text", 385), 4: ("missing", sizes[4]),
+    }
+    assert sizes[4] > 0
+
+
+@pytest.mark.parametrize("code", sorted(imports.RESUMABLE))
+def test_every_resumable_failure_stays_listed_while_its_documents_are_kept(client, app, hunter, tmp_path, code):
+    """F."""
+    _, queued = pause(client, app, hunter, tmp_path)
+    with app.app_context():
+        session = app.db.session
+        session.execute(sa.update(LibraryImport).where(LibraryImport.id == queued["id"]).values(error_code=code, resume_after=None))
+        session.commit()
+        now = imports._now()
+
+        def listed(days):
+            return queued["id"] in [r["id"] for r in imports.current(library(app), "alice", now=now + timedelta(days=days))]
+
+        assert listed(3) and listed(6)
+        ldh.purge(session, now=now + timedelta(days=6))
+        assert kept(app, queued["id"]) == 2
+        assert not listed(8)
+
+
+def test_hide_during_a_fetch_stops_the_import_and_keeps_nothing(client, app, hunter, tmp_path, monkeypatch):
+    """G: the terms are checked before each document is written."""
+    queued = start(client, create(client))
+    real = provider.document
+    answered = []
+
+    def hidden_at_the_third(key, ref, **options):
+        found = real(key, ref, **options)
+        answered.append(ref)
+        if len(answered) == 3:
+            assert settings(client, {"legal-data-hunter-terms": "hide"}).status_code == 200
+        return found
+
+    monkeypatch.setattr(provider, "document", hidden_at_the_third)
+    done, sink = work(app, tmp_path, queued["id"])
+
+    assert (done["status"], done["code"], done["error"]) == ("failed", "license_hidden", provider.LICENSE_HIDDEN)
+    assert len(answered) == 3 and sink.calls == []
+    assert kept(app, queued["id"]) == 0
+
+
+def test_hide_before_saving_makes_no_dataset(client, app, hunter, tmp_path, monkeypatch):
+    """G: and once more before the move to saving."""
+    queued = start(client, create(client))
+    real = ldh.write_csv
+
+    def hidden_after_writing(path, rows):
+        real(path, rows)
+        assert settings(client, {"legal-data-hunter-terms": "hide"}).status_code == 200
+
+    monkeypatch.setattr(ldh, "write_csv", hidden_after_writing)
+    done, sink = work(app, tmp_path, queued["id"])
+
+    assert (done["status"], done["code"]) == ("failed", "license_hidden") and sink.calls == []
+    assert kept(app, queued["id"]) == 0 and not csv_of(tmp_path, queued["id"]).exists()
+
+
+def test_hide_then_out_of_credits_then_a_sweep_keeps_nothing(client, app, hunter, tmp_path, monkeypatch):
+    """G: purge deletes a paused import's documents while the terms are Hide, whatever its failure."""
+    queued = start(client, create(client))
+    hunter.credits = 2
+    real = provider.document
+    asked = []
+
+    def hidden_before_the_third(key, ref, **options):
+        asked.append(ref)
+        if len(asked) == 3:
+            assert settings(client, {"legal-data-hunter-terms": "hide"}).status_code == 200
+        return real(key, ref, **options)
+
+    monkeypatch.setattr(provider, "document", hidden_before_the_third)
+    done, _ = work(app, tmp_path, queued["id"])
+
+    assert done["code"] == "out_of_credits"
+    assert kept(app, queued["id"]) == 2  # it was running when the terms were hidden
+    with app.app_context():
+        imports.sweep(app.db.session)
+    assert kept(app, queued["id"]) == 0
+
+
+def test_of_two_interleaved_retries_of_one_paused_import_only_one_starts(file_app, hunter, tmp_path, monkeypatch):
+    """H: the second retry lands after the first passed its checks, before it claims the paused import."""
+    app = file_app
+    client = app.test_client()
+    _, paused = pause(client, app, hunter, tmp_path)
+    real = imports._pinned
+    other = []
+
+    def the_other_retry_lands_first(*args):
+        if not other:
+            other.append(None)  # once: the other retry's own _pinned runs through
+            other[0] = client.post(f"/api/library/imports/{paused['id']}/retry", headers=ALICE)
+        return real(*args)
+
+    monkeypatch.setattr(imports, "_pinned", the_other_retry_lands_first)
+    this = client.post(f"/api/library/imports/{paused['id']}/retry", headers=ALICE)
+
+    [first] = other
+    assert first.status_code == 202, first.get_json()
+    assert this.status_code == 409 and this.get_json()["code"] == "not_retryable"
+    with app.app_context():
+        assert app.db.session.query(LibraryImport).count() == 2
+    winner = first.get_json()["id"]
+    assert kept(app, winner) == 2 and kept(app, paused["id"]) == 0
+    assert record_of(app, winner).active_key == f"alice:{record_of(app, paused['id']).external_id}"
+
+
+def test_two_interleaved_starts_of_one_entry_make_one_import(file_app, hunter, tmp_path, monkeypatch):
+    """H: both pass the running check; the unique `active_key` refuses the second insert."""
+    app = file_app
+    client = app.test_client()
+    entry = create(client)
+    real = imports._pinned
+    other = []
+
+    def the_other_start_lands_first(*args):
+        if not other:
+            other.append(None)  # once: the other start's own _pinned runs through
+            other[0] = client.post("/api/library/imports", json={
+                "provider": "legal_data_hunter", "dataset": entry["ref"], "licenseAck": True,
+            }, headers=ALICE)
+        return real(*args)
+
+    monkeypatch.setattr(imports, "_pinned", the_other_start_lands_first)
+    this = client.post("/api/library/imports", json={
+        "provider": "legal_data_hunter", "dataset": entry["ref"], "licenseAck": True,
+    }, headers=ALICE)
+
+    [first] = other
+    assert first.status_code == 202, first.get_json()
+    assert this.status_code == 409 and this.get_json()["code"] == "already_running"
+    with app.app_context():
+        assert app.db.session.query(LibraryImport).count() == 1
+
+
+def test_an_imports_active_key_is_freed_when_it_ends(client, app, hunter, tmp_path, queue):
+    """H: held while queued or running, null after completing, cancelling, a sweep or a queue refusal."""
+    entry = create(client)
+    key = f"alice:{entry['ref']}"
+    first = start(client, entry)
+    assert record_of(app, first["id"]).active_key == key
+    work(app, tmp_path, first["id"])
+    assert record_of(app, first["id"]).active_key is None
+
+    second = start(client, entry)
+    client.post(f"/api/library/imports/{second['id']}/cancel", headers=ALICE)
+    assert record_of(app, second["id"]).active_key is None
+
+    third = start(client, entry)
+    with app.app_context():
+        assert imports.sweep(app.db.session, now=imports._now() + timedelta(hours=1)) == [third["id"]]
+    assert record_of(app, third["id"]).active_key is None
+
+    queue.fail = True
+    start(client, entry, status=503)
+    queue.fail = False
+    with app.app_context():
+        assert app.db.session.query(LibraryImport).filter(LibraryImport.active_key.is_not(None)).count() == 0
+    assert start(client, entry)["status"] == "queued"
+
+
+def test_a_hugging_face_import_holds_no_active_key(client, app):
+    """H: only a Legal Data Hunter import is limited to one at a time."""
+    body = {"dataset": "coastalcph/lex_glue", "config": "ledgar", "split": "train", "textColumn": "text",
+            "labelColumn": "label", "size": 200}
+    queued = client.post("/api/library/imports", json=body, headers=ALICE)
+
+    assert queued.status_code == 202, queued.get_json()
+    assert record_of(app, queued.get_json()["id"]).active_key is None
+
+
+def test_a_queue_refusal_and_a_sweep_before_the_answer_leave_the_paused_import_whole(client, app, hunter, tmp_path, queue, monkeypatch):
+    """I: the new import's failure and the paused import's restore are one commit."""
+    _, paused = pause(client, app, hunter, tmp_path)
+    queue.fail = True
+    Refused = imports.Refused
+
+    class SweptBeforeTheAnswer(Refused):
+        def __init__(self, status, code, message):
+            super().__init__(status, code, message)
+            if code == "not_started":
+                with app.app_context():
+                    imports.sweep(app.db.session)
+
+    monkeypatch.setattr(imports, "Refused", SweptBeforeTheAnswer)
+    refused = client.post(f"/api/library/imports/{paused['id']}/retry", headers=ALICE)
+
+    assert refused.status_code == 503 and refused.get_json()["code"] == "not_started"
+    assert kept(app, paused["id"]) == 2
+    assert record_of(app, paused["id"]).dismissed_at is None
+    with app.app_context():
+        [new] = app.db.session.query(LibraryImport).filter(LibraryImport.id != paused["id"]).all()
+        assert (new.status, new.error_code, new.active_key) == ("failed", "not_started", None)
+        assert new.dismissed_at is not None
+    monkeypatch.setattr(imports, "Refused", Refused)
+    queue.fail = False
+    again = client.post(f"/api/library/imports/{paused['id']}/retry", headers=ALICE)
+    assert again.status_code == 202 and kept(app, again.get_json()["id"]) == 2
+
+
+def test_a_cancel_between_the_workers_check_and_its_write_leaves_nothing(file_app, hunter, tmp_path, monkeypatch):
+    """J: the write itself checks the import, in one statement."""
+    app = file_app
+    client = app.test_client()
+    queued = start(client, create(client))
+    real = ldh._still_wanted
+    checks = []
+
+    def cancelled_right_after_the_check(session, record):
+        real(session, record)
+        checks.append(record.id)
+        if len(checks) == 3:
+            with app.app_context():
+                assert imports.cancel(library(app), "alice", queued["id"])["status"] == "cancelled"
+
+    monkeypatch.setattr(ldh, "_still_wanted", cancelled_right_after_the_check)
+    done, sink = work(app, tmp_path, queued["id"])
+
+    assert done["status"] == "cancelled" and sink.calls == []
+    assert kept(app, queued["id"]) == 0
+
+
+@pytest.mark.parametrize("corpus", [[], {}, False, 0, "", "statutes"])
+def test_a_corpus_that_names_no_corpus_is_refused(client, hunter, corpus):
+    """L: only a missing or null corpus means case law."""
+    refused = create(client, status=400, query={"q": "x", "corpus": corpus})
+
+    assert "query.corpus" in refused["fields"]
+    assert hunter.calls == []
+
+
+@pytest.mark.parametrize("query", [{"q": "x"}, {"q": "x", "corpus": None}])
+def test_a_missing_corpus_is_case_law(client, hunter, query):
+    entry = create(client, query=query)
+
+    assert entry["query"]["corpus"] == "case_law"
+    assert hunter.calls[-1]["json"]["namespace"] == "case_law"
+
+
+def test_a_retry_after_of_too_many_digits_is_the_longest_wait_without_parsing():
+    """L: past Python's digit limit, int() would raise."""
+    assert provider.retry_after("9" * 5000) == provider.MAX_RETRY_AFTER
+    assert provider.retry_after("1" + "0" * 10) == provider.MAX_RETRY_AFTER
+    assert provider.retry_after("0000000007") == 7
