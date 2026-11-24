@@ -1,0 +1,46 @@
+{
+  "NL/rechtspraak/ECLI:NL:HR:2023:1234": {
+    "source": "rechtspraak", "source_id": "ECLI:NL:HR:2023:1234", "data_type": "case_law",
+    "title": "Hoge Raad 14 april 2023, oneerlijk beding",
+    "text": "De Hoge Raad oordeelt dat het beding in de algemene voorwaarden oneerlijk is in de zin van richtlijn 93/13/EEG.",
+    "url": "https://uitspraken.rechtspraak.nl/details?id=ECLI:NL:HR:2023:1234",
+    "date": "2023-04-14", "country": "NL", "language": "nl",
+    "court": "Hoge Raad", "chamber": "Civiele kamer", "jurisdiction": "NL", "ecli": "ECLI:NL:HR:2023:1234",
+    "case_number": "22/01234", "decision_type": "Uitspraak", "court_tier": 1, "judges": [], "meta": {}
+  },
+  "FR/Judilibre/6543a1b2c3d4e5f6": {
+    "source": "Judilibre", "source_id": "6543a1b2c3d4e5f6", "data_type": "case_law",
+    "title": "Cour de cassation, 1re civ., 15 mars 2023, clause abusive",
+    "text": "Vu l'article L. 212-1 du code de la consommation ; attendu que la clause crée un déséquilibre significatif",
+    "text_truncated": true,
+    "url": "https://www.courdecassation.fr/decision/6543a1b2c3d4e5f6",
+    "date": "2023-03-15", "country": "FR", "language": "fr",
+    "court": "Cour de cassation", "ecli": "ECLI:FR:CCASS:2023:C100123", "case_number": "21-12.345", "meta": {}
+  },
+  "DE/bverfg/1 BvR 123/20": {
+    "source": "bverfg", "source_id": "1 BvR 123/20", "data_type": "case_law",
+    "title": "BVerfG, Beschluss vom 2. Februar 2022, 1 BvR 123/20",
+    "text": "Die Verfassungsbeschwerde wird nicht zur Entscheidung angenommen.",
+    "url": "https://www.bundesverfassungsgericht.de/e/rk20220202_1bvr012320.html",
+    "date": "2022-02-02", "country": "DE", "language": "de",
+    "court": "Bundesverfassungsgericht", "ecli": "ECLI:DE:BVerfG:2022:rk20220202.1bvr012320", "meta": {}
+  },
+  "NL/rechtspraak/ECLI:NL:RBAMS:2022:999": {
+    "source": "rechtspraak", "source_id": "ECLI:NL:RBAMS:2022:999", "data_type": "case_law",
+    "title": "Rechtbank Amsterdam 3 maart 2022",
+    "text": "",
+    "text_unavailable": true,
+    "url": "https://uitspraken.rechtspraak.nl/details?id=ECLI:NL:RBAMS:2022:999",
+    "date": "2022-03-03", "country": "NL", "language": "nl",
+    "court": "Rechtbank Amsterdam", "ecli": "ECLI:NL:RBAMS:2022:999", "meta": {}
+  },
+  "EU/eurlex/32016R0679": {
+    "source": "eurlex", "source_id": "32016R0679", "data_type": "legislation",
+    "title": "Regulation (EU) 2016/679 (General Data Protection Regulation)",
+    "text": "Article 1. Subject-matter and objectives. This Regulation lays down rules relating to the protection of natural persons.",
+    "url": "https://eur-lex.europa.eu/eli/reg/2016/679/oj",
+    "date": "2016-04-27", "country": "EU", "language": "en",
+    "document_type": "regulation", "authority": "European Parliament and Council", "status": "in_force",
+    "identifier": "2016/679", "eli_uri": "http://data.europa.eu/eli/reg/2016/679/oj", "meta": {}
+  }
+}
