@@ -503,6 +503,22 @@ def _json_object():
     return body
 
 
+@library_bp.route("/legal-data-hunter/search", methods=["POST"])
+def ldh_search():
+    """Search Legal Data Hunter with the signed-in user's own key (#15): {q, corpus, country, source, dateFrom,
+    dateTo}; 50 hits are asked for, whatever `limit` says. A 429 carries `retryAfter` and a `Retry-After` header."""
+    if not ldh_module.searchable(_host()):
+        raise ApiError(404, ldh_provider.NOT_OFFERED, "not_offered")
+    body = _json_object()
+    try:
+        return jsonify(_ldh_call(ldh_module.search, body))
+    except ApiError as refused:
+        retry = refused.body.get("retryAfter")
+        if refused.status == 429 and retry is not None:
+            return jsonify(refused.body), 429, {"Retry-After": str(retry)}
+        raise
+
+
 @library_bp.route("/admin/legal-data-hunter/preview", methods=["POST"])
 def ldh_preview():
     """Search Legal Data Hunter with the admin's own key: {q, corpus, country, source, dateFrom, dateTo, limit}."""

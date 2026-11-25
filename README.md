@@ -310,6 +310,18 @@ Any signed-in user:
   `reasonCode`/`reason` (`needs_key`: "Needs your Legal Data Hunter key — add it in Settings";
   `no_documents`), `confirmation: {"text", "checkbox"}`, `publishable: false`,
   `publishRefusal`, `citation`.
+- `POST /api/library/legal-data-hunter/search` with `{"q", "corpus"?, "country"?, "source"?,
+  "dateFrom"?, "dateTo"?}` (the filters as for the admin preview below) → `{"query", "hits":
+  [{"country", "source", "sourceId", "title", "court", "date", "ecli", "language", "url",
+  "snippet"}], "total", "max": 50}` (#15). Searched with the signed-in user's own key (one call of
+  their plan), admin or not; 50 hits are always asked for, and a `limit` in the body is ignored.
+  Refused: 404 `not_offered` without the seam **or while the terms are Hide** (the same answer,
+  before the body is read), 400 `bad_request` (not a JSON object) or `invalid` (`fields`, as
+  `query.<field>`), 409 `needs_key` (no key: "add it in Settings") or `bad_key` (Legal Data
+  Hunter refused it), 429 `slow_down` (the per-minute cap) or `out_of_credits`, each with
+  `retryAfter` (seconds, or null) and, when known, a `Retry-After` header, and 503
+  `provider_unavailable` (unreachable, an error, or a redirect off its origin). The key is never
+  in an answer.
 - `POST /api/library/imports` with `{"provider": "legal_data_hunter", "dataset": <entry ref>,
   "licenseAck": true, "name"?}` → 202 and the import (`documentCount`, `skipped`, `missing`,
   `resumeAfter`). Refused: 404 `not_found` / `not_offered`, 403 `license_hidden`, 409

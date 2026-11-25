@@ -8,6 +8,17 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- Legal Data Hunter search for every signed-in user (#15, BAIGLE #202):
+  `POST /api/library/legal-data-hunter/search` searches with the caller's own key (admin or not)
+  and asks for 50 hits with snippets, whatever `limit` the body gives. Refusals: 404
+  `not_offered` without the key seam or while the "Legal Data Hunter terms" level is Hide, 409
+  `needs_key` and `bad_key`, 429 `slow_down` and `out_of_credits` with `retryAfter` and a
+  `Retry-After` header, 503 `provider_unavailable`, 400 `invalid` and `bad_request`.
+  `legal_data_hunter.search(host, body)` and `legal_data_hunter.searchable(host)` back it. The
+  admin preview is unchanged.
+
 ## [0.17.0] - 2026-11-24
 
 ### Fixed
