@@ -161,6 +161,10 @@ class LibraryImport(LibraryBase):
     skipped: Mapped[int | None] = mapped_column(Integer, nullable=True)
     missing: Mapped[int | None] = mapped_column(Integer, nullable=True)
     resume_after: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # A Legal Data Hunter search import (#16): the user's own searches that found its documents, each a checked query
+    # ({q, corpus, …}) or just {q}. `external_id` is then `search:<digest of its documents>`, not an entry. Null for
+    # every other import.
+    queries: Mapped[list | None] = mapped_column(JSON, nullable=True)
     # The CSV it hands `create_dataset`, saved with the move to saving, before the Dataset exists: the publish block
     # matches it while `dataset_ref` is not yet recorded. `failed_cap` is the download cap it stopped under as
     # `too_large`; Try again is refused until the cap is higher. `active_key` is `owner:entry` while it is queued or

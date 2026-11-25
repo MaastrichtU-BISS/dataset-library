@@ -459,6 +459,7 @@ def test_skipped_and_missing_documents_are_counted_on_the_dataset(client, app, h
     assert (done["skipped"], done["missing"], done["rows"]) == (1, 1, 3)
     assert len(sink.calls[0]["rows"]) == 3
     assert provenance["legalDataHunter"] == {
+        "origin": "legal_data_hunter_entry", "originLabel": "Curated entry",
         "entry": entry["ref"], "documents": 5, "rows": 3, "skipped": 1, "missing": 1,
         "termsConfirmedAt": provenance["licenseAckAt"],
     }

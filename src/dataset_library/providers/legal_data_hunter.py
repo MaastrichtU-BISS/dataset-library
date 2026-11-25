@@ -69,6 +69,18 @@ NOT_OFFERED = "Legal Data Hunter is not set up on this platform."
 NOT_IN_LIBRARY = "That dataset is not in the library."
 LICENSE_HIDDEN = "Legal Data Hunter's terms are not allowed on this platform, so this entry cannot be imported."
 NO_DOCUMENTS = "This entry has no documents to import."
+# Importing a Legal Data Hunter search (#16): the documents a user ticked across their own searches.
+SEARCH_HIDDEN = "Legal Data Hunter's terms are not allowed on this platform, so these documents cannot be imported."
+CHOOSE_DOCUMENTS = "Choose at least one Legal Data Hunter document to import."
+TOO_MANY_DOCUMENTS = f"Import at most {MAX_DOCUMENTS} Legal Data Hunter documents at once."
+NO_QUERIES = f"Send the searches that found these documents: from 1 to {MAX_DOCUMENTS} queries."
+BOTH_KINDS = "Import either a Legal Data Hunter entry or documents from your searches, not both."
+SEARCH_RUNNING = "An import of these documents is still running. Wait for it to finish, then try again."
+
+
+def bad_document(place):
+    """Why a search import was refused: its `place`-th document (from 1) is no document id."""
+    return f"Document {place} is not a Legal Data Hunter document id."
 NO_TEXT = "None of these documents had any text, so there is nothing to import."
 # Publishing to Zenodo is refused for a dataset built from Legal Data Hunter and for a model trained on one (L10).
 DATASET_PUBLISH_REFUSED = (
@@ -489,6 +501,7 @@ def row(found, ref=None):
         "language": _text(found.get("language")) or "",
         "ecli": _text(found.get("ecli")) or "",
         "eli": _text(eli) or "",
-        "source_url": _text(found.get("url")) or "",
+        # Only an http(s) link: a `javascript:` or `data:` one would run in a page that links to it.
+        "source_url": _web_url(found.get("url")) or "",
         "text_truncated": bool(found.get("text_truncated")),
     }
