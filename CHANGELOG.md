@@ -8,8 +8,27 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-25
+
 ### Added
 
+- Importing a Legal Data Hunter search as a Dataset (#16, BAIGLE #202): `POST /api/library/imports`
+  with `{"provider": "legal_data_hunter", "documents": [...], "queries": [...], "licenseAck":
+  true, "name"?, "taskType"?}` imports the documents a user ticked across their own searches (up
+  to 100 unique; duplicates dropped, keeping the first) with their own key, through the curated
+  entry's import end to end: one credit per document, rows unlabelled, documents without text
+  skipped and counted, out of credits pausing and Try again resuming, Hide, and the publish block
+  for the Dataset and models trained on it. Its `external_id` is `search:<digest of its
+  documents>`, so a double click returns the running import. Refusals: 400 `bad_request` (both
+  `dataset` and `documents`), `no_documents`, `bad_document`, `too_many_documents`,
+  `bad_queries`, `bad_task`, `bad_name`; 403 `license_hidden`; 404 `not_offered`; 409
+  `needs_key`, `needs_ack`. Provenance's `legalDataHunter` now has `origin`
+  (`legal_data_hunter_search` or `legal_data_hunter_entry`) and `originLabel` ("Legal Data Hunter
+  search" or "Curated entry"); a search import's also has `queries` and `documentIds`, and its
+  `entry` is null.
+- `library_imports.queries` (JSON, nullable): the queries a search import was made from.
+  **Migration** `dl_0011_ldh_search_queries` adds it; a host that mirrors the package's tables in
+  its own migrations must add the column too.
 - Legal Data Hunter search for every signed-in user (#15, BAIGLE #202):
   `POST /api/library/legal-data-hunter/search` searches with the caller's own key (admin or not)
   and asks for 50 hits with snippets, whatever `limit` the body gives. Refusals: 404
@@ -19,6 +38,11 @@ While the version is 0.x, minor releases may contain breaking changes.
   `legal_data_hunter.search(host, body)` and `legal_data_hunter.searchable(host)` back it. The
   admin preview is unchanged. A hit's `url` is kept only when it is an http(s) URL (else `null`),
   in the user search and the admin preview alike, so a `javascript:` link never reaches a page.
+
+### Fixed
+
+- An imported row's `source_url` is kept only when it is an http(s) URL, else `""` (#16, from
+  the review of #15): a document whose `url` is `javascript:` or `data:` never lands in a Dataset.
 
 ## [0.17.0] - 2026-11-24
 

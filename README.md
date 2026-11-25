@@ -158,6 +158,22 @@ and saves up to 100 of them as an entry: a title, a description, a task type
 starts, so a Refresh never touches an import or a dataset already made. Entries are shown to
 every signed-in user as featured cards labelled "Legal Data Hunter".
 
+### Importing a Legal Data Hunter search
+
+Any signed-in user with their own key may also search Legal Data Hunter themselves
+(`POST /legal-data-hunter/search`, #15), tick documents across one or more searches, and import
+up to 100 of them as their own Dataset (#16). A search import is an import of no entry: it runs
+through the same machinery as an entry's (one credit per document with the user's key, rows as
+below, unlabelled, documents without text skipped and counted, the pause when the credits run out
+and Try again resuming from what was fetched, staging and discard, Hide, and the publish block
+for the Dataset and every model trained on it). Its `external_id` is `search:` and a SHA-256
+digest of its documents' ids (in any order), so a double click with the same documents returns
+the running import, and any other selection starts its own. The import keeps the queries that
+found its documents (`library_imports.queries`, JSON, added by migration
+`dl_0011_ldh_search_queries`), and its provenance says `legalDataHunter.origin:
+"legal_data_hunter_search"` ("Legal Data Hunter search"; an entry's is
+`"legal_data_hunter_entry"`, "Curated entry"), with `queries` and `documentIds`.
+
 Each user imports with their **own** key. The host gives one seam,
 `legal_data_hunter_key(owner_id)`, returning the user's key (`sk-…`) or None; the package
 never stores, logs or returns a key. Without the seam, Legal Data Hunter is not offered; a seam
@@ -331,6 +347,24 @@ Any signed-in user:
   codes from the worker: `out_of_credits`, `bad_key`, `needs_key`, `provider_busy`,
   `license_hidden`, `needs_ack`, `no_usable_rows`, `not_offered`, `too_large`, and the sweep's
   `stopped`.
+- `POST /api/library/imports` with `{"provider": "legal_data_hunter", "documents":
+  [{"country", "source", "sourceId", "title"?}, ...], "queries": [query | "text", ...],
+  "licenseAck": true, "name"?, "taskType"?}` (no `dataset`) → 202 and the import of a Legal
+  Data Hunter search (#16). `documents` are the ids the search hits gave; duplicates (same
+  `country`, `source` and `sourceId`) are dropped, keeping the first, and at most 100 may remain;
+  past the row cap they are cut to it, as an entry's are. `queries` are the searches that found
+  them, 1 to 100, each the `query` a search answered (checked again as the admin preview checks
+  one) or just its text (kept as `{"q"}`); repeats are kept once. `taskType` is one of the
+  host's task types, `classification` by default. `name` defaults to "Legal Data Hunter: <first
+  query's text>". The same documents already queued or running → 200 and that import. Refused,
+  before anything is queued or Legal Data Hunter is called: 404 `not_offered` (no seam), 403
+  `license_hidden` (the terms are Hide: "Legal Data Hunter's terms are not allowed on this
+  platform, so these documents cannot be imported."), 400 `bad_request` (both `dataset` and
+  `documents`), `no_documents` (missing, not a list, or empty), `bad_document` ("Document N is
+  not a Legal Data Hunter document id."), `too_many_documents` (over 100 unique, or over 1000
+  sent), `bad_queries`, `bad_task`, `bad_name`, 409 `needs_key`, `needs_ack` (every time without
+  the confirmation). Failure codes from the worker are an entry import's. Try again
+  (`/imports/<ref>/retry`) resumes from the import's own documents and keeps its queries.
 - `POST /api/library/imports/<ref>/retry` of a Legal Data Hunter import → 202 and the new
   import. Refused: 409 `already_running` ("Another import of this entry is still running. Wait
   for it to finish, then try again."), 409 `not_retryable` (not failed or cancelled, put away,
