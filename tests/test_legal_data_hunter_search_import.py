@@ -131,8 +131,11 @@ def test_a_search_import_is_cut_to_the_row_cap_as_an_entry_is(make_app, hunter, 
     client = app.test_client()
 
     queued = start_search(client, many(5))
+    # The same first 2 with others past the cap: the same import, not a second one paying for them again.
+    again = start_search(client, many(2) + many(7)[5:], status=200)
 
     assert queued["documentCount"] == 2
+    assert again["id"] == queued["id"]
 
 
 # --- Refusals ---------------------------------------------------------------------------------------------------
@@ -365,6 +368,14 @@ def test_a_dataset_from_a_search_and_models_trained_on_it_cannot_be_published(cl
         session = app.db.session
         assert ldh.publish_refusal(session, done["datasetRef"]) == provider.DATASET_PUBLISH_REFUSED
         assert ldh.publish_refusal(session, done["datasetRef"], model=True) == provider.MODEL_PUBLISH_REFUSED
+
+
+@pytest.mark.parametrize("sent", [7, 500, "abc"])
+def test_a_query_is_stored_with_the_searchs_limit_whatever_limit_is_sent(client, app, sent):
+    queued = start_search(client, [EU], queries=[{**QUERY, "limit": sent}])
+
+    with app.app_context():
+        assert app.db.session.get(LibraryImport, queued["id"]).queries[0]["limit"] == ldh.SEARCH_HITS
 
 
 def test_the_queries_are_kept_on_the_import(client, app):

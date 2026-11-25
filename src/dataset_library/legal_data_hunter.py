@@ -464,6 +464,8 @@ def start(host, owner_id, body, *, ack_at=None, previous=None):
         if _level(host) == "hide":
             raise Refused(403, "license_hidden", provider.SEARCH_HIDDEN)
         documents, queries, task_type = _chosen(host, body)
+        # Cut to the row cap before the digest: selections that differ only past the cap are the same import.
+        documents = documents[:host.row_cap()]
         entry_ref = SEARCH_PREFIX + _digest(documents)
     else:
         entry_ref = body.get("dataset")
