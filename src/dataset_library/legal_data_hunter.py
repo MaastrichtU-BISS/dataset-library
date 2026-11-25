@@ -14,6 +14,7 @@ or a model trained on one, is never published (the host refuses, with `DATASET_P
 The package never keeps a key. The host gives one seam, ``legal_data_hunter_key(owner_id)``, which returns that
 user's key or None; it is asked when the key is needed, by the request or by the worker.
 """
+import hashlib
 import logging
 import json
 import time
@@ -40,6 +41,7 @@ from .providers.legal_data_hunter import (  # noqa: F401 - the host's names for 
     MAX_DOCUMENTS,
     MODEL_PUBLISH_REFUSED,
     NEEDS_KEY,
+    SEARCH_HIDDEN,
     PROVIDER,
     BadKey,
     DocumentNotFound,
@@ -404,30 +406,79 @@ def _citation(title):
 # --- Importing --------------------------------------------------------------------------------------------------
 
 
+# A search import (#16) is not of an entry: its `external_id` is this prefix and a digest of its documents.
+SEARCH_PREFIX = "search:"
+# Where a Legal Data Hunter import's documents were chosen, as its provenance says.
+ENTRY_ORIGIN, SEARCH_ORIGIN = "legal_data_hunter_entry", "legal_data_hunter_search"
+ORIGIN_LABELS = {ENTRY_ORIGIN: "Curated entry", SEARCH_ORIGIN: "Legal Data Hunter search"}
+# The most document ids a search import's request may carry, duplicates included; at most MAX_DOCUMENTS are unique.
+MAX_SENT = 10 * MAX_DOCUMENTS
+
+
+def is_search(record):
+    """Whether an import is of a user's own Legal Data Hunter search (#16), not of a curated entry."""
+    return (record.external_id or "").startswith(SEARCH_PREFIX)
+
+
+def hidden_message(record):
+    """Why an import is refused while the terms are Hide, in the words of what the user chose."""
+    return provider.SEARCH_HIDDEN if is_search(record) else provider.LICENSE_HIDDEN
+
+
+def origin(record):
+    return SEARCH_ORIGIN if is_search(record) else ENTRY_ORIGIN
+
+
 def start(host, owner_id, body, *, ack_at=None, previous=None):
-    """Queue an import of an entry: one row per document, fetched by the worker with the student's key.
+    """Queue an import of an entry, or of the documents a user ticked across their own searches (#16): one row per
+    document, fetched by the worker with the user's key.
 
-    The student must confirm (`licenseAck: true`) every time; a retry carries its import's confirmation time
-    (`ack_at`). The import copies the entry's documents, up to the row cap; a retry (`previous`) keeps its import's,
-    and takes over the documents it already fetched, so Try again fetches none of them again. A retry needs no entry:
-    it resumes from its import's own documents even when the admin has since deleted the entry, and never cuts them
-    to a lowered row cap. A retry of an import that stopped at the download cap is refused until the cap is higher.
+    An entry import names the entry (`dataset`). A search import sends `documents` instead (each a document id,
+    {country, source, sourceId, title?}; duplicates are dropped, keeping the first, and at most 100 may remain), the
+    `queries` that found them (1 to 100, each a checked query or its text), and a `taskType` (classification by
+    default); its name defaults to its first query's text. Sending both is refused.
 
-    At most one import of an entry per owner is queued or running: the new import holds `active_key` (unique). A retry
-    claims its paused import (puts it away, if no one has) in the same transaction that inserts the new import and
-    moves the documents, so of two retries of one import only one starts. Returns the import as JSON and whether it is
-    new; raises imports.Refused."""
+    The user must confirm (`licenseAck: true`) every time; a retry carries its import's confirmation time (`ack_at`).
+    The import copies the entry's (or the request's) documents, up to the row cap; a retry (`previous`) keeps its
+    import's, and takes over the documents it already fetched, so Try again fetches none of them again. A retry needs
+    no entry: it resumes from its import's own documents even when the admin has since deleted the entry, and never
+    cuts them to a lowered row cap. A retry of an import that stopped at the download cap is refused until the cap is
+    higher.
+
+    At most one import of an entry (or of one set of documents) per owner is queued or running: the new import holds
+    `active_key` (unique). A search import's `external_id` is `search:` and a digest of its documents, so the same
+    documents imported twice at once (a double click) make one import, and other selections their own. A retry claims
+    its paused import (puts it away, if no one has) in the same transaction that inserts the new import and moves the
+    documents, so of two retries of one import only one starts. Returns the import as JSON and whether it is new;
+    raises imports.Refused."""
     Refused = imports_module.Refused
     if not offered(host):
         raise Refused(404, "not_offered", provider.NOT_OFFERED)
-    entry_ref = body.get("dataset")
-    entry = host.db.session.get(LibraryLegalDataHunterEntry, entry_ref) if isinstance(entry_ref, str) else None
-    if previous is not None:
-        entry_ref = previous.external_id
-    elif entry is None:
-        raise Refused(404, "not_found", provider.NOT_IN_LIBRARY)
-    if _level(host) == "hide":
-        raise Refused(403, "license_hidden", provider.LICENSE_HIDDEN)
+    searching = previous is not None and is_search(previous)
+    entry, queries = None, None
+    # `documents: null` beside an entry is an entry import, as before #16; without one it is a search import with none.
+    if previous is None and "documents" in body and (body["documents"] is not None or body.get("dataset") is None):
+        searching = True
+        if body.get("dataset") is not None:
+            raise Refused(400, "bad_request", provider.BOTH_KINDS)
+        if _level(host) == "hide":
+            raise Refused(403, "license_hidden", provider.SEARCH_HIDDEN)
+        documents, queries, task_type = _chosen(host, body)
+        # Cut to the row cap before the digest: selections that differ only past the cap are the same import.
+        documents = documents[:host.row_cap()]
+        entry_ref = SEARCH_PREFIX + _digest(documents)
+    else:
+        entry_ref = body.get("dataset")
+        entry = (
+            host.db.session.get(LibraryLegalDataHunterEntry, entry_ref)
+            if previous is None and isinstance(entry_ref, str) else None
+        )
+        if previous is not None:
+            entry_ref = previous.external_id
+        elif entry is None:
+            raise Refused(404, "not_found", provider.NOT_IN_LIBRARY)
+        if _level(host) == "hide":
+            raise Refused(403, "license_hidden", provider.SEARCH_HIDDEN if searching else provider.LICENSE_HIDDEN)
     if not has_key(host, owner_id):
         raise Refused(409, "needs_key", NEEDS_KEY)
     if body.get("licenseAck") is not True:
@@ -442,12 +493,17 @@ def start(host, owner_id, body, *, ack_at=None, previous=None):
         # The paused import's own list, whole: it was paid for at the cap it started under.
         documents = list(previous.documents or [])
         max_rows = previous.max_rows if previous.max_rows is not None else cap
-    else:
+        task_type = previous.task_type
+        queries = previous.queries
+    elif entry is not None:
         documents = list(entry.documents or [])[:cap]
         max_rows = cap
+        task_type = entry.task_type
+    else:
+        documents = documents[:cap]
+        max_rows = cap
     if not documents:
-        raise Refused(409, "no_documents", provider.NO_DOCUMENTS)
-    task_type = previous.task_type if previous is not None else entry.task_type
+        raise Refused(409, "no_documents", provider.CHOOSE_DOCUMENTS if searching else provider.NO_DOCUMENTS)
     if previous is not None and (previous.saved_path or previous.dataset_ref):
         # It stopped once it reached saving (a sweep or restart then): its Dataset may exist, or be being made, so Try
         # again could make a second one. The claim below checks this again, in the same statement.
@@ -467,20 +523,24 @@ def start(host, owner_id, body, *, ack_at=None, previous=None):
         .order_by(LibraryImport.created_at.desc())
         .first()
     )
+    already_running = provider.SEARCH_RUNNING if searching else provider.ALREADY_RUNNING
     if running is not None:
         if previous is not None:
             # Never hand back the other import and put the paused one (and what it fetched) away.
-            raise Refused(409, "already_running", provider.ALREADY_RUNNING)
+            raise Refused(409, "already_running", already_running)
         imports_module._log(running, "repeated")
         return running.to_dict(), False
     now = imports_module._now()
     if previous is not None:
         record_name = name or previous.name
         citation = imports_module._pinned(previous.citation or _citation(previous.name), None, now)
-    else:
+    elif entry is not None:
         earlier = session.query(LibraryImport).filter_by(owner_id=owner_id, provider=PROVIDER, external_id=entry.id).count()
         record_name = name or (entry.title if not earlier else f"{entry.title} ({earlier + 1})")
         citation = imports_module._pinned(_citation(entry.title), None, now)
+    else:
+        record_name = name or f"{LABEL}: {queries[0]['q']}"[:255].strip()
+        citation = imports_module._pinned(_citation(record_name), None, now)
     previous_ref = previous.id if previous is not None else None
     if previous_ref is not None and not _put_away(session, previous_ref, now):
         # Another Try again (or a Put away) got there first, or a worker reached saving since the check above.
@@ -495,16 +555,16 @@ def start(host, owner_id, body, *, ack_at=None, previous=None):
         text_column="text", label_column=None, task_type=task_type,
         sample_size=len(documents), max_rows=max_rows, balance=False,
         name=record_name, citation=citation,
-        source=PROVIDER, documents=documents, skipped=0, missing=0,
+        source=PROVIDER, documents=documents, queries=queries, skipped=0, missing=0,
         status=imports_module.QUEUED, active_key=active_key(owner_id, entry_ref),
     )
     session.add(record)
     try:
         session.flush()
     except IntegrityError:
-        # Another import of the entry was queued between the check above and this insert.
+        # Another import of the entry (or of these documents) was queued between the check above and this insert.
         session.rollback()
-        raise Refused(409, "already_running", provider.ALREADY_RUNNING) from None
+        raise Refused(409, "already_running", already_running) from None
     if previous_ref is not None:
         # Try again: the documents already fetched move to the new import, so they are not fetched (or paid for) again.
         _move_documents(session, previous_ref, record.id)
@@ -528,6 +588,66 @@ def start(host, owner_id, body, *, ack_at=None, previous=None):
 
     imports_module._enqueue(host, record, restore)
     return record.to_dict(), True
+
+
+def _chosen(host, body):
+    """A search import's documents (checked, each once, in the order sent), queries and task type. Raises
+    imports.Refused with the first thing wrong."""
+    Refused = imports_module.Refused
+    sent = body.get("documents")
+    if not isinstance(sent, list) or not sent:
+        raise Refused(400, "no_documents", provider.CHOOSE_DOCUMENTS)
+    if len(sent) > MAX_SENT:
+        raise Refused(400, "too_many_documents", provider.TOO_MANY_DOCUMENTS)
+    documents, seen = [], set()
+    for place, item in enumerate(sent, start=1):
+        ref = provider.document_ref(item)
+        if ref is None:
+            raise Refused(400, "bad_document", provider.bad_document(place))
+        identity = (ref["country"], ref["source"], ref["sourceId"])
+        if identity in seen:
+            continue
+        seen.add(identity)
+        documents.append(ref)
+    if len(documents) > MAX_DOCUMENTS:
+        raise Refused(400, "too_many_documents", provider.TOO_MANY_DOCUMENTS)
+    queries = _queries(body.get("queries"))
+    task_type = body.get("taskType") or "classification"
+    if not isinstance(task_type, str) or task_type not in host.task_types:
+        raise Refused(400, "bad_task", f"Unknown task type: {task_type}")
+    return documents, queries, task_type
+
+
+def _queries(sent):
+    """The searches that found a search import's documents, each once: a checked query ({q, corpus, …}, as the search
+    answered it), or just its text ({q}). Raises imports.Refused (`bad_queries`)."""
+    refused = imports_module.Refused(400, "bad_queries", provider.NO_QUERIES)
+    if not isinstance(sent, list) or not 1 <= len(sent) <= MAX_DOCUMENTS:
+        raise refused
+    queries = []
+    for item in sent:
+        if isinstance(item, str):
+            text = item.strip()
+            if not text or len(text) > provider.MAX_QUERY:
+                raise refused
+            query = {"q": text}
+        elif isinstance(item, dict):
+            try:
+                # As the search route asked it: SEARCH_HITS, whatever limit (or none) is sent.
+                query = provider.check_query({**item, "limit": SEARCH_HITS})
+            except InvalidQuery:
+                raise refused from None
+        else:
+            raise refused
+        if query not in queries:
+            queries.append(query)
+    return queries
+
+
+def _digest(documents):
+    """The same documents, in any order, give the same digest."""
+    identities = sorted([ref["country"], ref["source"], ref["sourceId"]] for ref in documents)
+    return hashlib.sha256(json.dumps(identities, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
 def active_key(owner_id, entry_ref):
@@ -578,7 +698,7 @@ def fetch(session, record, key_for_owner, max_bytes=None):
     level = policy_module.level(TERMS, policy_module.for_session(session))
     refusal = None
     if level == "hide":
-        refusal = ImportFailed("license_hidden", provider.LICENSE_HIDDEN)
+        refusal = ImportFailed("license_hidden", hidden_message(record))
     elif record.license_ack_at is None:
         refusal = ImportFailed("needs_ack", provider.NEEDS_CONFIRMATION)
     elif key_for_owner is None:
@@ -731,7 +851,7 @@ def still_allowed(session, record):
     """Fail the import as `license_hidden`, discarding what it fetched, once an admin set the terms to Hide."""
     if policy_module.level(TERMS, policy_module.for_session(session)) == "hide":
         discard(session, record.id)
-        raise imports_module.ImportFailed("license_hidden", provider.LICENSE_HIDDEN)
+        raise imports_module.ImportFailed("license_hidden", hidden_message(record))
 
 
 def _still_running(session, record):
@@ -803,7 +923,7 @@ def not_saved(session, record):
     if record.status in imports_module.TERMINAL or record.staging_path is None:
         raise imports_module._Stopped()
     discard(session, record.id)
-    raise imports_module.ImportFailed("license_hidden", provider.LICENSE_HIDDEN)
+    raise imports_module.ImportFailed("license_hidden", hidden_message(record))
 
 
 def purge(session, *, now=None, keep=KEEP_FETCHED):

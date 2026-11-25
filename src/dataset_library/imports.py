@@ -428,16 +428,26 @@ def provenance(host, owner_id, dataset_ref):
         "publishRefusal": ldh_provider.DATASET_PUBLISH_REFUSED if record.provider == LEGAL_DATA_HUNTER else None,
     }
     if record.provider == LEGAL_DATA_HUNTER:
-        # The entry it was imported from, how many documents it fetched and skipped, and when the student confirmed
-        # their plan allows storing them and training models on them (`licenseAckAt`).
+        from . import legal_data_hunter  # lazy: it imports this module
+
+        # Where its documents were chosen (a curated entry, or the user's own searches, #16), how many it fetched and
+        # skipped, and when the user confirmed their plan allows storing them and training models on them.
+        origin = legal_data_hunter.origin(record)
+        searched = origin == legal_data_hunter.SEARCH_ORIGIN
         found["legalDataHunter"] = {
-            "entry": record.external_id,
+            "origin": origin,
+            "originLabel": legal_data_hunter.ORIGIN_LABELS[origin],
+            "entry": None if searched else record.external_id,
             "documents": len(record.documents or []),
             "rows": record.rows,
             "skipped": record.skipped or 0,
             "missing": record.missing or 0,
             "termsConfirmedAt": _iso(record.license_ack_at),
         }
+        if searched:
+            # The searches that found them, and the documents' ids, in the order they were fetched.
+            found["legalDataHunter"]["queries"] = record.queries or []
+            found["legalDataHunter"]["documentIds"] = record.documents or []
     if record.provider == COMMUNITY:
         # The DOI is the record's URL, so it is not stored twice.
         found["doi"] = (record.url or "").removeprefix(community_provider.DOI_PREFIX) or None

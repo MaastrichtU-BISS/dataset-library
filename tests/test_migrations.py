@@ -106,3 +106,19 @@ def test_legal_data_hunter_downgrades_to_the_community_schema():
         schema["library_imports"][0]
     )
     assert "ix_library_imports_active_key" not in _indexes(migrated, "library_imports")
+
+
+def test_a_search_import_keeps_its_queries_as_nullable_json():
+    """dl_0011 (#16): the queries a Legal Data Hunter search import was made from."""
+    assert _schema(_migrated())["library_imports"][0]["queries"] == ("JSON", True)
+    assert _revision("dl_0011_ldh_search_queries").down_revision == "dl_0010_legal_data_hunter"
+
+
+def test_search_queries_downgrade_to_the_legal_data_hunter_schema():
+    migrated = _migrated()
+    revision = _revision("dl_0011_ldh_search_queries")
+    with migrated.begin() as connection:
+        revision.op = Operations(MigrationContext.configure(connection))
+        revision.downgrade()
+
+    assert "queries" not in _schema(migrated)["library_imports"][0]
