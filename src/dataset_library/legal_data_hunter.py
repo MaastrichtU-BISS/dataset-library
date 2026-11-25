@@ -134,6 +134,32 @@ def preview(host, body):
     return {"query": query, "hits": found["hits"], "total": found["total"], "max": MAX_DOCUMENTS}
 
 
+# --- Legal Data Hunter search, for any signed-in user (#15) -------------------------------------------------------
+
+# A user's search asks for this many hits, whatever the request says: one page, one call of the user's plan.
+SEARCH_HITS = 50
+
+
+def searchable(host):
+    """Whether a user may search Legal Data Hunter here: the host gives the key seam and the admin has not set the
+    terms to Hide. When not, the search is refused as if Legal Data Hunter were not there."""
+    return offered(host) and _level(host) != "hide"
+
+
+def search(host, body):
+    """The hits of a user's search, with that user's own key: {query, hits, total, max}. Any `limit` in the body is
+    ignored: SEARCH_HITS are asked for. Raises NotOffered (also when the terms are Hide), NeedsKey, InvalidQuery, or
+    the provider's errors (BadKey, OutOfCredits, ProviderError)."""
+    if not searchable(host):
+        raise NotOffered()
+    key = key_for(host, host.current_owner())
+    if key is None:
+        raise NeedsKey()
+    query = provider.check_query({**body, "limit": SEARCH_HITS})
+    found = provider.search(key, query)
+    return {"query": query, "hits": found["hits"], "total": found["total"], "max": SEARCH_HITS}
+
+
 def list_all(host):
     """Every entry, newest first, for the admin's settings section, with its documents."""
     found = host.db.session.query(LibraryLegalDataHunterEntry).order_by(

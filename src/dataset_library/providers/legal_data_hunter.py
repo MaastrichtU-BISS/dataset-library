@@ -14,7 +14,7 @@ import json
 import re
 from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlsplit
 
 import requests
 from requests.auth import AuthBase
@@ -418,9 +418,22 @@ def _hit(item):
         "date": _text(item.get("date")),
         "ecli": _text(item.get("ecli")),
         "language": _text(item.get("language")),
-        "url": _text(item.get("url")),
+        "url": _web_url(item.get("url")),
         "snippet": _text(item.get("snippet"), 600),
     }
+
+
+def _web_url(value):
+    """A hit's link, only when it is an http(s) URL: anything else (`javascript:`, `data:`) would run in the page that
+    shows it, so it becomes None."""
+    url = _text(value)
+    if url is None:
+        return None
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    return url if parts.scheme.lower() in ("http", "https") and parts.netloc else None
 
 
 def document_ref(value):
