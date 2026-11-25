@@ -17,7 +17,8 @@ While the version is 0.x, minor releases may contain breaking changes.
   `needs_key` and `bad_key`, 429 `slow_down` and `out_of_credits` with `retryAfter` and a
   `Retry-After` header, 503 `provider_unavailable`, 400 `invalid` and `bad_request`.
   `legal_data_hunter.search(host, body)` and `legal_data_hunter.searchable(host)` back it. The
-  admin preview is unchanged.
+  admin preview is unchanged. A hit's `url` is kept only when it is an http(s) URL (else `null`),
+  in the user search and the admin preview alike, so a `javascript:` link never reaches a page.
 
 ## [0.17.0] - 2026-11-24
 

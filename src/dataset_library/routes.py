@@ -471,7 +471,7 @@ def _ldh_admin():
 
 
 def _ldh_call(action, *args):
-    """Run an admin's Legal Data Hunter action, turning its refusals into answers. A key is never in an answer."""
+    """Run a Legal Data Hunter action (an admin's or a user's search), turning its refusals into answers. A key is never in an answer."""
     host = _host()
     try:
         return action(host, *args)

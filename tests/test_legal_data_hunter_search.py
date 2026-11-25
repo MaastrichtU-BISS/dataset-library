@@ -7,6 +7,7 @@ import pytest
 
 import fake_legal_data_hunter
 from conftest import ADMIN, ALICE
+from dataset_library.providers.legal_data_hunter import MAX_RETRY_AFTER
 from fake_legal_data_hunter import ADMIN_KEY, STUDENT_KEY
 # The fixtures the curated-entry tests use: the faked Legal Data Hunter, the users' keys and an app with the key seam.
 from test_legal_data_hunter import BOB, QUERY, app, hunter, keys, queue, settings  # noqa: F401
@@ -57,7 +58,7 @@ def test_each_user_searches_with_their_own_key_never_anothers(client, hunter, ke
 def test_signing_in_is_required(client, hunter):
     response = client.post(SEARCH, json=QUERY)
 
-    assert response.status_code in (401, 403)
+    assert response.status_code == 401
     assert hunter.calls == []
 
 
@@ -190,6 +191,44 @@ def test_hidden_terms_refuse_the_search_as_if_legal_data_hunter_were_not_there(c
         assert response.status_code == 404
         assert response.get_json() == {"error": "Legal Data Hunter is not set up on this platform.", "code": "not_offered"}
     assert hunter.calls == []
+
+
+def test_hidden_terms_leave_the_admin_preview_working(client, hunter):
+    settings(client, {"legal-data-hunter-terms": "hide"})
+
+    response = client.post("/api/library/admin/legal-data-hunter/preview", json=QUERY, headers=ADMIN)
+
+    assert response.status_code == 200, response.get_json()
+
+
+@pytest.mark.parametrize("given, header", [
+    ("9" * 5000, str(MAX_RETRY_AFTER)),
+    ("Wed, 21 Oct 2099 07:28:00 GMT", str(MAX_RETRY_AFTER)),
+    ("Wed, 21 Oct 2015 07:28:00 GMT", "0"),
+])
+def test_the_retry_after_header_is_the_parsed_capped_seconds_never_the_raw_value(client, hunter, given, header):
+    hunter.credits, hunter.retry_after = 0, given
+
+    response = search(client)
+
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == header
+    assert response.get_json()["retryAfter"] == int(header)
+
+
+@pytest.mark.parametrize("url", [
+    "javascript:fetch('/api/x',{credentials:'include'})", "JaVaScRiPt:alert(1)", "data:text/html,<script>x</script>",
+    "//evil.example/x", "vbscript:x", "http://[bad",
+])
+def test_a_hit_link_that_is_not_http_or_https_is_dropped(client, hunter, monkeypatch, url):
+    tampered = copy.deepcopy(fake_legal_data_hunter.SEARCHES)
+    tampered["case_law"]["hits"][0]["url"] = url
+    monkeypatch.setattr(fake_legal_data_hunter, "SEARCHES", tampered)
+
+    hits = search(client).get_json()["hits"]
+
+    assert hits[0]["url"] is None
+    assert hits[1]["url"].startswith("https://")
 
 
 def test_the_search_works_again_once_the_terms_are_warn(client, hunter):
