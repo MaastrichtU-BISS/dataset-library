@@ -420,6 +420,11 @@ def is_search(record):
     return (record.external_id or "").startswith(SEARCH_PREFIX)
 
 
+def hidden_message(record):
+    """Why an import is refused while the terms are Hide, in the words of what the user chose."""
+    return provider.SEARCH_HIDDEN if is_search(record) else provider.LICENSE_HIDDEN
+
+
 def origin(record):
     return SEARCH_ORIGIN if is_search(record) else ENTRY_ORIGIN
 
@@ -451,7 +456,8 @@ def start(host, owner_id, body, *, ack_at=None, previous=None):
         raise Refused(404, "not_offered", provider.NOT_OFFERED)
     searching = previous is not None and is_search(previous)
     entry, queries = None, None
-    if previous is None and "documents" in body:
+    # `documents: null` beside an entry is an entry import, as before #16; without one it is a search import with none.
+    if previous is None and "documents" in body and (body["documents"] is not None or body.get("dataset") is None):
         searching = True
         if body.get("dataset") is not None:
             raise Refused(400, "bad_request", provider.BOTH_KINDS)
@@ -461,7 +467,10 @@ def start(host, owner_id, body, *, ack_at=None, previous=None):
         entry_ref = SEARCH_PREFIX + _digest(documents)
     else:
         entry_ref = body.get("dataset")
-        entry = host.db.session.get(LibraryLegalDataHunterEntry, entry_ref) if isinstance(entry_ref, str) else None
+        entry = (
+            host.db.session.get(LibraryLegalDataHunterEntry, entry_ref)
+            if previous is None and isinstance(entry_ref, str) else None
+        )
         if previous is not None:
             entry_ref = previous.external_id
         elif entry is None:
@@ -492,7 +501,7 @@ def start(host, owner_id, body, *, ack_at=None, previous=None):
         documents = documents[:cap]
         max_rows = cap
     if not documents:
-        raise Refused(409, "no_documents", provider.NO_DOCUMENTS)
+        raise Refused(409, "no_documents", provider.CHOOSE_DOCUMENTS if searching else provider.NO_DOCUMENTS)
     if previous is not None and (previous.saved_path or previous.dataset_ref):
         # It stopped once it reached saving (a sweep or restart then): its Dataset may exist, or be being made, so Try
         # again could make a second one. The claim below checks this again, in the same statement.
@@ -622,7 +631,8 @@ def _queries(sent):
             query = {"q": text}
         elif isinstance(item, dict):
             try:
-                query = provider.check_query(item)
+                # As the search route asked it: SEARCH_HITS, whatever limit (or none) is sent.
+                query = provider.check_query({**item, "limit": SEARCH_HITS})
             except InvalidQuery:
                 raise refused from None
         else:
@@ -686,7 +696,7 @@ def fetch(session, record, key_for_owner, max_bytes=None):
     level = policy_module.level(TERMS, policy_module.for_session(session))
     refusal = None
     if level == "hide":
-        refusal = ImportFailed("license_hidden", provider.LICENSE_HIDDEN)
+        refusal = ImportFailed("license_hidden", hidden_message(record))
     elif record.license_ack_at is None:
         refusal = ImportFailed("needs_ack", provider.NEEDS_CONFIRMATION)
     elif key_for_owner is None:
@@ -839,7 +849,7 @@ def still_allowed(session, record):
     """Fail the import as `license_hidden`, discarding what it fetched, once an admin set the terms to Hide."""
     if policy_module.level(TERMS, policy_module.for_session(session)) == "hide":
         discard(session, record.id)
-        raise imports_module.ImportFailed("license_hidden", provider.LICENSE_HIDDEN)
+        raise imports_module.ImportFailed("license_hidden", hidden_message(record))
 
 
 def _still_running(session, record):
@@ -911,7 +921,7 @@ def not_saved(session, record):
     if record.status in imports_module.TERMINAL or record.staging_path is None:
         raise imports_module._Stopped()
     discard(session, record.id)
-    raise imports_module.ImportFailed("license_hidden", provider.LICENSE_HIDDEN)
+    raise imports_module.ImportFailed("license_hidden", hidden_message(record))
 
 
 def purge(session, *, now=None, keep=KEEP_FETCHED):

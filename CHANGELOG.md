@@ -25,7 +25,8 @@ While the version is 0.x, minor releases may contain breaking changes.
   `needs_key`, `needs_ack`. Provenance's `legalDataHunter` now has `origin`
   (`legal_data_hunter_search` or `legal_data_hunter_entry`) and `originLabel` ("Legal Data Hunter
   search" or "Curated entry"); a search import's also has `queries` and `documentIds`, and its
-  `entry` is null.
+  `entry` is null. A query is stored with the search's own limit (50). Messages a search import can
+  meet (Hide in the worker, no documents, too large) speak of documents, not an entry.
 - `library_imports.queries` (JSON, nullable): the queries a search import was made from.
   **Migration** `dl_0011_ldh_search_queries` adds it; a host that mirrors the package's tables in
   its own migrations must add the column too.

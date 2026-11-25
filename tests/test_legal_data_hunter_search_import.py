@@ -192,6 +192,15 @@ def test_an_entry_and_documents_together_are_refused(client, queue):
     assert queue.refs == []
 
 
+def test_an_entry_import_with_documents_null_is_still_an_entry_import(client, queue):
+    entry = create(client)
+
+    response = post(client, dataset=entry["ref"], documents=None, licenseAck=True)
+
+    assert response.status_code == 202, response.get_json()
+    assert not response.get_json()["externalId"].startswith(ldh.SEARCH_PREFIX)
+
+
 @pytest.mark.parametrize("ack", [None, False, "yes", 1])
 def test_a_search_import_needs_the_terms_confirmation(client, queue, ack):
     body = {"documents": [EU], "queries": [QUERY]}
@@ -234,6 +243,7 @@ def test_hidden_terms_refuse_a_search_import_and_fail_one_already_queued(client,
     assert refused.get_json() == {"error": ldh.SEARCH_HIDDEN, "code": "license_hidden"}
     assert queue.refs == [queued["id"]]
     assert done["status"] == "failed" and done["code"] == "license_hidden"
+    assert done["error"] == ldh.SEARCH_HIDDEN  # in the words of what the user chose: documents, not an entry
     assert hunter.documents_fetched() == [] and sink.calls == []
 
 
@@ -362,7 +372,9 @@ def test_the_queries_are_kept_on_the_import(client, app):
 
     with app.app_context():
         record = app.db.session.get(LibraryImport, queued["id"])
-        assert record.queries == [provider.check_query(QUERY), {"q": "x"}]  # each once
+        # Each once, with the limit the search route asked for (50), whatever limit was sent.
+        assert record.queries == [provider.check_query({**QUERY, "limit": ldh.SEARCH_HITS}), {"q": "x"}]
+        assert record.queries[0]["limit"] == 50
         assert record.documents == [EU]
 
 

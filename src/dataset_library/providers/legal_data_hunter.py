@@ -105,7 +105,7 @@ def too_large(max_bytes):
     """Why an import stopped when its documents passed the platform's download cap."""
     return (
         f"These documents are more than this platform imports at once (limit {max_bytes // 1_000_000} MB). "
-        "Ask your course staff about the limit, or import an entry with fewer documents."
+        "Ask your course staff about the limit, or import fewer documents."
     )
 
 
