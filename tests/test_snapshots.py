@@ -17,7 +17,7 @@ from dataset_library import imports, pins, preview as preview_module, snapshots
 from dataset_library.errors import ProviderUnavailable, ProviderRateLimited
 from dataset_library.models import LibraryImport, LibraryPin, LibrarySettings, LibrarySnapshot
 from dataset_library.providers import huggingface
-from test_import import FakeCreateDataset, run, write_ner_shard, write_shard, write_summarization_shard  # noqa: F401 - `run` is a fixture
+from test_import import FakeCreateDataset, run, write_ner_shard, write_shard, write_summarization_shard, write_tner_shard  # noqa: F401 - `run` is a fixture
 from tests.conftest import ADMIN, ALICE
 
 # AI-team-UoA/greek_legal_code: its revision in the recorded Hub fixture, classification, cc-by-4.0 (Allow), with rows
@@ -1134,6 +1134,32 @@ def test_an_offline_open_proposes_the_task_the_live_preview_would_for_its_column
     # The copy's tags are named as the live preview names them (#180).
     assert body["ner"]["namesKnown"] is True
     assert body["ner"]["rows"][0] == {"text": "Clause one", "entities": [{"text": "Clause", "start": 0, "end": 6, "type": "PER"}]}
+
+
+def test_an_offline_copy_of_numbered_tags_applies_the_students_names(client, app, hub, cache, snapshot_dir, tmp_path, tner):
+    """Round 1 (#180): `?tagNames=` on the offline view, whose labels read every row it took, not only the shown ones."""
+    import json
+
+    pinned = pin_as_admin(client, tner)
+    tokens = [["plain", "words"]] * 9 + [["Mary", "Jones"]]
+    tags = [[0, 0]] * 9 + [[7, 8]]
+    build_copy(app, copy_row(app, pinned["ref"])["id"], snapshot_dir, [write_tner_shard(tmp_path / "tner.parquet", tokens, tags)])
+    take_hub_down(hub, cache)
+    names = ["O", "B-ORG", "I-ORG", "B-LOC", "I-LOC", "B-MISC", "I-MISC", "B-PER", "I-PER"]
+
+    plain = client.get(f"/api/library/datasets/huggingface/{tner}", headers=ALICE).get_json()
+    named = client.get(
+        f"/api/library/datasets/huggingface/{tner}", query_string={"tagNames": json.dumps(names)}, headers=ALICE,
+    ).get_json()
+
+    assert plain["offline"] is True and named["offline"] is True
+    assert plain["ner"]["namesKnown"] is False and plain["ner"]["tagNames"] is None
+    assert plain["ner"]["labels"] == [str(number) for number in range(9)]
+    assert len(plain["rows"]) == 8 and len(plain["ner"]["rows"]) == 8
+    assert named["ner"]["tagNames"] == names
+    assert named["ner"]["labels"] == plain["ner"]["labels"]
+    assert [entry["type"] for entry in named["ner"]["entityTypes"]] == ["ORG", "LOC", "MISC", "PER"]
+    assert named["ner"]["rows"][0] == {"text": "plain words", "entities": []}
 
 
 def test_an_offline_open_proposes_the_summary_columns_for_a_summarization_pin(client, app, hub, cache, snapshot_dir, tmp_path):

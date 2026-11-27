@@ -45,7 +45,7 @@ from .errors import NotParquet, ProviderError
 from .licenses import LICENSES, UNKNOWN, resolve_license
 from .limits import import_cap_bytes
 from .models import LibraryImport
-from .ner import class_label_names, spans, tag_names_problem, tokens_to_text
+from .ner import class_label_names, complete_tags, spans, student_tag_names, tag_names_problem, tokens_to_text
 from .providers import community as community_provider
 from .providers import legal_data_hunter as ldh_provider
 
@@ -107,6 +107,8 @@ UNNAMED_TAG = (
     "We can't read entity names: tag {number} has no name. Name every tag number "
     "in the import window, then import it again."
 )
+# A retry of an import that failed for want of names (#180) would send the same names again.
+NAME_TAGS_AGAIN = "Name every tag number in the import window, then import it again."
 # How much of a dataset an import may download before it samples.
 MAX_FETCH_BYTES = 200_000_000
 # How often a running import says it is alive, and how long a quiet one, or a
@@ -377,10 +379,12 @@ def _requested_tag_names(body, provider):
         return None
     if provider == LEGAL_DATA_HUNTER or (body.get("taskType") or "classification") not in NER_TASKS:
         raise Refused(400, "bad_tag_names", "Tags can only be named for an NER dataset's tag column.")
+    if not body.get("labelColumn"):
+        raise Refused(400, "bad_tag_names", "Pick the column of tags these names are for.")
     problem = tag_names_problem(value)
     if problem:
         raise Refused(400, "bad_tag_names", problem)
-    return [name.strip() for name in value]
+    return student_tag_names(value)
 
 
 def tag_names_of(record):
@@ -614,6 +618,9 @@ def retry(host, owner_id, import_ref):
     if record.provider == LEGAL_DATA_HUNTER and record.dismissed_at is not None:
         # Put away: its documents are gone, and it is not the student's to resume (#126).
         raise Refused(409, "not_retryable", ldh_provider.PUT_AWAY)
+    if record.error_code == "no_entity_names":
+        # The same names would fail the same way: the student names the tags again in a new import (#180).
+        raise Refused(409, "name_tags_again", NAME_TAGS_AGAIN)
     body = {
         "provider": record.provider,
         "dataset": record.external_id,
@@ -804,17 +811,21 @@ def run_import(
         # The import records the revision its rows were read from, whatever the
         # fetch could name; one that could not say records none (#120, #168).
         _advance(session, record, SAMPLING, {"revision": fetched.revision, **copy_updates})
-        rows, method, note = _sample(record, fetched.paths, random.Random(seed), open_parquet)
+        rows, method, note, names_unused = _sample(record, fetched.paths, random.Random(seed), open_parquet)
         _advance(session, record, VALIDATING, {"sample_method": method, "sample_note": note})
         _write_csv(path, record, rows)
         # The last check before the Dataset is written: a cancel before this wins.
         _advance(session, record, SAVING)
         dataset_ref = _create(create_dataset, record, csv)
         imported = _now()
+        citation = record.citation
+        if names_unused and citation:
+            # The files named their own tags, so the student's names were not used: the provenance does not claim them (#180).
+            citation = {k: v for k, v in citation.items() if k != "tagNames"}
         _advance(session, record, COMPLETED, {
             "dataset_ref": str(dataset_ref), "rows": len(rows), "imported_at": imported,
             # Cited at the revision that was read and the day it was imported.
-            "citation": _pinned(record.citation, None if provider == COMMUNITY else record.revision, imported),
+            "citation": _pinned(citation, None if provider == COMMUNITY else record.revision, imported),
         })
     except _Stopped:
         csv.remove()
@@ -1159,27 +1170,31 @@ def _sample(record, paths, rng, open_parquet):
     """Pick `sample_size` rows with text, reading as little as possible; balanced
     on the label column when asked and it has labels.
 
-    Returns the rows, the method used (``"stratified"`` or ``"random"``) and a
+    Returns the rows, the method used (``"stratified"`` or ``"random"``), a
     note when a balance was asked for but could not be kept, or when no NER
-    row had a tag for every word."""
+    row had a tag for every word, and whether the student's tag names (#180)
+    went unused because every file names its own tags."""
     if open_parquet is None:
         import pyarrow.parquet as pq
 
         open_parquet = pq.ParquetFile
     files = [open_parquet(path) for path in paths]
     _refuse_numbered_ner_tags(record, files)
+    names_unused = bool(tag_names_of(record)) and bool(record.label_column) and all(
+        _label_names(f, record.label_column) for f in files
+    )
     if record.balance and record.label_column:
         rows, note = _sample_balanced(record, files, rng)
         if rows is not None:
             rng.shuffle(rows)
-            return rows, "stratified", note
+            return rows, "stratified", note, names_unused
         rows = _sample_random(record, files, rng)
         rng.shuffle(rows)
-        return rows, "random", note
+        return rows, "random", note, names_unused
     rows = _sample_random(record, files, rng)
     rng.shuffle(rows)
     untagged = record.task_type in NER_TASKS and record.label_column and all(row[1] == "" for row in rows)
-    return rows, "random", NER_UNTAGGED if untagged else None
+    return rows, "random", NER_UNTAGGED if untagged else None, names_unused
 
 
 def _sample_random(record, files, rng):
@@ -1433,17 +1448,6 @@ def _numbered(tags):
     )
 
 
-def _complete_tags(tokens, tags):
-    """Whether an NER row has a token list and a tag for each of its tokens."""
-    return (
-        isinstance(tokens, (list, tuple))
-        and isinstance(tags, (list, tuple))
-        and len(tags) == len(tokens)
-        and len(tokens) > 0
-        and all(tag is not None for tag in tags)
-    )
-
-
 def _mapped(values, names, task_type="classification"):
     """A row as written for the host: text, then the label by name when it has one.
 
@@ -1459,13 +1463,14 @@ def _mapped(values, names, task_type="classification"):
         # scalar, short or partly empty tags) leaves the cell blank, so the
         # row waits to be annotated rather than training as "no entities", as
         # a partial annotation, or as one entity over the whole text.
-        if not _complete_tags(values[0], label):
+        if not complete_tags(values[0], label):
             return [text, ""]
         if _numbered(label) and not names:
             raise ImportFailed("no_entity_names", NO_ENTITY_NAMES)
         if isinstance(names, _StudentTagNames):
+            # A negative number (a -100 padding tag) is outside any entity, as `ner.spans` reads it.
             for tag in label:
-                if isinstance(tag, int) and not isinstance(tag, bool) and not 0 <= tag < len(names):
+                if isinstance(tag, int) and not isinstance(tag, bool) and tag >= len(names):
                     raise ImportFailed("no_entity_names", UNNAMED_TAG.format(number=tag))
         text, found = spans(values[0], label, names)
         return [text, json.dumps(found, ensure_ascii=False)]

@@ -1,4 +1,6 @@
 """Turning a Hugging Face NER row into legal-ml-core's text and entity spans (#6)."""
+import pytest
+
 from dataset_library.ner import spans, tokens_to_text
 
 NAMES = ["O", "B-PER", "I-PER", "B-ORG", "I-ORG"]
@@ -301,3 +303,50 @@ def test_class_label_names_are_read_from_the_label_or_its_sequence():
     assert class_label_names({"_type": "Sequence", "feature": label}) == NAMES
     assert class_label_names([label]) == NAMES
     assert class_label_names({"_type": "Sequence", "feature": {"_type": "Value", "dtype": "int64"}}) is None
+
+
+def test_an_empty_class_label_names_nothing():
+    """Round 1 (#180): the preview and the import both treat `names: []` as no names."""
+    from dataset_library.ner import class_label_names
+
+    empty = {"_type": "ClassLabel", "names": []}
+    assert class_label_names(empty) is None
+    assert class_label_names({"_type": "Sequence", "feature": empty}) is None
+
+
+@pytest.mark.parametrize("names", [
+    ["O", "S-PER"],  # only B- and I- name a position
+    ["O", "B_PER"],  # the separator is a hyphen
+    ["O", "B-"],  # a prefix without a type
+    ["O", "B- PER"],  # whitespace in the type
+    ["O", "B-\u0085"],  # Unicode whitespace is whitespace
+    ["O", "B-PER\u0085X"],
+    ["O", "E-PER"],
+    ["O", "PER"],  # a type without a position
+    ["O", "b-PER"],
+    ["O"] * 201,  # too many
+])
+def test_student_tag_names_follow_one_grammar(names):
+    from dataset_library.ner import tag_names_problem
+
+    assert tag_names_problem(names) is not None
+
+
+def test_student_tag_names_are_o_or_b_or_i_and_a_type():
+    from dataset_library.ner import student_tag_names, tag_names_problem
+
+    names = [" o", "B-PER ", "I-PER", "B-ORG.GOV", "I-Läkare", "O"]
+    assert tag_names_problem(names) is None
+    assert tag_names_problem(["O"] * 200) is None
+    assert student_tag_names(names) == ["O", "B-PER", "I-PER", "B-ORG.GOV", "I-Läkare", "O"]
+
+
+def test_complete_tags_needs_a_tag_for_every_token():
+    from dataset_library.ner import complete_tags
+
+    assert complete_tags(["a", "b"], [0, 1])
+    assert not complete_tags(["a", "b"], [0])
+    assert not complete_tags(["a", "b"], [0, None])
+    assert not complete_tags([], [])
+    assert not complete_tags("a b", [0, 1])
+    assert not complete_tags(["a"], None)

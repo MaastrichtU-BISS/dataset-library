@@ -13,6 +13,8 @@ CACHE_SECONDS = 600
 # are not known, so it is not kept, and a copy of the part (#121) may stand in for them.
 VIEWER_DOWN = "viewerDown"
 ROWS = 8
+# The most rows the viewer's first-rows gives; numbered tags are read from all of them.
+FIRST_ROWS = 100
 CELL_CHARACTERS = 400
 # Names that say which column is which, before falling back to the types.
 NER_TEXT_COLUMNS = ("tokens", "words")
@@ -103,7 +105,9 @@ def with_tag_names(body, tag_names):
     if not ner:
         return body
     if tag_names and not ner.get("namesKnown") and source:
-        body["ner"] = _ner_preview(source["features"], source["rows"], ner["textColumn"], ner["tagColumn"], tag_names)
+        named = _ner_preview(source["features"], source["rows"], ner["textColumn"], ner["tagColumn"], tag_names)
+        # The source keeps only the shown rows: `labels` stay those read from every first row.
+        body["ner"] = {**named, "labels": ner["labels"]}
     else:
         body["ner"] = {**ner, "tagNames": None}
     return body
@@ -183,10 +187,10 @@ def _build(host, external_id, config, split):
     body["preview"] = "ok" if body["rows"] else "unavailable"
     if body["preview"] == "ok":
         body["proposed"] = _propose(card["tasks"], features, rows.get("rows") or [])
-        first = (rows.get("rows") or [])[:ROWS]
-        body["ner"] = ner_part(body["proposed"], features, first)
+        every = rows.get("rows") or []
+        body["ner"] = ner_part(body["proposed"], features, every)
         if body["ner"] and not body["ner"]["namesKnown"]:
-            body[NER_SOURCE] = {"features": features, "rows": [{"row": r.get("row") or {}} for r in first]}
+            body[NER_SOURCE] = {"features": features, "rows": [{"row": r.get("row") or {}} for r in every[:ROWS]]}
     return body
 
 
@@ -259,7 +263,8 @@ def _all_bio(values):
 
 def ner_part(proposed, features, rows, tag_names=None):
     """The preview's `ner`: what the proposed NER columns hold, or None when
-    the proposal is not NER. `rows` are the viewer's `{"row": {...}}` entries."""
+    the proposal is not NER. `rows` are the viewer's `{"row": {...}}` entries,
+    every first row it gave: the first ROWS are shown."""
     if proposed.get("taskType") != "ner":
         return None
     return _ner_preview(features, rows, proposed["textColumn"], proposed["labelColumn"], tag_names)
@@ -268,22 +273,31 @@ def ner_part(proposed, features, rows, tag_names=None):
 def _ner_preview(features, rows, text_column, tag_column, tag_names=None):
     """What an NER dataset holds, read from its first rows (#180).
 
-    `labels` are the tag names: a ClassLabel's names in order, or for string
-    tags the distinct tags in these rows, `O` first and the rest as first seen,
-    or for numbers without names the distinct numbers as strings, sorted, with
-    `namesKnown` false. `entityTypes` are the types in `labels` with their
-    position prefix stripped and `O` left out, in that order, each with the
-    number of spans of it across `rows` (0 when none shows). Numbers without
-    names have no types: `ner.spans` cannot read a number it has no name for
-    and leaves it outside, as the import refuses such tags, so `entityTypes` is
-    empty and every row has no entities.
+    `rows` are every first row the viewer gave (up to FIRST_ROWS); the first
+    ROWS of them are shown and counted, and numbered tags are read from all.
 
-    `rows` are these rows as the import converts them (`ner.spans`): the text
-    and its entities. A row it cannot convert (tokens or tags missing or not a
-    list, or a different number of each) is left out and counted in
-    `skippedRows`. `typesOnlyColumns` are the other columns whose values all
-    read `TYPE: text` with TYPE one of `entityTypes`: entity types without
-    positions, which cannot be trained on.
+    `labels` are the tag names: a ClassLabel's names in order (an empty one
+    names nothing), or for string tags the distinct tags in the shown rows,
+    `O` first and the rest as first seen, or for numbers without names every
+    number from ``"0"`` to the highest non-negative tag in any of `rows`, as
+    strings, at most MAX_TAG_NAMES, with `namesKnown` false: position i is tag
+    number i, gaps included. Negative numbers (``-100`` padding) are outside
+    any entity and never a label. `entityTypes` are the types in `labels` with
+    their position prefix stripped and `O` left out, in that order, each with
+    the number of spans of it across the shown rows (0 when none shows).
+    Numbers without names have no types: `ner.spans` cannot read a number it
+    has no name for and leaves it outside, as the import refuses such tags, so
+    `entityTypes` is empty and every row has no entities.
+
+    `rows` in the result are the shown rows as the import writes them: a row
+    with a tag for every token (`ner.complete_tags`) is converted by
+    `ner.spans` into its text and entities; a row of tokens whose tags are
+    missing, short or partly empty is shown with no entities and counted in
+    `blankRows`, as it is imported with a blank entities cell; a row whose
+    tokens are not a list, or whose text is empty, is left out and counted in
+    `skippedRows`. `typesOnlyColumns` are the other list columns whose values
+    all read `TYPE: text` with TYPE one of `entityTypes`: entity types without
+    positions (WikiANN's `spans`), which cannot be trained on.
 
     `tag_names`, when the tags are numbers without names, are the student's
     names for them (#180): item i names number i. The rows are converted with
@@ -292,27 +306,35 @@ def _ner_preview(features, rows, text_column, tag_column, tag_names=None):
     them. Otherwise `tagNames` is null and they change nothing."""
     types = {f["name"]: f.get("type") for f in features}
     names = ner_module.class_label_names(types.get(tag_column))
-    cells = [(r.get("row") or {}) for r in rows]
-    tag_lists = [cell.get(tag_column) for cell in cells if isinstance(cell.get(tag_column), list)]
+    every = [(r.get("row") or {}) for r in rows]
+    cells = every[:ROWS]
     if names is not None:
         labels, names_known = [str(name) for name in names], True
     else:
-        seen = [tag for tags in tag_lists for tag in tags]
-        numbers = sorted({tag for tag in seen if isinstance(tag, int) and not isinstance(tag, bool)})
+        seen = [tag for cell in cells if isinstance(cell.get(tag_column), list) for tag in cell.get(tag_column)]
+        numbers = [
+            tag for cell in every if isinstance(cell.get(tag_column), list) for tag in cell.get(tag_column)
+            if isinstance(tag, int) and not isinstance(tag, bool)
+        ]
         strings = list(dict.fromkeys(tag for tag in seen if isinstance(tag, str)))
         names_known = not (_is_integer(_list_inner(types.get(tag_column))) or (numbers and not strings))
         if names_known:
             labels = (["O"] if "O" in strings else []) + [tag for tag in strings if tag != "O"]
         else:
-            labels = [str(number) for number in numbers]
+            highest = max((number for number in numbers if number >= 0), default=-1)
+            labels = [str(number) for number in range(min(highest + 1, ner_module.MAX_TAG_NAMES))]
     applied = None
     if names is None and not names_known and tag_names:
         names = applied = list(tag_names)
-    converted, skipped = [], 0
+    converted, skipped, blank = [], 0, 0
     for cell in cells:
         tokens, tags = cell.get(text_column), cell.get(tag_column)
-        if not isinstance(tokens, list) or not isinstance(tags, list) or len(tokens) != len(tags):
+        if not isinstance(tokens, list) or not ner_module.tokens_to_text(tokens).strip():
             skipped += 1
+            continue
+        if not ner_module.complete_tags(tokens, tags):
+            blank += 1
+            converted.append({"text": ner_module.tokens_to_text(tokens), "entities": []})
             continue
         text, entities = ner_module.spans(tokens, tags, names)
         converted.append({"text": text, "entities": entities})
@@ -335,20 +357,20 @@ def _ner_preview(features, rows, text_column, tag_column, tag_names=None):
         "entityTypes": entity_types,
         "rows": converted,
         "skippedRows": skipped,
+        "blankRows": blank,
         "typesOnlyColumns": [name for name in others if _types_only(name, cells, set(counts))],
         "tagNames": applied,
     }
 
 
 def _types_only(name, cells, entity_types):
-    """Whether every value of `name` in these rows is a string, or a list of
-    strings, reading `TYPE: text` with TYPE an entity type, at least one of them."""
+    """Whether `name` is a list column whose every value in these rows is a list
+    of strings reading `TYPE: text` with TYPE an entity type, at least one of
+    them. A plain text column is never one: a summary may well start "ORG: "."""
     values = []
     for cell in cells:
         value = cell.get(name)
-        if isinstance(value, str):
-            values.append(value)
-        elif isinstance(value, list) and all(isinstance(item, str) for item in value):
+        if isinstance(value, list) and all(isinstance(item, str) for item in value):
             values.extend(value)
         elif value is not None:
             return False

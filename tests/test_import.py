@@ -800,6 +800,86 @@ def test_the_datasets_own_tag_names_win_over_the_students(run, tmp_path):
     }
 
 
+def stored_citation(app, ref):
+    with app.app_context():
+        return app.db.session.get(LibraryImport, ref).citation
+
+
+def test_unused_student_tag_names_leave_the_completed_citation(run, app, tmp_path):
+    """Round 1 (#180): the files named their own tags, so the provenance does not claim the student's names."""
+    shard = write_ner_shard(tmp_path / "0000.parquet", [["John", "Smith"]], [[1, 2]])
+
+    result, _ = run(
+        [shard], size=1, task_type="ner", text_column="tokens", label_column="ner_tags",
+        citation={"title": "Legal NER", "tagNames": ["O", "B-LOC", "B-LOC"]},
+    )
+
+    assert result["status"] == "completed", result
+    citation = stored_citation(app, result["id"])
+    assert "tagNames" not in citation
+    assert citation["title"] == "Legal NER" and citation["revision"] == "abc123"
+
+
+def test_used_student_tag_names_stay_on_the_completed_citation(run, app, tmp_path):
+    shard = write_tner_shard(tmp_path / "0000.parquet", [["John", "Smith"]], [[1, 2]])
+
+    result, _ = run(
+        [shard], size=1, task_type="ner", text_column="tokens", label_column="tags",
+        citation={"title": "Legal NER", "tagNames": NER_NAMES},
+    )
+
+    assert result["status"] == "completed", result
+    assert stored_citation(app, result["id"])["tagNames"] == NER_NAMES
+
+
+def test_student_names_are_indexed_by_tag_number_gaps_included(run, tmp_path):
+    """Round 1 (#180): tags 0, 2 and 5 take names 0, 2 and 5, not the first three."""
+    shard = write_tner_shard(tmp_path / "0000.parquet", [["Rome", "and", "ACME"]], [[2, 0, 5]])
+
+    result, create = run(
+        [shard], size=1, task_type="ner", text_column="tokens", label_column="tags",
+        citation={"title": "Legal NER", "tagNames": ["O", "B-PER", "B-LOC", "I-LOC", "I-PER", "B-ORG"]},
+    )
+
+    assert result["status"] == "completed", result
+    assert entity_spans(create.calls[0]["rows"]) == {"Rome and ACME": [
+        {"text": "Rome", "start": 0, "end": 4, "type": "LOC"},
+        {"text": "ACME", "start": 9, "end": 13, "type": "ORG"},
+    ]}
+
+
+def test_a_rare_high_tag_past_the_previewed_rows_imports_with_its_name(run, tmp_path):
+    tokens = [["plain", "words"]] * 9 + [["Mary", "Jones"]]
+    tags = [[0, 0]] * 9 + [[7, 8]]
+    shard = write_tner_shard(tmp_path / "0000.parquet", tokens, tags)
+    names = ["O", "B-ORG", "I-ORG", "B-LOC", "I-LOC", "B-MISC", "I-MISC", "B-PER", "I-PER"]
+
+    result, create = run(
+        [shard], size=10, task_type="ner", text_column="tokens", label_column="tags",
+        citation={"title": "Legal NER", "tagNames": names},
+    )
+
+    assert result["status"] == "completed", result
+    assert entity_spans(create.calls[0]["rows"])["Mary Jones"] == [
+        {"text": "Mary Jones", "start": 0, "end": 10, "type": "PER"},
+    ]
+
+
+def test_negative_padding_tags_import_as_outside_with_student_names(run, tmp_path):
+    """Round 1 (#180): -100 marks padding, never an entity, and needs no name."""
+    shard = write_tner_shard(tmp_path / "0000.parquet", [["[CLS]", "John", "Smith", "[SEP]"]], [[-100, 1, 2, -100]])
+
+    result, create = run(
+        [shard], size=1, task_type="ner", text_column="tokens", label_column="tags",
+        citation={"title": "Legal NER", "tagNames": ["O", "B-PER", "I-PER"]},
+    )
+
+    assert result["status"] == "completed", result
+    assert entity_spans(create.calls[0]["rows"]) == {
+        "[CLS] John Smith [SEP]": [{"text": "John Smith", "start": 6, "end": 16, "type": "PER"}],
+    }
+
+
 def test_tags_with_an_empty_name_list_also_fail_before_any_row_is_read(run, tmp_path):
     shard = write_ner_shard(
         tmp_path / "0000.parquet", [["John", "Smith"]], [[0, 1]],

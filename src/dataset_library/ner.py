@@ -6,6 +6,7 @@ spans in that text, the format legal-ml-core's annotation queue stores. These
 are pure functions so the conversion can be tested without a Parquet file or a
 database.
 """
+import re
 
 # BIO and the neighbouring schemes all put the position before the type; BMES
 # (Chinese NER sets) marks the middle of an entity with M.
@@ -17,12 +18,16 @@ CONTINUES = frozenset("IM")
 PLACEHOLDERS = frozenset({"x", "pad", "[pad]", "<pad>", "[cls]", "[sep]"})
 # The most tag numbers a student may name (BAIGLE #180); NER sets have tens.
 MAX_TAG_NAMES = 200
+# The one grammar a student names a tag in (BAIGLE #180): O, or B- or I- and a
+# type with no whitespace in it. `_parse` reads datasets' own names more broadly.
+_STUDENT_TAG = re.compile(r"(?:[Oo]|[BI]-\S+)")
 
 
 def class_label_names(feature):
     """Names from a Hugging Face ClassLabel feature, or from the ClassLabel
     inside a Sequence (or a bare list, as the viewer writes one); None when
-    there is none. The import and the preview both read names this way."""
+    there is none, or when it names nothing (an empty ClassLabel says no more
+    than no ClassLabel). The import and the preview both read names this way."""
     if isinstance(feature, list):
         for item in feature:
             names = class_label_names(item)
@@ -32,7 +37,7 @@ def class_label_names(feature):
     if not isinstance(feature, dict):
         return None
     if feature.get("_type") == "ClassLabel":
-        return feature.get("names")
+        return feature.get("names") or None
     if feature.get("_type") in ("Sequence", "List", "LargeList"):
         return class_label_names(feature.get("feature"))
     return None
@@ -50,8 +55,9 @@ def tag_names_problem(value):
 
     A student names tags that are numbers without names (tner's datasets) in
     the import window (BAIGLE #180): a list where item i names tag number i,
-    each ``O`` or a position prefix and a type that ``_parse`` reads, such as
-    ``B-PER`` or ``I-PER``, at most MAX_TAG_NAMES of them."""
+    each ``O`` (in either case) or ``B-`` or ``I-`` followed by a type with no
+    whitespace in it, such as ``B-PER`` or ``I-PER``, at most MAX_TAG_NAMES of
+    them. Whitespace around a name is ignored."""
     if not isinstance(value, list) or not value:
         return "Name the tags as a list, one name for each tag number."
     if len(value) > MAX_TAG_NAMES:
@@ -59,12 +65,30 @@ def tag_names_problem(value):
     for number, name in enumerate(value):
         if not isinstance(name, str) or not name.strip():
             return f"Give tag {number} a name: O, or B- or I- followed by an entity type, like B-PER."
-        if name.strip().upper() == "O":
-            continue
-        parsed = _parse(name, None)
-        if parsed is None or parsed[0] is None:
+        if not _STUDENT_TAG.fullmatch(name.strip()):
             return f"Tag {number}'s name {name!r} is not O, or B- or I- followed by an entity type, like B-PER."
     return None
+
+
+def student_tag_names(value):
+    """A list `tag_names_problem` accepts, as it is kept: each name trimmed and
+    ``o`` written ``O``."""
+    return ["O" if name.strip() == "o" else name.strip() for name in value]
+
+
+def complete_tags(tokens, tags):
+    """Whether an NER row has a token list and a tag for each of its tokens.
+
+    Only such a row says where its entities are: the import writes anything
+    less (a text that is already a string, missing, scalar, short or partly
+    empty tags) with a blank entities cell, and the preview shows it so."""
+    return (
+        isinstance(tokens, (list, tuple))
+        and isinstance(tags, (list, tuple))
+        and len(tags) == len(tokens)
+        and len(tokens) > 0
+        and all(tag is not None for tag in tags)
+    )
 
 
 def tokens_to_text(tokens):

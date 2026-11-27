@@ -15,28 +15,38 @@ While the version is 0.x, minor releases may contain breaking changes.
 - The NER preview (BAIGLE #180): a Hugging Face preview whose proposal is NER now carries
   `ner`, so the import's column step can say what the tags mean before a student picks columns:
   `textColumn`, `tagColumn`, `labels` (a ClassLabel's names in order; for string tags the tags in
-  the first rows, `O` first, then as first seen; for numbers without names the numbers as strings,
-  sorted), `namesKnown` (false only for numbers without names), `entityTypes` (`{"type",
+  the first rows, `O` first, then as first seen; an empty ClassLabel names nothing; for numbers
+  without names every number from `"0"` to the highest non-negative tag in any row first-rows gave,
+  up to 100 rows, gaps included and at most 200, so position i is tag number i, with negative
+  `-100` padding never a label), `namesKnown` (false only for numbers without names), `entityTypes` (`{"type",
   "count"}` for each type in `labels` with its position prefix stripped and `O` left out, in label
   order, counting the spans in `rows`, 0 when none shows; numbers without names have none, as
-  `ner.spans` cannot read them), `rows` (the first rows as the import converts them, `{"text",
-  "entities"}`), `skippedRows` (rows it could not convert: tokens or tags missing, or their lengths
-  differ) and `typesOnlyColumns` (other columns whose every value reads `TYPE: text` with a known
-  type, such as WikiANN's `spans`: entity types without positions). `ner` is null for any other
+  `ner.spans` cannot read them), `rows` (the first 8 rows as the import writes them, `{"text",
+  "entities"}`, through the same `ner.complete_tags` check), `blankRows` (rows of tokens whose
+  tags are missing, short or partly empty: shown with no entities, as the import keeps them with a
+  blank entities cell), `skippedRows` (rows left out: tokens not a list, or no text) and
+  `typesOnlyColumns` (other list columns whose every value reads `TYPE: text` with a known type,
+  such as WikiANN's `spans`: entity types without positions; never a plain text column). `ner` is null for any other
   proposal, on a copy opened offline as on the live preview, and on a Community card. A preview
   cached without `ner` is rebuilt.
-- `ner.class_label_names` (moved from the import, which reads names through it as before) and
-  `ner.entity_type`, so the preview and the import read tag names the same way.
+- `ner.class_label_names` (moved from the import, which reads names through it as before),
+  `ner.complete_tags` (moved from the import) and `ner.entity_type`, so the preview and the import read tag names the same way.
 - Naming numbered tags (BAIGLE #180): an NER dataset whose tags are numbers without names, such
-  as tner's, now imports once the student names each number `O`, `B-<TYPE>` or `I-<TYPE>`.
+  as tner's, now imports once the student names each number `O`, `B-<TYPE>` or `I-<TYPE>` (`O` in
+  either case, kept as `O`; a type is one or more characters with no whitespace).
   `POST /api/library/imports` takes `tagNames` (a list, item i naming tag number i, at most 200,
-  NER only; else 400 `bad_tag_names`), keeps it on the import's `citation` as `tagNames`, so the
-  provenance shows the names came from the student, and keeps it on a retry; the worker reads the
-  tags with it only when the files name none. The preview takes `?tagNames=` as a JSON-encoded
+  NER with a `labelColumn` only; else 400 `bad_tag_names`), keeps it on the import's `citation` as
+  `tagNames`, so the provenance shows the names came from the student, and keeps it on a retry; the
+  worker reads the tags with it only when the files name none, and otherwise takes `tagNames` off
+  the completed import's citation. Negative tags (`-100` padding) need no name and are outside
+  any entity. A retry of an import that failed `no_entity_names` is refused with 409
+  `name_tags_again`, since the same names would fail again. The preview takes `?tagNames=` as a JSON-encoded
   list and computes `ner` with it (`rows`, `entityTypes`; `labels` stay the numbers, `namesKnown`
   false) and echoes it as `ner.tagNames`, null otherwise. The cached body is never changed by it:
   a preview of such tags keeps its raw first rows in the cache, unserved, to apply names to, and
-  one cached without them is rebuilt. `ner.tag_names_problem` checks a list of names.
+  one cached without them is rebuilt. `ner.tag_names_problem` checks a list of names and
+  `ner.student_tag_names` writes it as kept. An offline copy reads up to 100 rows, so its proposal
+  and its numbered labels read as many rows as the live preview; it still shows 8.
 
 ### Changed
 

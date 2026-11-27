@@ -528,6 +528,11 @@ def test_other_tag_names_are_another_import_and_a_retry_keeps_them(client, queue
     "O, B-PER",  # not a list
     [],  # nothing named
     ["O"] * 201,  # too many
+    ["O", "S-PER"],  # only B- and I- name a position
+    ["O", "B_PER"],
+    ["O", "B-"],
+    ["O", "B- PER"],
+    ["O", "B-\u0085"],
 ])
 def test_tag_names_that_are_not_a_list_of_tags_refuse_the_import(client, queue, tner, tag_names):
     refused = start(client, status=400, **tner_body(tner, tagNames=tag_names))
@@ -535,6 +540,44 @@ def test_tag_names_that_are_not_a_list_of_tags_refuse_the_import(client, queue, 
     assert refused["code"] == "bad_tag_names"
     assert refused["error"]
     assert queue.refs == []
+
+
+def test_a_retry_after_a_missing_name_says_to_name_the_tags_again(client, queue, tner):
+    """Round 1 (#180): a retry would send the same names, which fail the same way."""
+    first = start(client, **tner_body(tner, tagNames=["O", "B-PER", "I-PER"]))
+    set_import(client, first["id"], status="failed", error_code="no_entity_names")
+
+    resp = client.post(f"/api/library/imports/{first['id']}/retry", headers=ALICE)
+
+    assert resp.status_code == 409
+    assert resp.get_json()["code"] == "name_tags_again"
+    assert resp.get_json()["error"] == "Name every tag number in the import window, then import it again."
+    assert queue.refs == [first["id"]]
+
+
+@pytest.mark.parametrize("label_column", [None, ""])
+def test_tag_names_need_a_tag_column(client, queue, tner, label_column):
+    refused = start(client, status=400, **tner_body(tner, labelColumn=label_column, tagNames=TNER_NAMES))
+
+    assert refused["code"] == "bad_tag_names"
+    assert queue.refs == []
+
+
+def test_tag_names_need_a_tag_column_even_when_none_is_sent(client, queue, tner):
+    body = {k: v for k, v in tner_body(tner, tagNames=TNER_NAMES).items() if k != "labelColumn"}
+
+    resp = client.post("/api/library/imports", json=body, headers=ALICE)
+    refused = resp.get_json()
+
+    assert resp.status_code == 400
+    assert refused["code"] == "bad_tag_names"
+    assert queue.refs == []
+
+
+def test_a_lowercase_o_is_kept_as_o(client, queue, tner):
+    started = start(client, **tner_body(tner, tagNames=["o", "B-PER", "I-PER", "B-ORG", "I-ORG"]))
+
+    assert stored_citation(client, started["id"])["tagNames"] == TNER_NAMES
 
 
 def test_tag_names_are_only_for_an_ner_import(client, queue):

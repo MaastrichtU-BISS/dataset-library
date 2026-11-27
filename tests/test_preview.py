@@ -555,7 +555,7 @@ def test_numbered_tags_without_names_are_not_known_and_have_no_types():
 
     ner = _ner_preview(features, rows, "tokens", "tags")
 
-    assert ner["labels"] == ["0", "1", "3", "4"]
+    assert ner["labels"] == ["0", "1", "2", "3", "4"]
     assert ner["namesKnown"] is False
     # ner.spans cannot read a number without a name, so nothing becomes an entity type.
     assert ner["entityTypes"] == []
@@ -567,16 +567,46 @@ def test_numbered_tags_without_names_are_not_known_and_have_no_types():
     assert ner["typesOnlyColumns"] == []
 
 
-def test_a_row_that_cannot_be_converted_is_left_out_and_counted():
+def test_rows_are_shown_as_the_import_writes_them():
+    """Round 1 (#180): a row of tokens with incomplete tags is imported with blank
+    entities, so the preview shows it so and counts it; a row with no text, or no
+    token list, is not imported at all, so it is left out and counted."""
     features, rows = _wikiann()
     rows[1]["row"]["ner_tags"] = [1, 0]  # fewer tags than tokens
-    rows.append({"row_idx": 3, "row": {"tokens": None, "ner_tags": [0]}})  # a missing value
+    rows.append({"row_idx": 3, "row": {"tokens": ["Paris", "again"], "ner_tags": [5, None]}})  # a tag missing
+    rows.append({"row_idx": 4, "row": {"tokens": ["Lyon"], "ner_tags": None}})  # no tags at all
+    rows.append({"row_idx": 5, "row": {"tokens": ["", " "], "ner_tags": [0, 0]}})  # no text
+    rows.append({"row_idx": 6, "row": {"tokens": [], "ner_tags": []}})  # no tokens
+    rows.append({"row_idx": 7, "row": {"tokens": None, "ner_tags": [0]}})  # not a token list
 
     ner = _ner_preview(features, rows, "tokens", "ner_tags")
 
-    assert [row["text"] for row in ner["rows"]] == ["Angela Merkel visited Paris .", "Rome and Bob"]
-    assert ner["skippedRows"] == 2
+    assert ner["rows"] == [
+        {"text": "Angela Merkel visited Paris .", "entities": [
+            {"text": "Angela Merkel", "start": 0, "end": 13, "type": "PER"},
+            {"text": "Paris", "start": 22, "end": 27, "type": "LOC"},
+        ]},
+        {"text": "Ibrahim joined Acme Corp in Berlin", "entities": []},
+        {"text": "Rome and Bob", "entities": [
+            {"text": "Rome", "start": 0, "end": 4, "type": "LOC"},
+            {"text": "Bob", "start": 9, "end": 12, "type": "PER"},
+        ]},
+        {"text": "Paris again", "entities": []},
+        {"text": "Lyon", "entities": []},
+    ]
+    assert ner["blankRows"] == 3
+    assert ner["skippedRows"] == 3
     assert ner["entityTypes"] == [{"type": "PER", "count": 2}, {"type": "ORG", "count": 0}, {"type": "LOC", "count": 2}]
+
+
+def test_only_the_first_rows_are_shown_and_counted():
+    features, rows = _wikiann()
+    rows = _rows(*([rows[0]["row"]] * 8 + [{"tokens": ["Rome"], "ner_tags": None}, {"tokens": None, "ner_tags": None}]))
+
+    ner = _ner_preview(features, rows, "tokens", "ner_tags")
+
+    assert len(ner["rows"]) == 8
+    assert ner["blankRows"] == 0 and ner["skippedRows"] == 0
 
 
 def test_a_types_only_column_needs_every_value_to_name_a_known_type():
@@ -588,15 +618,16 @@ def test_a_types_only_column_needs_every_value_to_name_a_known_type():
     assert ner["typesOnlyColumns"] == []
 
 
-def test_a_types_only_string_column_is_flagged_too():
+def test_a_plain_text_column_is_never_types_only():
+    """Round 1 (#180): a summary that starts "ORG: " is text, not WikiANN's `spans`."""
     features, rows = _wikiann()
     features.append({"name": "summary", "type": _string()})
     for row in rows:
-        row["row"]["summary"] = row["row"]["spans"][0]
+        row["row"]["summary"] = "ORG: Court of Justice"
 
     ner = _ner_preview(features, rows, "tokens", "ner_tags")
 
-    assert ner["typesOnlyColumns"] == ["spans", "summary"]
+    assert ner["typesOnlyColumns"] == ["spans"]
 
 
 def test_an_ner_preview_carries_its_tags_through_the_route(client):
@@ -650,9 +681,64 @@ TNER_NER = {
         ]},
     ],
     "skippedRows": 0,
+    "blankRows": 0,
     "typesOnlyColumns": [],
     "tagNames": TNER_NAMES,
 }
+
+
+def _numbered(*tag_lists):
+    features = _features(tokens=_sequence(_string()), tags=_sequence(_integer()))
+    rows = _rows(*({"tokens": ["w"] * len(tags), "tags": tags} for tags in tag_lists))
+    return features, rows
+
+
+def test_numbered_labels_run_from_0_to_the_highest_tag_gaps_included():
+    """Round 1 (#180): position i is tag number i, so a gap is still a label."""
+    features, rows = _numbered([0, 2], [5, 0])
+
+    ner = _ner_preview(features, rows, "tokens", "tags")
+
+    assert ner["labels"] == ["0", "1", "2", "3", "4", "5"]
+    assert ner["namesKnown"] is False
+
+
+def test_numbered_labels_read_every_first_row_not_only_the_shown_ones():
+    """Round 1 (#180): tner's rare 7 and 8 may first show after the eighth row."""
+    features, rows = _numbered(*([[0, 1, 2]] * 8 + [[0, 8], [7, 0]]))
+
+    ner = _ner_preview(features, rows, "tokens", "tags")
+
+    assert ner["labels"] == [str(number) for number in range(9)]
+    assert len(ner["rows"]) == 8
+
+
+def test_negative_padding_tags_are_never_labels_and_read_as_outside():
+    features, rows = _numbered([-100, 1, 2, -100], [-100, 0])
+
+    ner = _ner_preview(features, rows, "tokens", "tags")
+    named = _ner_preview(features, rows, "tokens", "tags", ["O", "B-PER", "I-PER"])
+
+    assert ner["labels"] == ["0", "1", "2"]
+    assert named["rows"][0] == {"text": "w w w w", "entities": [{"text": "w w", "start": 2, "end": 5, "type": "PER"}]}
+    assert named["blankRows"] == 0 and named["skippedRows"] == 0
+
+
+def test_numbered_labels_stop_at_the_most_tags_a_student_may_name():
+    features, rows = _numbered([0, 450])
+
+    assert len(_ner_preview(features, rows, "tokens", "tags")["labels"]) == 200
+
+
+def test_an_empty_class_label_is_numbers_without_names():
+    """Round 1 (#180): `names: []` names nothing, as the import reads it."""
+    features = _features(tokens=_sequence(_string()), tags=_sequence(_class_label([])))
+    rows = _rows({"tokens": ["John", "Smith"], "tags": [1, 2]})
+
+    ner = _ner_preview(features, rows, "tokens", "tags")
+
+    assert ner["namesKnown"] is False
+    assert ner["labels"] == ["0", "1", "2"]
 
 
 def test_tag_names_convert_numbered_tags_and_give_their_types():
@@ -665,7 +751,7 @@ def test_tag_names_convert_numbered_tags_and_give_their_types():
 
     ner = _ner_preview(features, rows, "tokens", "tags", names)
 
-    assert ner["labels"] == ["0", "1", "3", "4"] and ner["namesKnown"] is False
+    assert ner["labels"] == ["0", "1", "2", "3", "4"] and ner["namesKnown"] is False
     assert ner["tagNames"] == names
     # Types in the names' order, each counted over the converted rows.
     assert ner["entityTypes"] == [{"type": "LOC", "count": 2}, {"type": "PER", "count": 1}]
@@ -728,6 +814,26 @@ def test_tag_names_on_a_dataset_that_names_its_tags_are_ignored(client):
     assert ner["entityTypes"] == [{"type": "PER", "count": 2}, {"type": "ORG", "count": 2}]
 
 
+def test_numbered_labels_read_every_first_row_the_viewer_gives_named_or_not(client, cache, tner, monkeypatch):
+    """Round 1 (#180): the eighth row is the last shown, but a tag first seen in the tenth is still a label."""
+    from conftest import VIEWER
+
+    key = f"first-rows?dataset={tner}&config=default&split=train"
+    body = VIEWER[key]["body"]
+    extra = [{"tokens": ["plain"], "tags": [0]}] * 8 + [{"tokens": ["Mary", "Jones"], "tags": [7, 8]}]
+    rows = body["rows"] + [{"row_idx": 2 + index, "row": row, "truncated_cells": []} for index, row in enumerate(extra)]
+    monkeypatch.setitem(VIEWER, key, {"status": 200, "body": {**body, "rows": rows}})
+    names = ["O", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC", "B-MISC", "I-MISC"]
+
+    plain = preview(client, tner)["ner"]
+    named = preview(client, tner, tagNames=json.dumps(names))["ner"]
+
+    assert plain["labels"] == [str(number) for number in range(9)]
+    assert len(plain["rows"]) == 8
+    assert named["labels"] == plain["labels"]
+    assert named["tagNames"] == names and len(named["rows"]) == 8
+
+
 @pytest.mark.parametrize("raw", [
     '["O", ""]',  # an empty name
     '["O", "PER"]',  # a type without a position prefix
@@ -737,6 +843,10 @@ def test_tag_names_on_a_dataset_that_names_its_tags_are_ignored(client):
     '[]',  # nothing named
     'O,B-PER',  # not JSON
     json.dumps(["O"] * 201),  # too many
+    '["O", "S-PER"]',  # only B- and I- name a position
+    '["O", "B_PER"]',  # the separator is a hyphen
+    '["O", "B- PER"]',  # no whitespace in a type
+    '["O", "b-PER"]',  # the prefix is a capital
 ])
 def test_tag_names_that_are_not_a_list_of_tags_are_refused(client, tner, raw):
     refused = preview(client, tner, status=400, tagNames=raw)

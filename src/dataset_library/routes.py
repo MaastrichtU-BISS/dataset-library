@@ -210,7 +210,7 @@ def _tag_names_param():
     problem = ner_module.tag_names_problem(value)
     if problem:
         raise ApiError(400, problem, "bad_tag_names")
-    return [name.strip() for name in value]
+    return ner_module.student_tag_names(value)
 
 
 def _copy_view(dataset_ref, config, split, tag_names=None):

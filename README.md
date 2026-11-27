@@ -430,22 +430,31 @@ Admins only (404 `not_offered` without the seam):
   `rowCount` (the split's size, when known) and `preview: "ok" | "unavailable"`.
   `ner` (#180) is null unless `proposed.taskType` is `"ner"`; then it is
   `{"textColumn", "tagColumn", "labels", "namesKnown", "entityTypes", "rows",
-  "skippedRows", "typesOnlyColumns"}`. `labels` are the tag names (a ClassLabel's,
-  else the tag strings in the first rows with `O` first, else the numbers as
-  strings with `namesKnown: false`); `entityTypes` are `{"type", "count"}` in
-  label order, counting spans across `rows`, which are the first rows as the
-  import converts them (`{"text", "entities": [{"text", "start", "end",
-  "type"}]}`), leaving out and counting in `skippedRows` any it cannot convert.
-  Numbers without names have no types. `typesOnlyColumns` are the other
-  columns whose values all read `TYPE: text` (WikiANN's `spans`): types without
-  positions, which cannot be trained on. `tagNames` is null unless names were applied.
+  "skippedRows", "blankRows", "typesOnlyColumns", "tagNames"}`. `labels` are the
+  tag names (a ClassLabel's; an empty ClassLabel names nothing), else the tag
+  strings in the first rows with `O` first, else, for numbers without names
+  (`namesKnown: false`), every number from `"0"` to the highest non-negative tag
+  in any row the viewer's first-rows gave (up to 100, not only those shown), gaps
+  included, at most 200: position i is tag number i. Negative tags (`-100`
+  padding) are outside any entity and never labels. `entityTypes` are `{"type",
+  "count"}` in label order, counting spans across `rows`, which are the first 8
+  rows as the import writes them (`{"text", "entities": [{"text", "start", "end",
+  "type"}]}`): a row with a tag for every token is converted; a row of tokens whose
+  tags are missing, short or partly empty is shown with no entities and counted in
+  `blankRows`, since the import keeps it with a blank entities cell; a row whose
+  tokens are not a list, or whose text is empty, is left out and counted in
+  `skippedRows`. Numbers without names have no types. `typesOnlyColumns` are the
+  other list columns whose values all read `TYPE: text` (WikiANN's `spans`): types
+  without positions, which cannot be trained on; a plain text column never is one.
+  `tagNames` is null unless names were applied.
   `?tagNames=` names numbers without names, as the import window lets a student
-  do: a JSON-encoded list where item i names tag number i, each `O` or a position
-  prefix and a type (`B-PER`, `I-PER`, at most 200), for example
+  do: a JSON-encoded list where item i names tag number i, each `O` (either case,
+  kept as `O`) or `B-` or `I-` followed by a type with no whitespace (`B-PER`,
+  `I-PER`), at most 200, for example
   `?tagNames=%5B%22O%22%2C%22B-PER%22%2C%22I-PER%22%5D` (`["O","B-PER","I-PER"]`).
   When the tags are numbers without names, `ner` is then computed with them:
   `rows` are converted with them, `entityTypes` are their types in their order,
-  `labels` stay the numbers, `namesKnown` stays `false` and `tagNames` echoes
+  `labels` stay the numbers (from every first row), `namesKnown` stays `false` and `tagNames` echoes
   them; otherwise they change nothing. The cached preview is never changed by
   them. Not a list of such names → 400 `bad_tag_names`. An offline copy takes it too.
 - `GET /api/library/options` → the task, license and source filters, the
@@ -487,14 +496,19 @@ Admins only (404 `not_offered` without the seam):
   `true` when a `labelColumn` is mapped and is always `false` without one. The
   same import (dataset, revision, mapping, size, balance) while one is queued
   or running → 200 and that one, queued once. `tagNames` (#180), for an NER
-  import only, names tags that are numbers without names (tner's datasets): a
-  list where item i names tag number i, each `O` or a prefix and a type, as the
-  preview's `?tagNames=` takes them. It is kept on the import's `citation` as
-  `tagNames`, so the Dataset's provenance says the names came from the student,
-  and the worker reads the tags with it only when the files name none: the
-  dataset's own names win. Without it, or when a row holds a number it does not
-  name, such an import fails `no_entity_names`, saying to name the tags in the
-  import window. Other tag names are another import, and a retry keeps them.
+  import with a `labelColumn` only, names tags that are numbers without names
+  (tner's datasets): a list where item i names tag number i, each `O`, `B-TYPE`
+  or `I-TYPE`, as the preview's `?tagNames=` takes them. It is kept on the
+  import's `citation` as `tagNames`, so the Dataset's provenance says the names
+  came from the student, and the worker reads the tags with it only when the
+  files name none: the dataset's own names win, and then `tagNames` is taken off
+  the completed import's citation, as they were not used. Negative tags (`-100`
+  padding) need no name and are outside any entity. Without names, or when a row
+  holds a number they do not name, such an import fails `no_entity_names`, saying
+  to name the tags in the import window. Other tag names are another import, and a
+  retry keeps them, except that a retry of an import that failed
+  `no_entity_names` is refused with 409 `name_tags_again` ("Name every tag number
+  in the import window, then import it again."): the same names would fail again.
   Refused before anything is
   queued: 400 (`bad_id`, `bad_mapping`, `bad_size`, `bad_name`, `bad_task`,
   `bad_config`, `bad_balance`, `bad_tag_names` for names that are not such a list or

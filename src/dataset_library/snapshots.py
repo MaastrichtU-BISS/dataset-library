@@ -35,7 +35,7 @@ from .errors import NotParquet, ProviderError, ProviderRateLimited
 from .licenses import LICENSES, UNKNOWN
 from .limits import download_cap_bytes
 from .models import LibraryImport, LibraryPin, LibrarySnapshot
-from .preview import LicenseHidden, ROWS, _cell, _propose, _type, ner_part
+from .preview import FIRST_ROWS, LicenseHidden, ROWS, _cell, _propose, _type, ner_part
 from .providers import huggingface
 
 logger = logging.getLogger("dataset_library")
@@ -334,7 +334,7 @@ def offline_detail(host, copy, *, rows=True, tag_names=None):
         "config": copy.config,
         "split": copy.split,
         "columns": [{"name": column["name"], "type": _column_type(column, features)} for column in columns],
-        "rows": [[_cell(raw.get(name), features.get(name)) for name in names] for raw in sample],
+        "rows": [[_cell(raw.get(name), features.get(name)) for name in names] for raw in sample[:ROWS]],
         "rowCount": copy.row_count,
         "proposed": proposed,
         "ner": ner_part(proposed, named, viewer_rows, tag_names),
@@ -365,7 +365,7 @@ def _readable_type(arrow_type):
 
 def _read_copy(path, names, rows):
     """The copy's Hugging Face features, from its schema metadata, and when `rows`, its
-    first rows as raw values keyed by column. Nothing when the file cannot be read: the
+    first rows (up to FIRST_ROWS; ROWS are shown) as raw values keyed by column. Nothing when the file cannot be read: the
     copy still opens, it just shows no rows (#121). A corrupt file is no file."""
     import pyarrow.parquet as pq
     from pyarrow.lib import ArrowInvalid
@@ -378,7 +378,8 @@ def _read_copy(path, names, rows):
         features = _features(parquet_file.schema_arrow.metadata)
         if not rows or not names:
             return features, []
-        batch = next(parquet_file.iter_batches(batch_size=ROWS, columns=names), None)
+        # As many rows as the viewer's first-rows gives, so the proposal and numbered NER tags read the same rows (#180).
+        batch = next(parquet_file.iter_batches(batch_size=FIRST_ROWS, columns=names), None)
     except (OSError, ValueError, KeyError, ArrowInvalid) as exc:
         logger.warning(f"library.snapshot.preview_unreadable file={os.path.basename(path)} error={exc}")
         return features, []
