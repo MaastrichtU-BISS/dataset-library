@@ -288,13 +288,14 @@ def copy_for_offline(host, external_id, config, split):
     return copy if level == "allow" else None
 
 
-def offline_detail(host, copy, *, rows=True):
+def offline_detail(host, copy, *, rows=True, tag_names=None):
     """A dataset as the library shows it while Hugging Face cannot be asked: the card of
     the pin the copy was made for, the copy's columns with the types its Hugging Face
     features give, its first rows, and the task the live preview would propose for those
     columns. An import takes the same facts (`rows=False` skips the first rows). The
     license is the platform's level now, as preview applies it; LicenseHidden when it is
-    hidden. `rowCount` is the copy's rows, not the split's."""
+    hidden. `rowCount` is the copy's rows, not the split's. `tag_names` name numbered NER
+    tags as on the live preview (#180)."""
     pin = host.db.session.get(LibraryPin, copy.pin_id)
     if pin is None:
         # Unpinned since the copy was found: it no longer stands in for anything.
@@ -336,7 +337,7 @@ def offline_detail(host, copy, *, rows=True):
         "rows": [[_cell(raw.get(name), features.get(name)) for name in names] for raw in sample],
         "rowCount": copy.row_count,
         "proposed": proposed,
-        "ner": ner_part(proposed, named, viewer_rows),
+        "ner": ner_part(proposed, named, viewer_rows, tag_names),
         # The copy stands in for Hugging Face: the page says so, and it can still be imported.
         "offline": True,
     }

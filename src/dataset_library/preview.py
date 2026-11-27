@@ -54,10 +54,15 @@ class UnknownConfig(Exception):
     pass
 
 
-def preview(host, external_id, config=None, split=None):
+def preview(host, external_id, config=None, split=None, tag_names=None):
     """One dataset's preview. The library's own rules come first: a dataset
     outside the enabled sources never reaches the Hub or the cache, so its
-    cards and viewer answers are not fetched and no refusal reveals it."""
+    cards and viewer answers are not fetched and no refusal reveals it.
+
+    `tag_names`, a checked list (``ner.tag_names_problem``), names an NER
+    dataset's numbered tags as the student named them (#180): the `ner` part is
+    computed again with them from the raw rows the cached body keeps. The cached
+    body itself never holds them, so a preview without them is unchanged."""
     from .search import enabled_sources
 
     sources = {source.ref for source in enabled_sources(host.db)}
@@ -68,12 +73,40 @@ def preview(host, external_id, config=None, split=None):
     # A body cached before citations (#120) has no citation, and one cached before
     # the NER preview (#180) no `ner`: rebuild it, so an import started right after
     # the deploy still gets both.
-    if not isinstance(body, dict) or "citation" not in body or "ner" not in body:
+    # An NER body with unnamed numbered tags cached without its raw rows cannot be named either.
+    if not isinstance(body, dict) or "citation" not in body or "ner" not in body or _lacks_ner_source(body):
         body = _build(host, external_id, config, split)
         # A preview built while the viewer was down is not kept: the next open asks again.
         if not body.get(VIEWER_DOWN):
             host.cache.set(key, body, CACHE_SECONDS)
-    return _apply_library_rules(host, body)
+    return with_tag_names(_apply_library_rules(host, body), tag_names)
+
+
+# The raw first rows and features an NER preview with unnamed numbered tags
+# keeps in its cached body, so tag names can be applied to them (#180). Never
+# served: `with_tag_names` takes it out.
+NER_SOURCE = "_nerSource"
+
+
+def _lacks_ner_source(body):
+    ner = body.get("ner")
+    return bool(ner) and not ner.get("namesKnown") and NER_SOURCE not in body
+
+
+def with_tag_names(body, tag_names):
+    """The preview as served: `ner` computed with the student's `tag_names` when
+    its tags are numbers without names, and `ner.tagNames` saying which names
+    were applied (null when none were). A copy: the cached body is not touched."""
+    source = body.get(NER_SOURCE)
+    body = {k: v for k, v in body.items() if k != NER_SOURCE}
+    ner = body.get("ner")
+    if not ner:
+        return body
+    if tag_names and not ner.get("namesKnown") and source:
+        body["ner"] = _ner_preview(source["features"], source["rows"], ner["textColumn"], ner["tagColumn"], tag_names)
+    else:
+        body["ner"] = {**ner, "tagNames": None}
+    return body
 
 
 def _apply_library_rules(host, body):
@@ -150,7 +183,10 @@ def _build(host, external_id, config, split):
     body["preview"] = "ok" if body["rows"] else "unavailable"
     if body["preview"] == "ok":
         body["proposed"] = _propose(card["tasks"], features, rows.get("rows") or [])
-        body["ner"] = ner_part(body["proposed"], features, (rows.get("rows") or [])[:ROWS])
+        first = (rows.get("rows") or [])[:ROWS]
+        body["ner"] = ner_part(body["proposed"], features, first)
+        if body["ner"] and not body["ner"]["namesKnown"]:
+            body[NER_SOURCE] = {"features": features, "rows": [{"row": r.get("row") or {}} for r in first]}
     return body
 
 
@@ -221,15 +257,15 @@ def _all_bio(values):
     return any(_BIO.match(tag) for tag in tags) and all(tag == "O" or _BIO.match(tag) for tag in tags)
 
 
-def ner_part(proposed, features, rows):
+def ner_part(proposed, features, rows, tag_names=None):
     """The preview's `ner`: what the proposed NER columns hold, or None when
     the proposal is not NER. `rows` are the viewer's `{"row": {...}}` entries."""
     if proposed.get("taskType") != "ner":
         return None
-    return _ner_preview(features, rows, proposed["textColumn"], proposed["labelColumn"])
+    return _ner_preview(features, rows, proposed["textColumn"], proposed["labelColumn"], tag_names)
 
 
-def _ner_preview(features, rows, text_column, tag_column):
+def _ner_preview(features, rows, text_column, tag_column, tag_names=None):
     """What an NER dataset holds, read from its first rows (#180).
 
     `labels` are the tag names: a ClassLabel's names in order, or for string
@@ -247,7 +283,13 @@ def _ner_preview(features, rows, text_column, tag_column):
     list, or a different number of each) is left out and counted in
     `skippedRows`. `typesOnlyColumns` are the other columns whose values all
     read `TYPE: text` with TYPE one of `entityTypes`: entity types without
-    positions, which cannot be trained on."""
+    positions, which cannot be trained on.
+
+    `tag_names`, when the tags are numbers without names, are the student's
+    names for them (#180): item i names number i. The rows are converted with
+    them and `entityTypes` are their types, as the import will read them;
+    `labels` stay the numbers and `namesKnown` false, and `tagNames` echoes
+    them. Otherwise `tagNames` is null and they change nothing."""
     types = {f["name"]: f.get("type") for f in features}
     names = ner_module.class_label_names(types.get(tag_column))
     cells = [(r.get("row") or {}) for r in rows]
@@ -263,6 +305,9 @@ def _ner_preview(features, rows, text_column, tag_column):
             labels = (["O"] if "O" in strings else []) + [tag for tag in strings if tag != "O"]
         else:
             labels = [str(number) for number in numbers]
+    applied = None
+    if names is None and not names_known and tag_names:
+        names = applied = list(tag_names)
     converted, skipped = [], 0
     for cell in cells:
         tokens, tags = cell.get(text_column), cell.get(tag_column)
@@ -272,8 +317,8 @@ def _ner_preview(features, rows, text_column, tag_column):
         text, entities = ner_module.spans(tokens, tags, names)
         converted.append({"text": text, "entities": entities})
     counts = {}
-    if names_known:
-        for label in labels:
+    if names_known or applied:
+        for label in applied or labels:
             type_ = ner_module.entity_type(label)
             if type_ is not None:
                 counts.setdefault(type_, 0)
@@ -291,6 +336,7 @@ def _ner_preview(features, rows, text_column, tag_column):
         "rows": converted,
         "skippedRows": skipped,
         "typesOnlyColumns": [name for name in others if _types_only(name, cells, set(counts))],
+        "tagNames": applied,
     }
 
 

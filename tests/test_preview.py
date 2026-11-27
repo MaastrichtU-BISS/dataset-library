@@ -1,3 +1,7 @@
+import json
+
+import pytest
+
 from dataset_library.preview import _list_inner, _ner_preview, _propose
 from tests.conftest import ALICE
 
@@ -625,3 +629,117 @@ def test_a_preview_cached_before_the_ner_part_is_rebuilt_with_it(client, hub, ca
     cache.set(key, {k: v for k, v in cache.get(key).items() if k != "ner"}, 600)
 
     assert preview(client, "coastalcph/legal_ner")["ner"]["labels"][0] == "O"
+
+
+# Naming numbered tags (#180): a student names tner's numbers, and the preview reads them with those names.
+TNER_NAMES = ["O", "B-PER", "I-PER", "B-ORG", "I-ORG"]
+TNER_NER = {
+    "textColumn": "tokens",
+    "tagColumn": "tags",
+    "labels": ["0", "1", "2", "3"],
+    "namesKnown": False,
+    "entityTypes": [{"type": "PER", "count": 2}, {"type": "ORG", "count": 2}],
+    "rows": [
+        {"text": "John Smith works at ACME", "entities": [
+            {"text": "John Smith", "start": 0, "end": 10, "type": "PER"},
+            {"text": "ACME", "start": 20, "end": 24, "type": "ORG"},
+        ]},
+        {"text": "ACME sued Mary Jones", "entities": [
+            {"text": "ACME", "start": 0, "end": 4, "type": "ORG"},
+            {"text": "Mary Jones", "start": 10, "end": 20, "type": "PER"},
+        ]},
+    ],
+    "skippedRows": 0,
+    "typesOnlyColumns": [],
+    "tagNames": TNER_NAMES,
+}
+
+
+def test_tag_names_convert_numbered_tags_and_give_their_types():
+    features = _features(tokens=_sequence(_string()), tags=_sequence(_integer()), spans=_sequence(_string()))
+    rows = _rows(
+        {"tokens": ["Angela", "Merkel", "visited", "Paris"], "tags": [3, 4, 0, 1], "spans": ["PER: Angela Merkel"]},
+        {"tokens": ["Berlin"], "tags": [1], "spans": ["LOC: Berlin"]},
+    )
+    names = ["O", "B-LOC", "I-LOC", "B-PER", "I-PER"]
+
+    ner = _ner_preview(features, rows, "tokens", "tags", names)
+
+    assert ner["labels"] == ["0", "1", "3", "4"] and ner["namesKnown"] is False
+    assert ner["tagNames"] == names
+    # Types in the names' order, each counted over the converted rows.
+    assert ner["entityTypes"] == [{"type": "LOC", "count": 2}, {"type": "PER", "count": 1}]
+    assert ner["rows"] == [
+        {"text": "Angela Merkel visited Paris", "entities": [
+            {"text": "Angela Merkel", "start": 0, "end": 13, "type": "PER"},
+            {"text": "Paris", "start": 22, "end": 27, "type": "LOC"},
+        ]},
+        {"text": "Berlin", "entities": [{"text": "Berlin", "start": 0, "end": 6, "type": "LOC"}]},
+    ]
+    # With the types known, `spans` now reads as types without positions.
+    assert ner["typesOnlyColumns"] == ["spans"]
+
+
+def test_tag_names_change_nothing_for_tags_the_dataset_names():
+    features, rows = _wikiann()
+
+    named = _ner_preview(features, rows, "tokens", "ner_tags", ["O", "B-LOC"])
+
+    assert named == {**_ner_preview(features, rows, "tokens", "ner_tags"), "tagNames": None}
+    assert named["entityTypes"][0] == {"type": "PER", "count": 3}
+
+
+def test_a_preview_names_numbered_tags_without_touching_the_cached_preview(client, cache, tner):
+
+
+    plain = preview(client, tner)
+    assert plain["ner"]["tagNames"] is None and plain["ner"]["entityTypes"] == []
+    key = f"library:preview:{tner}::"
+    cached = json.dumps(cache.get(key), sort_keys=True)
+
+    named = preview(client, tner, tagNames=json.dumps(TNER_NAMES))
+
+    assert named["ner"] == TNER_NER
+    assert {k: v for k, v in named.items() if k != "ner"} == {k: v for k, v in plain.items() if k != "ner"}
+    # The cached body is as it was, and a preview without names reads it unchanged.
+    assert json.dumps(cache.get(key), sort_keys=True) == cached
+    assert preview(client, tner) == plain
+    # The raw rows the cache keeps for naming are never served.
+    assert "_nerSource" not in plain and "_nerSource" not in named
+
+
+def test_tag_names_are_applied_to_a_preview_cached_before_it_kept_its_raw_rows(client, cache, tner):
+
+
+    preview(client, tner)
+    key = f"library:preview:{tner}::"
+    cache.set(key, {k: v for k, v in cache.get(key).items() if k != "_nerSource"}, 600)
+
+    assert preview(client, tner, tagNames=json.dumps(TNER_NAMES))["ner"] == TNER_NER
+    assert "_nerSource" in cache.get(key)
+
+
+def test_tag_names_on_a_dataset_that_names_its_tags_are_ignored(client):
+
+
+    ner = preview(client, "coastalcph/legal_ner", tagNames=json.dumps(["O", "B-LOC"]))["ner"]
+
+    assert ner["tagNames"] is None
+    assert ner["entityTypes"] == [{"type": "PER", "count": 2}, {"type": "ORG", "count": 2}]
+
+
+@pytest.mark.parametrize("raw", [
+    '["O", ""]',  # an empty name
+    '["O", "PER"]',  # a type without a position prefix
+    '["O", "B-"]',  # a prefix without a type
+    '["O", 1]',  # not a string
+    '"O"',  # not a list
+    '[]',  # nothing named
+    'O,B-PER',  # not JSON
+    json.dumps(["O"] * 201),  # too many
+])
+def test_tag_names_that_are_not_a_list_of_tags_are_refused(client, tner, raw):
+    refused = preview(client, tner, status=400, tagNames=raw)
+
+    assert refused["code"] == "bad_tag_names"
+    assert refused["error"]

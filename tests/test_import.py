@@ -731,6 +731,75 @@ def test_tags_without_names_fail_before_any_row_is_read(run, tmp_path):
     assert not list((tmp_path / "data").glob("library-*.csv"))
 
 
+def test_numbered_tags_named_by_the_student_import_as_entity_spans(run, tmp_path):
+    """BAIGLE #180: tner's numbers, named in the import window, become entities."""
+    shard = write_tner_shard(
+        tmp_path / "0000.parquet",
+        [["John", "Smith", "works", "at", "ACME"], ["ACME", "sued", "Mary", "Jones"]],
+        [[1, 2, 0, 0, 3], [3, 0, 1, 2]],
+    )
+
+    result, create = run(
+        [shard], size=2, task_type="ner", text_column="tokens", label_column="tags",
+        citation={"title": "Legal NER", "tagNames": NER_NAMES},
+    )
+
+    assert result["status"] == "completed", result
+    assert entity_spans(create.calls[0]["rows"]) == {
+        "John Smith works at ACME": [
+            {"text": "John Smith", "start": 0, "end": 10, "type": "PER"},
+            {"text": "ACME", "start": 20, "end": 24, "type": "ORG"},
+        ],
+        "ACME sued Mary Jones": [
+            {"text": "ACME", "start": 0, "end": 4, "type": "ORG"},
+            {"text": "Mary Jones", "start": 10, "end": 20, "type": "PER"},
+        ],
+    }
+    check_entity_offsets(create.calls[0]["rows"])
+
+
+def test_numbered_tags_without_the_students_names_say_to_name_them(run, tmp_path):
+    shard = write_tner_shard(tmp_path / "0000.parquet", [["John", "Smith"]], [[1, 2]])
+
+    result, create = run([shard], size=1, task_type="ner", text_column="tokens", label_column="tags")
+
+    assert result["code"] == "no_entity_names"
+    assert result["error"] == imports.NO_ENTITY_NAMES
+    assert "Name each tag number in the import window" in result["error"]
+    assert create.calls == []
+
+
+def test_a_tag_number_the_students_names_leave_out_fails_the_import(run, tmp_path):
+    shard = write_tner_shard(
+        tmp_path / "0000.parquet", [["John", "Smith", "at", "ACME"], ["Mary"]], [[1, 2, 0, 3], [1]],
+    )
+
+    result, create = run(
+        [shard], size=2, task_type="ner", text_column="tokens", label_column="tags",
+        citation={"title": "Legal NER", "tagNames": ["O", "B-PER", "I-PER"]},
+    )
+
+    assert result["status"] == "failed"
+    assert result["code"] == "no_entity_names"
+    assert "tag 3 has no name" in result["error"] and "import window" in result["error"]
+    assert create.calls == []
+    assert not list((tmp_path / "data").glob("library-*.csv"))
+
+
+def test_the_datasets_own_tag_names_win_over_the_students(run, tmp_path):
+    shard = write_ner_shard(tmp_path / "0000.parquet", [["John", "Smith"]], [[1, 2]])
+
+    result, create = run(
+        [shard], size=1, task_type="ner", text_column="tokens", label_column="ner_tags",
+        citation={"title": "Legal NER", "tagNames": ["O", "B-LOC", "B-LOC"]},
+    )
+
+    assert result["status"] == "completed", result
+    assert entity_spans(create.calls[0]["rows"]) == {
+        "John Smith": [{"text": "John Smith", "start": 0, "end": 10, "type": "PER"}],
+    }
+
+
 def test_tags_with_an_empty_name_list_also_fail_before_any_row_is_read(run, tmp_path):
     shard = write_ner_shard(
         tmp_path / "0000.parquet", [["John", "Smith"]], [[0, 1]],

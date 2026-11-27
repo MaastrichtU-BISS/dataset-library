@@ -1,10 +1,13 @@
 """The HTTP API, under /api/library."""
+import json
+
 from flask import Blueprint, current_app, jsonify, request
 
 from . import admin as admin_module
 from . import community as community_module
 from . import imports as imports_module
 from . import labels as labels_module
+from . import ner as ner_module
 from . import legal_data_hunter as ldh_module
 from . import pins as pins_module
 from . import policy as policy_module
@@ -151,18 +154,20 @@ def labels():
 @library_bp.route("/datasets/huggingface/<path:dataset_ref>", methods=["GET"])
 def dataset(dataset_ref):
     """One dataset's facts, configs and first rows (`?config=&split=`). While Hugging
-    Face cannot be asked, the copy the platform keeps of this part stands in (#121)."""
+    Face cannot be asked, the copy the platform keeps of this part stands in (#121).
+    `?tagNames=` is a JSON list naming an NER dataset's numbered tags (#180)."""
     if not DATASET_ID_PATTERN.match(dataset_ref):
         raise ApiError(400, f"Not a Hugging Face dataset id: {dataset_ref}", "bad_id")
     config, split = request.args.get("config") or None, request.args.get("split") or None
+    tag_names = _tag_names_param()
     try:
-        body = preview_module.preview(_host(), dataset_ref, config, split)
+        body = preview_module.preview(_host(), dataset_ref, config, split, tag_names)
     except (preview_module.NotInLibrary, PrivateDataset):
         raise ApiError(404, "That dataset is not in the library.", "not_found")
     except preview_module.UnknownConfig:
         raise ApiError(400, "That dataset has no such configuration or split.", "bad_config")
     except ProviderError as down:
-        view = _copy_view(dataset_ref, config, split)
+        view = _copy_view(dataset_ref, config, split, tag_names)
         if view is not None:
             return view
         if isinstance(down, ProviderRateLimited):
@@ -170,7 +175,7 @@ def dataset(dataset_ref):
         raise ApiError(503, "Hugging Face is unavailable right now. Try again in a few minutes.", "provider_unavailable")
     if body.get(preview_module.VIEWER_DOWN):
         # The viewer did not answer: the copy of this part, when there is one, shows the rows (#121).
-        view = _copy_view(dataset_ref, config, split)
+        view = _copy_view(dataset_ref, config, split, tag_names)
         if view is not None:
             return view
     return jsonify(body)
@@ -192,12 +197,28 @@ def community_dataset(record_ref):
     return jsonify(body)
 
 
-def _copy_view(dataset_ref, config, split):
+def _tag_names_param():
+    """The `tagNames` query parameter: a JSON list of tag names, item i naming tag
+    number i (#180), or None when it is absent or empty. 400 when it is not one."""
+    raw = request.args.get("tagNames")
+    if raw is None or raw == "":
+        return None
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        value = None
+    problem = ner_module.tag_names_problem(value)
+    if problem:
+        raise ApiError(400, problem, "bad_tag_names")
+    return [name.strip() for name in value]
+
+
+def _copy_view(dataset_ref, config, split, tag_names=None):
     """The platform's copy of this part of the dataset as the page shows it, or None when
     there is no copy to show (#121). A copy whose license is now hidden is not in the library."""
     try:
         copy = snapshots_module.copy_for_offline(_host(), dataset_ref, config, split)
-        return None if copy is None else jsonify(snapshots_module.offline_detail(_host(), copy))
+        return None if copy is None else jsonify(snapshots_module.offline_detail(_host(), copy, tag_names=tag_names))
     except preview_module.LicenseHidden:
         raise ApiError(404, "That dataset is not in the library.", "not_found")
 

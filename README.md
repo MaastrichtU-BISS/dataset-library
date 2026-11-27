@@ -438,7 +438,16 @@ Admins only (404 `not_offered` without the seam):
   "type"}]}`), leaving out and counting in `skippedRows` any it cannot convert.
   Numbers without names have no types. `typesOnlyColumns` are the other
   columns whose values all read `TYPE: text` (WikiANN's `spans`): types without
-  positions, which cannot be trained on.
+  positions, which cannot be trained on. `tagNames` is null unless names were applied.
+  `?tagNames=` names numbers without names, as the import window lets a student
+  do: a JSON-encoded list where item i names tag number i, each `O` or a position
+  prefix and a type (`B-PER`, `I-PER`, at most 200), for example
+  `?tagNames=%5B%22O%22%2C%22B-PER%22%2C%22I-PER%22%5D` (`["O","B-PER","I-PER"]`).
+  When the tags are numbers without names, `ner` is then computed with them:
+  `rows` are converted with them, `entityTypes` are their types in their order,
+  `labels` stay the numbers, `namesKnown` stays `false` and `tagNames` echoes
+  them; otherwise they change nothing. The cached preview is never changed by
+  them. Not a list of such names → 400 `bad_tag_names`. An offline copy takes it too.
 - `GET /api/library/options` → the task, license and source filters, the
   license table (`level` is this platform's: `allow`, `warn` or `hide`; a
   provider's terms, such as `legal-data-hunter-terms`, and their group "Provider
@@ -472,14 +481,24 @@ Admins only (404 `not_offered` without the seam):
 
 - `POST /api/library/imports` with `{"dataset", "config", "split", "textColumn",
   "labelColumn", "size", "name"?, "taskType"?, "licenseAck"?, "revision"?,
-  "balance"?}` → 202 and the import,
+  "balance"?, "tagNames"?}` → 202 and the import,
   `queued`. The size is cut to the row cap (the admin's, else `max_rows()`).
   `balance` keeps the label proportions of the whole dataset; it defaults to
   `true` when a `labelColumn` is mapped and is always `false` without one. The
   same import (dataset, revision, mapping, size, balance) while one is queued
-  or running → 200 and that one, queued once. Refused before anything is
+  or running → 200 and that one, queued once. `tagNames` (#180), for an NER
+  import only, names tags that are numbers without names (tner's datasets): a
+  list where item i names tag number i, each `O` or a prefix and a type, as the
+  preview's `?tagNames=` takes them. It is kept on the import's `citation` as
+  `tagNames`, so the Dataset's provenance says the names came from the student,
+  and the worker reads the tags with it only when the files name none: the
+  dataset's own names win. Without it, or when a row holds a number it does not
+  name, such an import fails `no_entity_names`, saying to name the tags in the
+  import window. Other tag names are another import, and a retry keeps them.
+  Refused before anything is
   queued: 400 (`bad_id`, `bad_mapping`, `bad_size`, `bad_name`, `bad_task`,
-  `bad_config`, `bad_balance`), 403
+  `bad_config`, `bad_balance`, `bad_tag_names` for names that are not such a list or
+  for a task other than NER), 403
   (`license_hidden`), 404, 409
   (`gated`, `private` when the Hub's answer says the owner keeps it private
   (an anonymous 401/404 is `not_found`), `not_importable`, `needs_ack` for a license set to warn, `changed`

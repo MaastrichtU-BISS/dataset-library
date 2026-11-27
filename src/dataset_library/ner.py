@@ -15,6 +15,8 @@ PREFIX_SEPARATORS = ("-", "_")
 CONTINUES = frozenset("IM")
 # Tags some preprocessed sets put on sub-word or padding positions: not types.
 PLACEHOLDERS = frozenset({"x", "pad", "[pad]", "<pad>", "[cls]", "[sep]"})
+# The most tag numbers a student may name (BAIGLE #180); NER sets have tens.
+MAX_TAG_NAMES = 200
 
 
 def class_label_names(feature):
@@ -41,6 +43,28 @@ def entity_type(tag):
     ``S-``, …) stripped, or None for ``O``, an empty tag or a placeholder."""
     parsed = _parse(tag, None) if isinstance(tag, str) else None
     return parsed[1] if parsed else None
+
+
+def tag_names_problem(value):
+    """Why `value` cannot name a dataset's numbered tags, or None when it can.
+
+    A student names tags that are numbers without names (tner's datasets) in
+    the import window (BAIGLE #180): a list where item i names tag number i,
+    each ``O`` or a position prefix and a type that ``_parse`` reads, such as
+    ``B-PER`` or ``I-PER``, at most MAX_TAG_NAMES of them."""
+    if not isinstance(value, list) or not value:
+        return "Name the tags as a list, one name for each tag number."
+    if len(value) > MAX_TAG_NAMES:
+        return f"Name at most {MAX_TAG_NAMES} tags."
+    for number, name in enumerate(value):
+        if not isinstance(name, str) or not name.strip():
+            return f"Give tag {number} a name: O, or B- or I- followed by an entity type, like B-PER."
+        if name.strip().upper() == "O":
+            continue
+        parsed = _parse(name, None)
+        if parsed is None or parsed[0] is None:
+            return f"Tag {number}'s name {name!r} is not O, or B- or I- followed by an entity type, like B-PER."
+    return None
 
 
 def tokens_to_text(tokens):

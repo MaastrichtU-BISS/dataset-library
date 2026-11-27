@@ -27,6 +27,22 @@ While the version is 0.x, minor releases may contain breaking changes.
   cached without `ner` is rebuilt.
 - `ner.class_label_names` (moved from the import, which reads names through it as before) and
   `ner.entity_type`, so the preview and the import read tag names the same way.
+- Naming numbered tags (BAIGLE #180): an NER dataset whose tags are numbers without names, such
+  as tner's, now imports once the student names each number `O`, `B-<TYPE>` or `I-<TYPE>`.
+  `POST /api/library/imports` takes `tagNames` (a list, item i naming tag number i, at most 200,
+  NER only; else 400 `bad_tag_names`), keeps it on the import's `citation` as `tagNames`, so the
+  provenance shows the names came from the student, and keeps it on a retry; the worker reads the
+  tags with it only when the files name none. The preview takes `?tagNames=` as a JSON-encoded
+  list and computes `ner` with it (`rows`, `entityTypes`; `labels` stay the numbers, `namesKnown`
+  false) and echoes it as `ner.tagNames`, null otherwise. The cached body is never changed by it:
+  a preview of such tags keeps its raw first rows in the cache, unserved, to apply names to, and
+  one cached without them is rebuilt. `ner.tag_names_problem` checks a list of names.
+
+### Changed
+
+- `no_entity_names` now says to name the tag numbers in the import window; it still fails an
+  import of numbers without names when no `tagNames` are given, or when a row holds a number they
+  do not name.
 
 ## [0.18.0] - 2026-11-25
 

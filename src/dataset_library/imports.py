@@ -45,7 +45,7 @@ from .errors import NotParquet, ProviderError
 from .licenses import LICENSES, UNKNOWN, resolve_license
 from .limits import import_cap_bytes
 from .models import LibraryImport
-from .ner import class_label_names, spans, tokens_to_text
+from .ner import class_label_names, spans, tag_names_problem, tokens_to_text
 from .providers import community as community_provider
 from .providers import legal_data_hunter as ldh_provider
 
@@ -99,7 +99,13 @@ NESTED_NER = (
 )
 NO_ENTITY_NAMES = (
     "We can't read entity names: this dataset's tags are numbers without names, "
-    "so they can't become entity types."
+    "so they can't become entity types. Name each tag number in the import window "
+    "(for example 1 as B-PER and 2 as I-PER), then import it again."
+)
+# A tag number the student's names (#180) leave out.
+UNNAMED_TAG = (
+    "We can't read entity names: tag {number} has no name. Name every tag number "
+    "in the import window, then import it again."
 )
 # How much of a dataset an import may download before it samples.
 MAX_FETCH_BYTES = 200_000_000
@@ -228,6 +234,7 @@ def start(host, owner_id, body, *, ack_at=None, pin=None):
     from .providers.huggingface import DATASET_ID_PATTERN, PrivateDataset
 
     provider = body.get("provider") or HUGGING_FACE
+    tag_names = _requested_tag_names(body, provider)
     if provider == LEGAL_DATA_HUNTER:
         from . import legal_data_hunter  # lazy: it imports this module
 
@@ -302,9 +309,18 @@ def start(host, owner_id, body, *, ack_at=None, pin=None):
     if seen_revision and dataset.get("revision") and seen_revision != dataset["revision"]:
         raise Refused(409, "changed", community_provider.CHANGED if provider == COMMUNITY else CHANGED)
 
+    citation = _pinned(dataset.get("citation"), None if provider == COMMUNITY else dataset.get("revision"), _now())
+    if tag_names is not None:
+        if citation is None:
+            # Only a platform copy of a pin made before citations has none (#120, #121).
+            raise Refused(409, "bad_tag_names", "This copy of the dataset can't keep tag names. Try again once Hugging Face is back.")
+        # The student's names for the numbered tags ride on the citation, so the Dataset's provenance says where
+        # its entity types came from (#180).
+        citation = {**citation, "tagNames": tag_names}
+
     session = host.db.session
     cap = host.row_cap()
-    running = (
+    candidates = (
         session.query(LibraryImport)
         .filter(
             LibraryImport.owner_id == owner_id,
@@ -321,8 +337,10 @@ def start(host, owner_id, body, *, ack_at=None, pin=None):
             LibraryImport.status.in_(RUNNING),
         )
         .order_by(LibraryImport.created_at.desc())
-        .first()
+        .all()
     )
+    # Other tag names are another import.
+    running = next((r for r in candidates if tag_names_of(r) == tag_names), None)
     if running is not None:
         _log(running, "repeated")
         return running.to_dict(), False
@@ -335,7 +353,7 @@ def start(host, owner_id, body, *, ack_at=None, pin=None):
         sample_size=min(size, cap), max_rows=cap, balance=balance,
         name=name or (dataset["title"] if not earlier else f"{dataset['title']} ({earlier + 1})"),
         # A Community citation names its DOI, not a revision: Zenodo gives each version a DOI of its own (#122).
-        citation=_pinned(dataset.get("citation"), None if provider == COMMUNITY else dataset.get("revision"), _now()),
+        citation=citation,
         source=_source(provider, copy),
         snapshot_id=None if copy is None else copy.id,
         # The Publication, origin and file this import is bound to, so a queued import checks them again (#122).
@@ -349,6 +367,25 @@ def start(host, owner_id, body, *, ack_at=None, pin=None):
     _log(record, QUEUED, size=record.sample_size)
     _enqueue(host, record)
     return record.to_dict(), True
+
+
+def _requested_tag_names(body, provider):
+    """The body's `tagNames`, checked: the student's names for an NER dataset's
+    numbered tags, item i naming tag number i (#180), or None when not sent."""
+    value = body.get("tagNames")
+    if value is None:
+        return None
+    if provider == LEGAL_DATA_HUNTER or (body.get("taskType") or "classification") not in NER_TASKS:
+        raise Refused(400, "bad_tag_names", "Tags can only be named for an NER dataset's tag column.")
+    problem = tag_names_problem(value)
+    if problem:
+        raise Refused(400, "bad_tag_names", problem)
+    return [name.strip() for name in value]
+
+
+def tag_names_of(record):
+    """The names the student gave the import's numbered NER tags (#180), or None."""
+    return (record.citation or {}).get("tagNames")
 
 
 def _enqueue(host, record, restore=None):
@@ -590,6 +627,7 @@ def retry(host, owner_id, import_ref):
         "balance": record.balance,
         "name": record.name,
         "licenseAck": record.license_ack_at is not None,
+        "tagNames": tag_names_of(record),
     }
     if record.provider == LEGAL_DATA_HUNTER:
         # Try again keeps the documents it was started with and resumes after those it fetched (#126, L12). It claims
@@ -1057,6 +1095,21 @@ def _label_names(parquet_file, column):
     return class_label_names(features.get(column) or {})
 
 
+class _StudentTagNames(list):
+    """Tag names the student gave (#180), not the files: every number met must have one."""
+
+
+def _tag_names(record, parquet_file, column):
+    """The names for `column`'s numbered labels: the file's own, or for an NER
+    import whose files name none, the student's (#180). The dataset's own names
+    always win."""
+    names = _label_names(parquet_file, column)
+    if names or record.task_type not in NER_TASKS:
+        return names
+    given = tag_names_of(record)
+    return _StudentTagNames(given) if given else names
+
+
 def _refuse_numbered_ner_tags(record, files):
     """Fail before any row is read when NER columns cannot become words and
     entity types: records, maps, lists of those or of lists, or numbered tags
@@ -1073,7 +1126,8 @@ def _refuse_numbered_ner_tags(record, files):
         # A text that is already a string gets blank entities (its tags have
         # no tokens to sit on), so its tags' names do not matter.
         text_is_tokens = record.text_column in schema.names and _is_list(schema.field(record.text_column).type)
-        if text_is_tokens and _integer_list(schema.field(record.label_column).type) and not _label_names(parquet_file, record.label_column):
+        named = _tag_names(record, parquet_file, record.label_column)
+        if text_is_tokens and _integer_list(schema.field(record.label_column).type) and not named:
             raise ImportFailed("no_entity_names", NO_ENTITY_NAMES)
 
 
@@ -1137,7 +1191,7 @@ def _sample_random(record, files, rng):
     one with empty text."""
     groups, total = _groups(files)
     columns = [record.text_column] + ([record.label_column] if record.label_column else [])
-    names = [_label_names(f, record.label_column) if record.label_column else None for f in files]
+    names = [_tag_names(record, f, record.label_column) if record.label_column else None for f in files]
     needs_summary = record.task_type == "summarization" and record.label_column is not None
 
     want = min(record.sample_size, total)
@@ -1409,6 +1463,10 @@ def _mapped(values, names, task_type="classification"):
             return [text, ""]
         if _numbered(label) and not names:
             raise ImportFailed("no_entity_names", NO_ENTITY_NAMES)
+        if isinstance(names, _StudentTagNames):
+            for tag in label:
+                if isinstance(tag, int) and not isinstance(tag, bool) and not 0 <= tag < len(names):
+                    raise ImportFailed("no_entity_names", UNNAMED_TAG.format(number=tag))
         text, found = spans(values[0], label, names)
         return [text, json.dumps(found, ensure_ascii=False)]
     if names and isinstance(label, int) and 0 <= label < len(names):

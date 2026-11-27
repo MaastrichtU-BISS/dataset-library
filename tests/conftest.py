@@ -220,3 +220,37 @@ def client(app):
 
 ALICE = {"X-User": "alice"}
 ADMIN = {"X-User": "ada", "X-Admin": "yes"}
+
+
+# A tner-like dataset (BAIGLE #180): tokens and numbered tags with no names, so a
+# student names them. Added per test, so searches over the recorded Hub see none of it.
+TNER_ID = "coastalcph/legal_ner_numbered"
+TNER_ROWS = [
+    {"tokens": ["John", "Smith", "works", "at", "ACME"], "tags": [1, 2, 0, 0, 3]},
+    {"tokens": ["ACME", "sued", "Mary", "Jones"], "tags": [3, 0, 1, 2]},
+]
+
+
+@pytest.fixture
+def tner(hub, monkeypatch):
+    legal_ner = HUB_DATASETS["coastalcph/legal_ner"]["body"]
+    monkeypatch.setitem(HUB_DATASETS, TNER_ID, {"status": 200, "body": {
+        **legal_ner, "id": TNER_ID, "sha": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+        "cardData": {"pretty_name": "Legal NER, numbered", "license": "cc-by-4.0"},
+    }})
+    monkeypatch.setitem(VIEWER, f"splits?dataset={TNER_ID}", {"status": 200, "body": {
+        "splits": [{"dataset": TNER_ID, "config": "default", "split": "train"}],
+    }})
+    monkeypatch.setitem(VIEWER, f"info?dataset={TNER_ID}&config=default", {"status": 200, "body": {
+        "dataset_info": {"splits": {"train": {"name": "train", "num_examples": 2}}, "config_name": "default"},
+        "partial": False,
+    }})
+    monkeypatch.setitem(VIEWER, f"first-rows?dataset={TNER_ID}&config=default&split=train", {"status": 200, "body": {
+        "dataset": TNER_ID, "config": "default", "split": "train",
+        "features": [
+            {"feature_idx": 0, "name": "tokens", "type": {"_type": "Sequence", "feature": {"dtype": "string", "_type": "Value"}}},
+            {"feature_idx": 1, "name": "tags", "type": {"_type": "Sequence", "feature": {"dtype": "int64", "_type": "Value"}}},
+        ],
+        "rows": [{"row_idx": index, "row": row, "truncated_cells": []} for index, row in enumerate(TNER_ROWS)],
+    }})
+    return TNER_ID

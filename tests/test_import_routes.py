@@ -481,3 +481,64 @@ def test_a_dataset_the_hub_moved_to_an_owner_outside_the_library_is_not_found(ma
 
     assert refused["code"] == "not_found"
     assert queue.refs == []
+
+
+# Naming numbered tags (BAIGLE #180): the student's names travel with the import.
+TNER_NAMES = ["O", "B-PER", "I-PER", "B-ORG", "I-ORG"]
+
+
+def tner_body(tner, **body):
+    return {"dataset": tner, "config": None, "split": None, "textColumn": "tokens", "labelColumn": "tags",
+            "taskType": "ner", "size": 2, **body}
+
+
+def stored_citation(client, ref):
+    from dataset_library.models import LibraryImport
+
+    with client.application.app_context():
+        return client.application.db.session.get(LibraryImport, ref).citation
+
+
+def test_an_ner_import_keeps_the_students_tag_names_on_its_citation(client, queue, tner):
+    started = start(client, **tner_body(tner, tagNames=[" O", "B-PER ", "I-PER", "B-ORG", "I-ORG"]))
+
+    citation = stored_citation(client, started["id"])
+    assert citation["tagNames"] == TNER_NAMES  # trimmed
+    assert citation["title"] == "Legal NER, numbered"
+    assert queue.refs == [started["id"]]
+
+
+def test_other_tag_names_are_another_import_and_a_retry_keeps_them(client, queue, tner):
+    first = start(client, **tner_body(tner, tagNames=TNER_NAMES))
+    assert start(client, status=200, **tner_body(tner, tagNames=TNER_NAMES))["id"] == first["id"]
+    other = start(client, **tner_body(tner, tagNames=["O", "B-LOC", "I-LOC", "B-ORG", "I-ORG"]))
+    assert other["id"] != first["id"]
+    assert start(client, **tner_body(tner))["id"] not in (first["id"], other["id"])
+
+    set_import(client, first["id"], status="failed", error_code="provider_busy")
+    retried = client.post(f"/api/library/imports/{first['id']}/retry", headers=ALICE).get_json()
+
+    assert stored_citation(client, retried["id"])["tagNames"] == TNER_NAMES
+
+
+@pytest.mark.parametrize("tag_names", [
+    [""],  # an empty name
+    ["O", "PER"],  # not a tag: no position prefix
+    ["O", None],  # not a string
+    "O, B-PER",  # not a list
+    [],  # nothing named
+    ["O"] * 201,  # too many
+])
+def test_tag_names_that_are_not_a_list_of_tags_refuse_the_import(client, queue, tner, tag_names):
+    refused = start(client, status=400, **tner_body(tner, tagNames=tag_names))
+
+    assert refused["code"] == "bad_tag_names"
+    assert refused["error"]
+    assert queue.refs == []
+
+
+def test_tag_names_are_only_for_an_ner_import(client, queue):
+    refused = start(client, status=400, tagNames=TNER_NAMES)
+
+    assert refused["code"] == "bad_tag_names"
+    assert queue.refs == []
