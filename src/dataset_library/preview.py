@@ -3,6 +3,7 @@ import json
 import re
 
 from . import labels as labels_module
+from . import ner as ner_module
 from . import policy as policy_module
 from .licenses import LICENSES, UNKNOWN
 from .providers import huggingface, viewer
@@ -32,6 +33,9 @@ SUMMARY_TEXT_COLUMNS = (
 # answers and translations.
 SUMMARY_LABEL_COLUMNS = ("summary", "highlights", "abstract")
 LIST_TYPES = ("Sequence", "List", "LargeList")
+# A readable copy of a row's entities without positions, as WikiANN's `spans`
+# column holds them: "PER: Ibrahim". The type is checked against the dataset's own.
+_TYPED_TEXT = re.compile(r"^([^\s:]+): \S")
 # A BIO-style tag: a position letter, a separator, then the entity type.
 _BIO = re.compile(r"^[BIESLU][-_].")
 INTEGER_DTYPES = ("int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64")
@@ -61,9 +65,10 @@ def preview(host, external_id, config=None, split=None):
         raise NotInLibrary()
     key = f"library:preview:{external_id}:{config or ''}:{split or ''}"
     body = host.cache.get(key)
-    # A body cached before citations (#120) has no citation: rebuild it, so an
-    # import started right after the deploy still gets one.
-    if not isinstance(body, dict) or "citation" not in body:
+    # A body cached before citations (#120) has no citation, and one cached before
+    # the NER preview (#180) no `ner`: rebuild it, so an import started right after
+    # the deploy still gets both.
+    if not isinstance(body, dict) or "citation" not in body or "ner" not in body:
         body = _build(host, external_id, config, split)
         # A preview built while the viewer was down is not kept: the next open asks again.
         if not body.get(VIEWER_DOWN):
@@ -105,6 +110,7 @@ def _build(host, external_id, config, split):
         **card,
         "preview": "unavailable", "configs": [], "config": None, "split": None,
         "columns": [], "rows": [], "rowCount": None, "proposed": _no_proposal(),
+        "ner": None,
     }
     body["labels"] = labels_module.for_ids(host.cache, [external_id])[external_id]
     try:
@@ -144,6 +150,7 @@ def _build(host, external_id, config, split):
     body["preview"] = "ok" if body["rows"] else "unavailable"
     if body["preview"] == "ok":
         body["proposed"] = _propose(card["tasks"], features, rows.get("rows") or [])
+        body["ner"] = ner_part(body["proposed"], features, (rows.get("rows") or [])[:ROWS])
     return body
 
 
@@ -212,6 +219,101 @@ def _entity_tags(name, feature, rows):
 def _all_bio(values):
     tags = [value for value in values if isinstance(value, str) and value.strip()]
     return any(_BIO.match(tag) for tag in tags) and all(tag == "O" or _BIO.match(tag) for tag in tags)
+
+
+def ner_part(proposed, features, rows):
+    """The preview's `ner`: what the proposed NER columns hold, or None when
+    the proposal is not NER. `rows` are the viewer's `{"row": {...}}` entries."""
+    if proposed.get("taskType") != "ner":
+        return None
+    return _ner_preview(features, rows, proposed["textColumn"], proposed["labelColumn"])
+
+
+def _ner_preview(features, rows, text_column, tag_column):
+    """What an NER dataset holds, read from its first rows (#180).
+
+    `labels` are the tag names: a ClassLabel's names in order, or for string
+    tags the distinct tags in these rows, `O` first and the rest as first seen,
+    or for numbers without names the distinct numbers as strings, sorted, with
+    `namesKnown` false. `entityTypes` are the types in `labels` with their
+    position prefix stripped and `O` left out, in that order, each with the
+    number of spans of it across `rows` (0 when none shows). Numbers without
+    names have no types: `ner.spans` cannot read a number it has no name for
+    and leaves it outside, as the import refuses such tags, so `entityTypes` is
+    empty and every row has no entities.
+
+    `rows` are these rows as the import converts them (`ner.spans`): the text
+    and its entities. A row it cannot convert (tokens or tags missing or not a
+    list, or a different number of each) is left out and counted in
+    `skippedRows`. `typesOnlyColumns` are the other columns whose values all
+    read `TYPE: text` with TYPE one of `entityTypes`: entity types without
+    positions, which cannot be trained on."""
+    types = {f["name"]: f.get("type") for f in features}
+    names = ner_module.class_label_names(types.get(tag_column))
+    cells = [(r.get("row") or {}) for r in rows]
+    tag_lists = [cell.get(tag_column) for cell in cells if isinstance(cell.get(tag_column), list)]
+    if names is not None:
+        labels, names_known = [str(name) for name in names], True
+    else:
+        seen = [tag for tags in tag_lists for tag in tags]
+        numbers = sorted({tag for tag in seen if isinstance(tag, int) and not isinstance(tag, bool)})
+        strings = list(dict.fromkeys(tag for tag in seen if isinstance(tag, str)))
+        names_known = not (_is_integer(_list_inner(types.get(tag_column))) or (numbers and not strings))
+        if names_known:
+            labels = (["O"] if "O" in strings else []) + [tag for tag in strings if tag != "O"]
+        else:
+            labels = [str(number) for number in numbers]
+    converted, skipped = [], 0
+    for cell in cells:
+        tokens, tags = cell.get(text_column), cell.get(tag_column)
+        if not isinstance(tokens, list) or not isinstance(tags, list) or len(tokens) != len(tags):
+            skipped += 1
+            continue
+        text, entities = ner_module.spans(tokens, tags, names)
+        converted.append({"text": text, "entities": entities})
+    counts = {}
+    if names_known:
+        for label in labels:
+            type_ = ner_module.entity_type(label)
+            if type_ is not None:
+                counts.setdefault(type_, 0)
+    for row in converted:
+        for entity in row["entities"]:
+            counts[entity["type"]] = counts.get(entity["type"], 0) + 1
+    entity_types = [{"type": type_, "count": count} for type_, count in counts.items()]
+    others = [name for name in types if name not in (text_column, tag_column)]
+    return {
+        "textColumn": text_column,
+        "tagColumn": tag_column,
+        "labels": labels,
+        "namesKnown": names_known,
+        "entityTypes": entity_types,
+        "rows": converted,
+        "skippedRows": skipped,
+        "typesOnlyColumns": [name for name in others if _types_only(name, cells, set(counts))],
+    }
+
+
+def _types_only(name, cells, entity_types):
+    """Whether every value of `name` in these rows is a string, or a list of
+    strings, reading `TYPE: text` with TYPE an entity type, at least one of them."""
+    values = []
+    for cell in cells:
+        value = cell.get(name)
+        if isinstance(value, str):
+            values.append(value)
+        elif isinstance(value, list) and all(isinstance(item, str) for item in value):
+            values.extend(value)
+        elif value is not None:
+            return False
+    values = [value for value in values if value.strip()]
+    if not values or not entity_types:
+        return False
+    for value in values:
+        match = _TYPED_TEXT.match(value.strip())
+        if not match or match.group(1) not in entity_types:
+            return False
+    return True
 
 
 def _first_text(named, preferred, exclude=None):

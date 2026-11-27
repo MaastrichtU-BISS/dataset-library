@@ -1,4 +1,4 @@
-from dataset_library.preview import _list_inner, _propose
+from dataset_library.preview import _list_inner, _ner_preview, _propose
 from tests.conftest import ALICE
 
 NOTHING = {"taskType": None, "textColumn": None, "labelColumn": None}
@@ -465,3 +465,163 @@ def test_a_generic_target_or_output_is_not_a_summary():
     ]
 
     assert _propose(["summarization"], features, []) == NOTHING
+
+
+# The NER preview (#180): what an NER dataset's tags mean, before columns are picked.
+WIKIANN_NAMES = ["O", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC"]
+
+
+def _features(**types):
+    return [{"name": name, "type": type_} for name, type_ in types.items()]
+
+
+def _rows(*cells):
+    return [{"row_idx": index, "row": cell} for index, cell in enumerate(cells)]
+
+
+def _wikiann():
+    features = _features(
+        tokens=_sequence(_string()), ner_tags=_sequence(_class_label(WIKIANN_NAMES)),
+        langs=_sequence(_string()), spans=_sequence(_string()), note=_string(),
+    )
+    rows = _rows(
+        {"tokens": ["Angela", "Merkel", "visited", "Paris", "."], "ner_tags": [1, 2, 0, 5, 0],
+         "langs": ["en"] * 5, "spans": ["PER: Angela Merkel", "LOC: Paris"], "note": "Note: a state visit"},
+        {"tokens": ["Ibrahim", "joined", "Acme", "Corp", "in", "Berlin"], "ner_tags": [1, 0, 3, 4, 0, 5],
+         "langs": ["en"] * 6, "spans": ["PER: Ibrahim", "ORG: Acme Corp", "LOC: Berlin"], "note": "plain text"},
+        {"tokens": ["Rome", "and", "Bob"], "ner_tags": [5, 0, 1],
+         "langs": ["en"] * 3, "spans": ["LOC: Rome", "PER: Bob"], "note": ""},
+    )
+    return features, rows
+
+
+def test_a_class_label_ner_preview_names_its_tags_types_and_rows():
+    features, rows = _wikiann()
+
+    ner = _ner_preview(features, rows, "tokens", "ner_tags")
+
+    assert ner["textColumn"] == "tokens" and ner["tagColumn"] == "ner_tags"
+    assert ner["labels"] == WIKIANN_NAMES
+    assert ner["namesKnown"] is True
+    assert ner["entityTypes"] == [{"type": "PER", "count": 3}, {"type": "ORG", "count": 1}, {"type": "LOC", "count": 3}]
+    assert ner["rows"][0] == {
+        "text": "Angela Merkel visited Paris .",
+        "entities": [
+            {"text": "Angela Merkel", "start": 0, "end": 13, "type": "PER"},
+            {"text": "Paris", "start": 22, "end": 27, "type": "LOC"},
+        ],
+    }
+    assert ner["rows"][1]["entities"][1] == {"text": "Acme Corp", "start": 15, "end": 24, "type": "ORG"}
+    assert len(ner["rows"]) == 3 and ner["skippedRows"] == 0
+    # `spans` repeats the entities without positions; `langs` and a "Note: …" text column do not.
+    assert ner["typesOnlyColumns"] == ["spans"]
+
+
+def test_a_type_with_no_span_in_the_preview_still_shows_with_none():
+    features, rows = _wikiann()
+
+    ner = _ner_preview(features, rows[:1], "tokens", "ner_tags")
+
+    assert ner["entityTypes"] == [{"type": "PER", "count": 1}, {"type": "ORG", "count": 0}, {"type": "LOC", "count": 1}]
+
+
+def test_string_tags_are_their_own_labels_with_o_first():
+    features = _features(tokens=_sequence(_string()), ner_tags=_sequence(_string()))
+    rows = _rows(
+        {"tokens": ["The", "Court", "of", "Justice", "ruled"], "ner_tags": ["B-ORG", "I-ORG", "I-ORG", "I-ORG", "O"]},
+        {"tokens": ["Judge", "Smith", "said"], "ner_tags": ["O", "S-PER", "O"]},
+    )
+
+    ner = _ner_preview(features, rows, "tokens", "ner_tags")
+
+    assert ner["labels"] == ["O", "B-ORG", "I-ORG", "S-PER"]
+    assert ner["namesKnown"] is True
+    assert ner["entityTypes"] == [{"type": "ORG", "count": 1}, {"type": "PER", "count": 1}]
+    assert ner["rows"][0]["entities"] == [{"text": "The Court of Justice", "start": 0, "end": 20, "type": "ORG"}]
+    assert ner["rows"][1]["entities"] == [{"text": "Smith", "start": 6, "end": 11, "type": "PER"}]
+    assert ner["typesOnlyColumns"] == []
+
+
+def test_numbered_tags_without_names_are_not_known_and_have_no_types():
+    features = _features(tokens=_sequence(_string()), tags=_sequence(_integer()), spans=_sequence(_string()))
+    rows = _rows(
+        {"tokens": ["Angela", "Merkel", "visited", "Paris"], "tags": [3, 4, 0, 1], "spans": ["PER: Angela Merkel"]},
+        {"tokens": ["Berlin"], "tags": [1], "spans": ["LOC: Berlin"]},
+    )
+
+    ner = _ner_preview(features, rows, "tokens", "tags")
+
+    assert ner["labels"] == ["0", "1", "3", "4"]
+    assert ner["namesKnown"] is False
+    # ner.spans cannot read a number without a name, so nothing becomes an entity type.
+    assert ner["entityTypes"] == []
+    assert ner["rows"] == [
+        {"text": "Angela Merkel visited Paris", "entities": []},
+        {"text": "Berlin", "entities": []},
+    ]
+    # With no known types, nothing reads as a types-only column either.
+    assert ner["typesOnlyColumns"] == []
+
+
+def test_a_row_that_cannot_be_converted_is_left_out_and_counted():
+    features, rows = _wikiann()
+    rows[1]["row"]["ner_tags"] = [1, 0]  # fewer tags than tokens
+    rows.append({"row_idx": 3, "row": {"tokens": None, "ner_tags": [0]}})  # a missing value
+
+    ner = _ner_preview(features, rows, "tokens", "ner_tags")
+
+    assert [row["text"] for row in ner["rows"]] == ["Angela Merkel visited Paris .", "Rome and Bob"]
+    assert ner["skippedRows"] == 2
+    assert ner["entityTypes"] == [{"type": "PER", "count": 2}, {"type": "ORG", "count": 0}, {"type": "LOC", "count": 2}]
+
+
+def test_a_types_only_column_needs_every_value_to_name_a_known_type():
+    features, rows = _wikiann()
+    rows[2]["row"]["spans"] = ["LOC: Rome", "Plain words"]
+
+    ner = _ner_preview(features, rows, "tokens", "ner_tags")
+
+    assert ner["typesOnlyColumns"] == []
+
+
+def test_a_types_only_string_column_is_flagged_too():
+    features, rows = _wikiann()
+    features.append({"name": "summary", "type": _string()})
+    for row in rows:
+        row["row"]["summary"] = row["row"]["spans"][0]
+
+    ner = _ner_preview(features, rows, "tokens", "ner_tags")
+
+    assert ner["typesOnlyColumns"] == ["spans", "summary"]
+
+
+def test_an_ner_preview_carries_its_tags_through_the_route(client):
+    body = preview(client, "coastalcph/legal_ner")
+
+    ner = body["ner"]
+    assert ner["labels"] == ["O", "B-PER", "I-PER", "B-ORG", "I-ORG"]
+    assert ner["namesKnown"] is True
+    assert ner["entityTypes"] == [{"type": "PER", "count": 2}, {"type": "ORG", "count": 2}]
+    assert ner["rows"][0] == {
+        "text": "John Smith works at ACME",
+        "entities": [
+            # The recorded tags are [O, B-PER, I-PER, O, B-ORG]: the span is what they say.
+            {"text": "Smith works", "start": 5, "end": 16, "type": "PER"},
+            {"text": "ACME", "start": 20, "end": 24, "type": "ORG"},
+        ],
+    }
+    assert ner["skippedRows"] == 0 and ner["typesOnlyColumns"] == []
+
+
+def test_a_preview_that_is_not_ner_has_no_ner_part(client):
+    assert preview(client, "AI-team-UoA/greek_legal_code")["ner"] is None
+    assert preview(client, "coastalcph/legal_summaries")["ner"] is None
+    assert preview(client, "jfrenz/legalglue")["ner"] is None
+
+
+def test_a_preview_cached_before_the_ner_part_is_rebuilt_with_it(client, hub, cache):
+    preview(client, "coastalcph/legal_ner")
+    key = "library:preview:coastalcph/legal_ner::"
+    cache.set(key, {k: v for k, v in cache.get(key).items() if k != "ner"}, 600)
+
+    assert preview(client, "coastalcph/legal_ner")["ner"]["labels"][0] == "O"

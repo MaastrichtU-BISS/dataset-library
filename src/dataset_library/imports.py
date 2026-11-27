@@ -45,7 +45,7 @@ from .errors import NotParquet, ProviderError
 from .licenses import LICENSES, UNKNOWN, resolve_license
 from .limits import import_cap_bytes
 from .models import LibraryImport
-from .ner import spans, tokens_to_text
+from .ner import class_label_names, spans, tokens_to_text
 from .providers import community as community_provider
 from .providers import legal_data_hunter as ldh_provider
 
@@ -1054,24 +1054,7 @@ def _label_names(parquet_file, column):
         return None
     if not isinstance(features, dict):
         return None
-    return _class_label_names(features.get(column) or {})
-
-
-def _class_label_names(feature):
-    """Names from a ClassLabel, or from the ClassLabel inside a Sequence."""
-    if isinstance(feature, list):
-        for item in feature:
-            names = _class_label_names(item)
-            if names is not None:
-                return names
-        return None
-    if not isinstance(feature, dict):
-        return None
-    if feature.get("_type") == "ClassLabel":
-        return feature.get("names")
-    if feature.get("_type") in ("Sequence", "List", "LargeList"):
-        return _class_label_names(feature.get("feature"))
-    return None
+    return class_label_names(features.get(column) or {})
 
 
 def _refuse_numbered_ner_tags(record, files):

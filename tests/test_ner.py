@@ -282,3 +282,22 @@ def test_lowercase_prefixes_and_outside_tags_are_read():
 def test_bert_special_tokens_are_not_types():
     for tag in ("[CLS]", "[SEP]"):
         assert spans(["a"], [tag])[1] == []
+
+
+def test_an_entity_type_is_its_tag_without_the_position():
+    from dataset_library.ner import entity_type
+
+    assert [entity_type(tag) for tag in ["B-PER", "I-ORG", "E-LOC", "S-MISC", "U_DATE", "LAW"]] == [
+        "PER", "ORG", "LOC", "MISC", "DATE", "LAW",
+    ]
+    assert [entity_type(tag) for tag in ["O", "", "X", "[PAD]", 3, None]] == [None] * 6
+
+
+def test_class_label_names_are_read_from_the_label_or_its_sequence():
+    from dataset_library.ner import class_label_names
+
+    label = {"_type": "ClassLabel", "names": NAMES}
+    assert class_label_names(label) == NAMES
+    assert class_label_names({"_type": "Sequence", "feature": label}) == NAMES
+    assert class_label_names([label]) == NAMES
+    assert class_label_names({"_type": "Sequence", "feature": {"_type": "Value", "dtype": "int64"}}) is None

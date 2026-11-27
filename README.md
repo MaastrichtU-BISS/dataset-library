@@ -428,6 +428,17 @@ Admins only (404 `not_offered` without the seam):
 - `GET /api/library/datasets/huggingface/<org>/<name>?config=&split=` → the
   card plus `configs`, `config`, `split`, `columns`, the first `rows`, `labels`
   `rowCount` (the split's size, when known) and `preview: "ok" | "unavailable"`.
+  `ner` (#180) is null unless `proposed.taskType` is `"ner"`; then it is
+  `{"textColumn", "tagColumn", "labels", "namesKnown", "entityTypes", "rows",
+  "skippedRows", "typesOnlyColumns"}`. `labels` are the tag names (a ClassLabel's,
+  else the tag strings in the first rows with `O` first, else the numbers as
+  strings with `namesKnown: false`); `entityTypes` are `{"type", "count"}` in
+  label order, counting spans across `rows`, which are the first rows as the
+  import converts them (`{"text", "entities": [{"text", "start", "end",
+  "type"}]}`), leaving out and counting in `skippedRows` any it cannot convert.
+  Numbers without names have no types. `typesOnlyColumns` are the other
+  columns whose values all read `TYPE: text` (WikiANN's `spans`): types without
+  positions, which cannot be trained on.
 - `GET /api/library/options` → the task, license and source filters, the
   license table (`level` is this platform's: `allow`, `warn` or `hide`; a
   provider's terms, such as `legal-data-hunter-terms`, and their group "Provider

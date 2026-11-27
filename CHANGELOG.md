@@ -8,6 +8,26 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-27
+
+### Added
+
+- The NER preview (BAIGLE #180): a Hugging Face preview whose proposal is NER now carries
+  `ner`, so the import's column step can say what the tags mean before a student picks columns:
+  `textColumn`, `tagColumn`, `labels` (a ClassLabel's names in order; for string tags the tags in
+  the first rows, `O` first, then as first seen; for numbers without names the numbers as strings,
+  sorted), `namesKnown` (false only for numbers without names), `entityTypes` (`{"type",
+  "count"}` for each type in `labels` with its position prefix stripped and `O` left out, in label
+  order, counting the spans in `rows`, 0 when none shows; numbers without names have none, as
+  `ner.spans` cannot read them), `rows` (the first rows as the import converts them, `{"text",
+  "entities"}`), `skippedRows` (rows it could not convert: tokens or tags missing, or their lengths
+  differ) and `typesOnlyColumns` (other columns whose every value reads `TYPE: text` with a known
+  type, such as WikiANN's `spans`: entity types without positions). `ner` is null for any other
+  proposal, on a copy opened offline as on the live preview, and on a Community card. A preview
+  cached without `ner` is rebuilt.
+- `ner.class_label_names` (moved from the import, which reads names through it as before) and
+  `ner.entity_type`, so the preview and the import read tag names the same way.
+
 ## [0.18.0] - 2026-11-25
 
 ### Added

@@ -377,6 +377,7 @@ def test_an_open_record_is_importable_with_its_table_and_a_proposal(client, zeno
     assert body["rows"][0][0] == "The Supplier may terminate this Agreement by giving thirty days' notice."
     # The columns are proposed, and no task: a Publication carries none, and a text column is no reason to claim one (#122, fix 5).
     assert body["proposed"] == {"taskType": None, "textColumn": "text", "labelColumn": "label"}
+    assert body["ner"] is None
     assert body["file"] == {"key": "data.csv", "size": RECORDS["101"]["files"][0]["size"]}
     assert body["revision"] == checksum_of("101")
     assert body["url"] == "https://doi.org/10.5281/zenodo.101"

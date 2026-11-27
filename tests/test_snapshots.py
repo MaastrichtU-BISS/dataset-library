@@ -1131,6 +1131,9 @@ def test_an_offline_open_proposes_the_task_the_live_preview_would_for_its_column
     assert [column["name"] for column in body["columns"]] == ["tokens", "ner_tags"]
     assert body["proposed"] == {"taskType": "ner", "textColumn": "tokens", "labelColumn": "ner_tags"}
     assert body["rowCount"] == 2
+    # The copy's tags are named as the live preview names them (#180).
+    assert body["ner"]["namesKnown"] is True
+    assert body["ner"]["rows"][0] == {"text": "Clause one", "entities": [{"text": "Clause", "start": 0, "end": 6, "type": "PER"}]}
 
 
 def test_an_offline_open_proposes_the_summary_columns_for_a_summarization_pin(client, app, hub, cache, snapshot_dir, tmp_path):
@@ -1143,6 +1146,7 @@ def test_an_offline_open_proposes_the_summary_columns_for_a_summarization_pin(cl
 
     assert body["proposed"] == {"taskType": "summarization", "textColumn": "document", "labelColumn": "summary"}
     assert body["rowCount"] == 2
+    assert body["ner"] is None
 
 
 def test_a_corrupt_copy_opens_without_rows_instead_of_failing(client, app, hub, cache, snapshot_dir, tmp_path):

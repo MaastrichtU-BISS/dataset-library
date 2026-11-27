@@ -17,6 +17,32 @@ CONTINUES = frozenset("IM")
 PLACEHOLDERS = frozenset({"x", "pad", "[pad]", "<pad>", "[cls]", "[sep]"})
 
 
+def class_label_names(feature):
+    """Names from a Hugging Face ClassLabel feature, or from the ClassLabel
+    inside a Sequence (or a bare list, as the viewer writes one); None when
+    there is none. The import and the preview both read names this way."""
+    if isinstance(feature, list):
+        for item in feature:
+            names = class_label_names(item)
+            if names is not None:
+                return names
+        return None
+    if not isinstance(feature, dict):
+        return None
+    if feature.get("_type") == "ClassLabel":
+        return feature.get("names")
+    if feature.get("_type") in ("Sequence", "List", "LargeList"):
+        return class_label_names(feature.get("feature"))
+    return None
+
+
+def entity_type(tag):
+    """A tag's entity type with its position prefix (``B-``, ``I-``, ``E-``,
+    ``S-``, …) stripped, or None for ``O``, an empty tag or a placeholder."""
+    parsed = _parse(tag, None) if isinstance(tag, str) else None
+    return parsed[1] if parsed else None
+
+
 def tokens_to_text(tokens):
     """A row's text: tokens joined by single spaces, a string kept as it is.
 

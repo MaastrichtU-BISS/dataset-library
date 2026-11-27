@@ -35,7 +35,7 @@ from .errors import NotParquet, ProviderError, ProviderRateLimited
 from .licenses import LICENSES, UNKNOWN
 from .limits import download_cap_bytes
 from .models import LibraryImport, LibraryPin, LibrarySnapshot
-from .preview import LicenseHidden, ROWS, _cell, _propose, _type
+from .preview import LicenseHidden, ROWS, _cell, _propose, _type, ner_part
 from .providers import huggingface
 
 logger = logging.getLogger("dataset_library")
@@ -308,6 +308,9 @@ def offline_detail(host, copy, *, rows=True):
     names = [column["name"] for column in columns]
     path = file_of(host.snapshot_dir, copy) if host.snapshot_dir is not None and copy.file_path else None
     features, sample = _read_copy(path, names, rows)
+    named = [{"name": n, "type": features.get(n)} for n in names]
+    viewer_rows = [{"row": raw} for raw in sample]
+    proposed = _propose(card.get("tasks") or [], named, viewer_rows)
     return {
         "id": f"{copy.provider}:{copy.external_id}",
         "provider": copy.provider,
@@ -332,7 +335,8 @@ def offline_detail(host, copy, *, rows=True):
         "columns": [{"name": column["name"], "type": _column_type(column, features)} for column in columns],
         "rows": [[_cell(raw.get(name), features.get(name)) for name in names] for raw in sample],
         "rowCount": copy.row_count,
-        "proposed": _propose(card.get("tasks") or [], [{"name": n, "type": features.get(n)} for n in names], [{"row": raw} for raw in sample]),
+        "proposed": proposed,
+        "ner": ner_part(proposed, named, viewer_rows),
         # The copy stands in for Hugging Face: the page says so, and it can still be imported.
         "offline": True,
     }
