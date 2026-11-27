@@ -91,8 +91,20 @@ NER_SOURCE = "_nerSource"
 
 
 def _lacks_ner_source(body):
+    """An NER body with unnamed tags whose source is missing, or was kept before it held
+    every first row's tags (round 2): the named preview reads `missingTags` from them all."""
     ner = body.get("ner")
-    return bool(ner) and not ner.get("namesKnown") and NER_SOURCE not in body
+    return bool(ner) and not ner.get("namesKnown") and "tags" not in (body.get(NER_SOURCE) or {})
+
+
+def _ner_source(features, every, tag_column):
+    """What a cached body keeps to name its tags later: the features, the shown rows,
+    and every first row's tag cell."""
+    return {
+        "features": features,
+        "rows": [{"row": r.get("row") or {}} for r in every[:ROWS]],
+        "tags": [(r.get("row") or {}).get(tag_column) for r in every],
+    }
 
 
 def with_tag_names(body, tag_names):
@@ -105,11 +117,15 @@ def with_tag_names(body, tag_names):
     if not ner:
         return body
     if tag_names and not ner.get("namesKnown") and source:
-        named = _ner_preview(source["features"], source["rows"], ner["textColumn"], ner["tagColumn"], tag_names)
-        # The source keeps only the shown rows: `labels` stay those read from every first row.
-        body["ner"] = {**named, "labels": ner["labels"]}
+        tag_column = ner["tagColumn"]
+        # The shown rows whole, then the rest of the first rows' tags, so numbers past the
+        # eighth row still count; and the base preview's "unnamed" reading is kept.
+        rows = source["rows"] + [{"row": {tag_column: tags}} for tags in source["tags"][ROWS:]]
+        body["ner"] = _ner_preview(
+            source["features"], rows, ner["textColumn"], tag_column, tag_names, unnamed=True,
+        )
     else:
-        body["ner"] = {**ner, "tagNames": None}
+        body["ner"] = {**ner, "tagNames": None, "missingTags": []}
     return body
 
 
@@ -190,7 +206,7 @@ def _build(host, external_id, config, split):
         every = rows.get("rows") or []
         body["ner"] = ner_part(body["proposed"], features, every)
         if body["ner"] and not body["ner"]["namesKnown"]:
-            body[NER_SOURCE] = {"features": features, "rows": [{"row": r.get("row") or {}} for r in every[:ROWS]]}
+            body[NER_SOURCE] = _ner_source(features, every, body["ner"]["tagColumn"])
     return body
 
 
@@ -248,9 +264,10 @@ def _entity_tags(name, feature, rows):
         return False
     if name in NER_NAMED_COLUMNS:
         return True
-    if _is_class_label(feature):
-        return _all_bio(feature.get("names") or [])
-    if _is_integer(feature):
+    if _is_class_label(feature) and feature.get("names"):
+        return _all_bio(feature["names"])
+    # A ClassLabel that names nothing is numbers without names, as an integer column is.
+    if _is_integer(feature) or _is_class_label(feature):
         return name in GENERIC_TAG_COLUMNS
     values = [tag for row in rows if isinstance((cell := (row.get("row") or {}).get(name)), list) for tag in cell]
     return _all_bio(values)
@@ -270,7 +287,7 @@ def ner_part(proposed, features, rows, tag_names=None):
     return _ner_preview(features, rows, proposed["textColumn"], proposed["labelColumn"], tag_names)
 
 
-def _ner_preview(features, rows, text_column, tag_column, tag_names=None):
+def _ner_preview(features, rows, text_column, tag_column, tag_names=None, unnamed=False):
     """What an NER dataset holds, read from its first rows (#180).
 
     `rows` are every first row the viewer gave (up to FIRST_ROWS); the first
@@ -296,16 +313,32 @@ def _ner_preview(features, rows, text_column, tag_column, tag_names=None):
     `blankRows`, as it is imported with a blank entities cell; a row whose
     tokens are not a list, or whose text is empty, is left out and counted in
     `skippedRows`. `typesOnlyColumns` are the other list columns whose values
-    all read `TYPE: text` with TYPE one of `entityTypes`: entity types without
-    positions (WikiANN's `spans`), which cannot be trained on.
+    all read `TYPE: text`, at least one of them: entity types without positions
+    (WikiANN's `spans`), which cannot be trained on. With the types known (or
+    named), TYPE must be one of `entityTypes`; with numbers without names any
+    TYPE counts, so such a column is flagged before the student names the tags.
+
+    `unnamedNumberedColumns` are the other list columns, in feature order, that
+    hold numbers without names: their element type is an integer or a ClassLabel
+    with no names, or every value of theirs in the shown rows is a list of
+    integers (at least one), and the feature names none. tner's `pos_tags` is
+    one. The served rows join lists into text, so this says what they hold.
 
     `tag_names`, when the tags are numbers without names, are the student's
     names for them (#180): item i names number i. The rows are converted with
     them and `entityTypes` are their types, as the import will read them;
     `labels` stay the numbers and `namesKnown` false, and `tagNames` echoes
-    them. Otherwise `tagNames` is null and they change nothing."""
+    them. `missingTags` are then the non-negative tag numbers in any of `rows`
+    that the names do not reach (number >= len(tag_names)), sorted and each
+    once: a number not in the rows is never listed. Otherwise `tagNames` is
+    null, `missingTags` is ``[]`` and the names change nothing.
+
+    `unnamed` keeps a reading made before (the base preview read every first
+    row): the tags are numbers without names whatever these rows show."""
     types = {f["name"]: f.get("type") for f in features}
-    names = ner_module.class_label_names(types.get(tag_column))
+    # An empty ClassLabel names nothing: on the NER paths it is numbers without names.
+    names = ner_module.class_label_names(types.get(tag_column)) or None
+    inner = _list_inner(types.get(tag_column))
     every = [(r.get("row") or {}) for r in rows]
     cells = every[:ROWS]
     if names is not None:
@@ -317,15 +350,16 @@ def _ner_preview(features, rows, text_column, tag_column, tag_names=None):
             if isinstance(tag, int) and not isinstance(tag, bool)
         ]
         strings = list(dict.fromkeys(tag for tag in seen if isinstance(tag, str)))
-        names_known = not (_is_integer(_list_inner(types.get(tag_column))) or (numbers and not strings))
+        names_known = not (unnamed or _is_integer(inner) or _is_class_label(inner) or (numbers and not strings))
         if names_known:
             labels = (["O"] if "O" in strings else []) + [tag for tag in strings if tag != "O"]
         else:
             highest = max((number for number in numbers if number >= 0), default=-1)
             labels = [str(number) for number in range(min(highest + 1, ner_module.MAX_TAG_NAMES))]
-    applied = None
+    applied, missing = None, []
     if names is None and not names_known and tag_names:
         names = applied = list(tag_names)
+        missing = sorted({number for number in numbers if number >= len(applied)})
     converted, skipped, blank = [], 0, 0
     for cell in cells:
         tokens, tags = cell.get(text_column), cell.get(tag_column)
@@ -349,6 +383,8 @@ def _ner_preview(features, rows, text_column, tag_column, tag_names=None):
             counts[entity["type"]] = counts.get(entity["type"], 0) + 1
     entity_types = [{"type": type_, "count": count} for type_, count in counts.items()]
     others = [name for name in types if name not in (text_column, tag_column)]
+    # Before the types are known, any TYPE may be one.
+    known_types = set(counts) if names_known or applied else None
     return {
         "textColumn": text_column,
         "tagColumn": tag_column,
@@ -358,15 +394,18 @@ def _ner_preview(features, rows, text_column, tag_column, tag_names=None):
         "rows": converted,
         "skippedRows": skipped,
         "blankRows": blank,
-        "typesOnlyColumns": [name for name in others if _types_only(name, cells, set(counts))],
+        "typesOnlyColumns": [name for name in others if _types_only(name, cells, known_types)],
+        "unnamedNumberedColumns": [name for name in others if _unnamed_numbers(types[name], name, cells)],
         "tagNames": applied,
+        "missingTags": missing,
     }
 
 
 def _types_only(name, cells, entity_types):
     """Whether `name` is a list column whose every value in these rows is a list
-    of strings reading `TYPE: text` with TYPE an entity type, at least one of
-    them. A plain text column is never one: a summary may well start "ORG: "."""
+    of strings reading `TYPE: text` with TYPE one of `entity_types` (any TYPE
+    when it is None), at least one of them. A plain text column is never one:
+    a summary may well start "ORG: "."""
     values = []
     for cell in cells:
         value = cell.get(name)
@@ -375,13 +414,27 @@ def _types_only(name, cells, entity_types):
         elif value is not None:
             return False
     values = [value for value in values if value.strip()]
-    if not values or not entity_types:
+    if not values or entity_types is not None and not entity_types:
         return False
     for value in values:
         match = _TYPED_TEXT.match(value.strip())
-        if not match or match.group(1) not in entity_types:
+        if not match or (entity_types is not None and match.group(1) not in entity_types):
             return False
     return True
+
+
+def _unnamed_numbers(feature, name, cells):
+    """Whether a column is a list of numbers without names (see `_ner_preview`)."""
+    if not _is_list(feature) or ner_module.class_label_names(feature):
+        return False
+    inner = _list_inner(feature)
+    if _is_integer(inner) or _is_class_label(inner):
+        return True
+    values = [cell.get(name) for cell in cells if cell.get(name) is not None]
+    return bool(values) and any(values) and all(
+        isinstance(value, list) and all(isinstance(item, int) and not isinstance(item, bool) for item in value)
+        for value in values
+    )
 
 
 def _first_text(named, preferred, exclude=None):

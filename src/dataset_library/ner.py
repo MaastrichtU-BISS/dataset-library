@@ -26,8 +26,10 @@ _STUDENT_TAG = re.compile(r"(?:[Oo]|[BI]-\S+)")
 def class_label_names(feature):
     """Names from a Hugging Face ClassLabel feature, or from the ClassLabel
     inside a Sequence (or a bare list, as the viewer writes one); None when
-    there is none, or when it names nothing (an empty ClassLabel says no more
-    than no ClassLabel). The import and the preview both read names this way."""
+    there is none. An empty ClassLabel gives ``[]``: classification still reads
+    its ``-1`` as "no label", while the NER paths treat ``[]`` as numbers
+    without names (BAIGLE #180). The import and the preview both read names
+    this way."""
     if isinstance(feature, list):
         for item in feature:
             names = class_label_names(item)
@@ -37,7 +39,7 @@ def class_label_names(feature):
     if not isinstance(feature, dict):
         return None
     if feature.get("_type") == "ClassLabel":
-        return feature.get("names") or None
+        return list(feature.get("names") or [])
     if feature.get("_type") in ("Sequence", "List", "LargeList"):
         return class_label_names(feature.get("feature"))
     return None

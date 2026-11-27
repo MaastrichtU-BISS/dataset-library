@@ -305,13 +305,14 @@ def test_class_label_names_are_read_from_the_label_or_its_sequence():
     assert class_label_names({"_type": "Sequence", "feature": {"_type": "Value", "dtype": "int64"}}) is None
 
 
-def test_an_empty_class_label_names_nothing():
-    """Round 1 (#180): the preview and the import both treat `names: []` as no names."""
+def test_an_empty_class_label_reads_as_an_empty_list_of_names():
+    """Round 2 (#180): `names: []` is still a ClassLabel, so classification reads its -1 as
+    "no label"; only the NER paths treat it as numbers without names."""
     from dataset_library.ner import class_label_names
 
     empty = {"_type": "ClassLabel", "names": []}
-    assert class_label_names(empty) is None
-    assert class_label_names({"_type": "Sequence", "feature": empty}) is None
+    assert class_label_names(empty) == []
+    assert class_label_names({"_type": "Sequence", "feature": empty}) == []
 
 
 @pytest.mark.parametrize("names", [

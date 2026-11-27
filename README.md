@@ -430,8 +430,10 @@ Admins only (404 `not_offered` without the seam):
   `rowCount` (the split's size, when known) and `preview: "ok" | "unavailable"`.
   `ner` (#180) is null unless `proposed.taskType` is `"ner"`; then it is
   `{"textColumn", "tagColumn", "labels", "namesKnown", "entityTypes", "rows",
-  "skippedRows", "blankRows", "typesOnlyColumns", "tagNames"}`. `labels` are the
-  tag names (a ClassLabel's; an empty ClassLabel names nothing), else the tag
+  "skippedRows", "blankRows", "typesOnlyColumns", "unnamedNumberedColumns",
+  "tagNames", "missingTags"}`. `labels` are the tag names (a ClassLabel's; an
+  empty ClassLabel names nothing, so `namesKnown` is false even when the first
+  rows hold no numbers), else the tag
   strings in the first rows with `O` first, else, for numbers without names
   (`namesKnown: false`), every number from `"0"` to the highest non-negative tag
   in any row the viewer's first-rows gave (up to 100, not only those shown), gaps
@@ -446,7 +448,15 @@ Admins only (404 `not_offered` without the seam):
   `skippedRows`. Numbers without names have no types. `typesOnlyColumns` are the
   other list columns whose values all read `TYPE: text` (WikiANN's `spans`): types
   without positions, which cannot be trained on; a plain text column never is one.
-  `tagNames` is null unless names were applied.
+  With the types known (or named) TYPE must be one of `entityTypes`; with numbers
+  without names any TYPE counts, so the column is flagged before naming.
+  `unnamedNumberedColumns` are the other list columns (not `textColumn` or
+  `tagColumn`), in feature order, holding numbers without names: the element type
+  is an integer or a ClassLabel with no names, or every non-null value in the shown
+  rows is a list of integers (one at least), and the feature names none (tner's
+  `pos_tags`). The served `rows` join list cells into text such as `"0, 7, 2"`, so
+  this says which hold numbers. `tagNames` is null unless names were applied, and
+  `missingTags` is then `[]`.
   `?tagNames=` names numbers without names, as the import window lets a student
   do: a JSON-encoded list where item i names tag number i, each `O` (either case,
   kept as `O`) or `B-` or `I-` followed by a type with no whitespace (`B-PER`,
@@ -455,7 +465,11 @@ Admins only (404 `not_offered` without the seam):
   When the tags are numbers without names, `ner` is then computed with them:
   `rows` are converted with them, `entityTypes` are their types in their order,
   `labels` stay the numbers (from every first row), `namesKnown` stays `false` and `tagNames` echoes
-  them; otherwise they change nothing. The cached preview is never changed by
+  them, and `missingTags` lists, sorted and once each, the non-negative tag numbers
+  in any first row (up to 100, not only the 8 shown) that are `>= len(tagNames)`:
+  names `["O","B-PER"]` against rows holding 0, 1, 3 and 5 give `[3, 5]` (2 and 4
+  are in no row, so they are not listed); `[]` when every number is named.
+  Otherwise they change nothing. The cached preview is never changed by
   them. Not a list of such names → 400 `bad_tag_names`. An offline copy takes it too.
 - `GET /api/library/options` → the task, license and source filters, the
   license table (`level` is this platform's: `allow`, `warn` or `hide`; a
@@ -501,8 +515,10 @@ Admins only (404 `not_offered` without the seam):
   or `I-TYPE`, as the preview's `?tagNames=` takes them. It is kept on the
   import's `citation` as `tagNames`, so the Dataset's provenance says the names
   came from the student, and the worker reads the tags with it only when the
-  files name none: the dataset's own names win, and then `tagNames` is taken off
-  the completed import's citation, as they were not used. Negative tags (`-100`
+  files name none: the dataset's own names win. `tagNames` is taken off the
+  completed import's citation unless a kept row's non-negative tag number was
+  read through them (not when the files name their tags, the tags are strings,
+  or every number was padding). Negative tags (`-100`
   padding) need no name and are outside any entity. Without names, or when a row
   holds a number they do not name, such an import fails `no_entity_names`, saying
   to name the tags in the import window. Other tag names are another import, and a

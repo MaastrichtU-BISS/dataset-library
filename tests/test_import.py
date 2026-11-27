@@ -1223,3 +1223,55 @@ def test_imported_csvs_become_datasets_through_legal_ml_cores_real_create_datase
         assert (ner_dataset.task_type, ner_dataset.row_count) == ("ner", 2)
         assert (conll_dataset.task_type, conll_dataset.row_count) == ("ner", 2)
         assert (summary_dataset.task_type, summary_dataset.row_count) == ("summarization", 2)
+
+
+def test_an_empty_class_label_still_reads_minus_one_as_no_label(run, tmp_path):
+    """Round 2 (#180): an empty-names ClassLabel is still a ClassLabel for classification."""
+    texts = [f"Clause {i}" for i in range(20)]
+    labels = [-1] * 4 + [i % 3 for i in range(16)]
+    shard = write_labels_shard(tmp_path / "0000.parquet", texts, labels, label_feature={"_type": "ClassLabel", "names": []})
+
+    result, create = run([shard], size=9, balance=True)
+
+    assert result["status"] == "completed", result
+    assert result["sampleMethod"] == "stratified"
+    assert "-1" not in {row["label"] for row in create.calls[0]["rows"]}
+
+    all_unlabelled = write_labels_shard(
+        tmp_path / "0001.parquet", [f"Other {i}" for i in range(8)], [-1] * 8,
+        label_feature={"_type": "ClassLabel", "names": []},
+    )
+
+    empty, _ = run([all_unlabelled], size=3, balance=True)
+
+    assert empty["sampleNote"] == imports.LABEL_EMPTY
+
+
+def test_student_tag_names_a_string_tag_import_never_used_leave_its_citation(run, app, tmp_path):
+    """Round 2 (#180): the tags are already names, so no number was read through the student's."""
+    shard = write_ner_shard(
+        tmp_path / "0000.parquet", [["Alice", "runs"]], [["B-PER", "O"]],
+        tag_feature={"feature": {"dtype": "string", "_type": "Value"}, "_type": "Sequence"},
+    )
+
+    result, create = run(
+        [shard], size=1, task_type="ner", text_column="tokens", label_column="ner_tags",
+        citation={"title": "Legal NER", "tagNames": ["O", "B-PER"]},
+    )
+
+    assert result["status"] == "completed", result
+    assert entity_spans(create.calls[0]["rows"]) == {"Alice runs": [{"text": "Alice", "start": 0, "end": 5, "type": "PER"}]}
+    assert "tagNames" not in stored_citation(app, result["id"])
+
+
+def test_student_tag_names_only_padding_never_used_leave_its_citation(run, app, tmp_path):
+    """Negative padding tags are outside without a name: they do not use the student's names."""
+    shard = write_tner_shard(tmp_path / "0000.parquet", [["[CLS]", "[SEP]"]], [[-100, -100]])
+
+    result, _ = run(
+        [shard], size=1, task_type="ner", text_column="tokens", label_column="tags",
+        citation={"title": "Legal NER", "tagNames": ["O", "B-PER"]},
+    )
+
+    assert result["status"] == "completed", result
+    assert "tagNames" not in stored_citation(app, result["id"])

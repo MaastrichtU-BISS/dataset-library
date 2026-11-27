@@ -1107,7 +1107,10 @@ def _label_names(parquet_file, column):
 
 
 class _StudentTagNames(list):
-    """Tag names the student gave (#180), not the files: every number met must have one."""
+    """Tag names the student gave (#180), not the files: every number met must have one.
+    `used` turns true once a kept row's number is read through them."""
+
+    used = False
 
 
 def _tag_names(record, parquet_file, column):
@@ -1173,40 +1176,46 @@ def _sample(record, paths, rng, open_parquet):
     Returns the rows, the method used (``"stratified"`` or ``"random"``), a
     note when a balance was asked for but could not be kept, or when no NER
     row had a tag for every word, and whether the student's tag names (#180)
-    went unused because every file names its own tags."""
+    went unused: no non-negative tag number in a kept row was read through
+    them, because the files name their own tags, the tags are strings already,
+    or every number was padding."""
     if open_parquet is None:
         import pyarrow.parquet as pq
 
         open_parquet = pq.ParquetFile
     files = [open_parquet(path) for path in paths]
     _refuse_numbered_ner_tags(record, files)
-    names_unused = bool(tag_names_of(record)) and bool(record.label_column) and all(
-        _label_names(f, record.label_column) for f in files
-    )
+    names = [_tag_names(record, f, record.label_column) if record.label_column else None for f in files]
+
+    def names_unused():
+        given = bool(tag_names_of(record))
+        return given and not any(isinstance(n, _StudentTagNames) and n.used for n in names)
+
     if record.balance and record.label_column:
         rows, note = _sample_balanced(record, files, rng)
         if rows is not None:
             rng.shuffle(rows)
-            return rows, "stratified", note, names_unused
-        rows = _sample_random(record, files, rng)
+            return rows, "stratified", note, names_unused()
+        rows = _sample_random(record, files, rng, names)
         rng.shuffle(rows)
-        return rows, "random", note, names_unused
-    rows = _sample_random(record, files, rng)
+        return rows, "random", note, names_unused()
+    rows = _sample_random(record, files, rng, names)
     rng.shuffle(rows)
     untagged = record.task_type in NER_TASKS and record.label_column and all(row[1] == "" for row in rows)
-    return rows, "random", NER_UNTAGGED if untagged else None, names_unused
+    return rows, "random", NER_UNTAGGED if untagged else None, names_unused()
 
 
-def _sample_random(record, files, rng):
+def _sample_random(record, files, rng, names=None):
     """Pick rows uniformly at random.
 
     Pass 1 reads only each row group's row count; pass 2 reads only the mapped
     columns of the row groups that hold a chosen row. A summarization row needs
     both a text and a summary, so one with a missing summary is replaced like
-    one with empty text."""
+    one with empty text. `names` are each file's label names (`_tag_names`)."""
     groups, total = _groups(files)
     columns = [record.text_column] + ([record.label_column] if record.label_column else [])
-    names = [_tag_names(record, f, record.label_column) if record.label_column else None for f in files]
+    if names is None:
+        names = [_tag_names(record, f, record.label_column) if record.label_column else None for f in files]
     needs_summary = record.task_type == "summarization" and record.label_column is not None
 
     want = min(record.sample_size, total)
@@ -1472,6 +1481,9 @@ def _mapped(values, names, task_type="classification"):
             for tag in label:
                 if isinstance(tag, int) and not isinstance(tag, bool) and tag >= len(names):
                     raise ImportFailed("no_entity_names", UNNAMED_TAG.format(number=tag))
+            if any(isinstance(tag, int) and not isinstance(tag, bool) and tag >= 0 for tag in label):
+                # The student's names were read: the provenance keeps them (#180).
+                names.used = True
         text, found = spans(values[0], label, names)
         return [text, json.dumps(found, ensure_ascii=False)]
     if names and isinstance(label, int) and 0 <= label < len(names):

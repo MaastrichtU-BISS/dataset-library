@@ -563,8 +563,8 @@ def test_numbered_tags_without_names_are_not_known_and_have_no_types():
         {"text": "Angela Merkel visited Paris", "entities": []},
         {"text": "Berlin", "entities": []},
     ]
-    # With no known types, nothing reads as a types-only column either.
-    assert ner["typesOnlyColumns"] == []
+    # With no types known yet, any TYPE reads as a types-only column (round 2).
+    assert ner["typesOnlyColumns"] == ["spans"]
 
 
 def test_rows_are_shown_as_the_import_writes_them():
@@ -683,7 +683,9 @@ TNER_NER = {
     "skippedRows": 0,
     "blankRows": 0,
     "typesOnlyColumns": [],
+    "unnamedNumberedColumns": [],
     "tagNames": TNER_NAMES,
+    "missingTags": [],
 }
 
 
@@ -853,3 +855,144 @@ def test_tag_names_that_are_not_a_list_of_tags_are_refused(client, tner, raw):
 
     assert refused["code"] == "bad_tag_names"
     assert refused["error"]
+
+
+# Round 2 (#180).
+
+
+def test_a_types_only_column_is_found_before_the_tags_are_named():
+    """With numbers without names no entity type is known, so any TYPE counts: a student
+    must not import WikiANN's `spans` as the entities before naming the tags."""
+    features = _features(tokens=_sequence(_string()), tags=_sequence(_integer()), spans=_sequence(_string()))
+    rows = _rows(
+        {"tokens": ["Alice", "ran"], "tags": [1, 0], "spans": ["PER: Alice"]},
+        {"tokens": ["Bob"], "tags": [1], "spans": []},
+    )
+
+    ner = _ner_preview(features, rows, "tokens", "tags")
+
+    assert ner["namesKnown"] is False
+    assert ner["typesOnlyColumns"] == ["spans"]
+    # Once named, the stricter check applies: TYPE must be one of the named types.
+    assert _ner_preview(features, rows, "tokens", "tags", ["O", "B-PER"])["typesOnlyColumns"] == ["spans"]
+    assert _ner_preview(features, rows, "tokens", "tags", ["O", "B-LOC"])["typesOnlyColumns"] == []
+
+
+def test_a_types_only_column_before_naming_still_needs_every_value_to_read_type_text():
+    features = _features(tokens=_sequence(_string()), tags=_sequence(_integer()), spans=_sequence(_string()))
+    rows = _rows({"tokens": ["Alice"], "tags": [1], "spans": ["PER: Alice", "plain words"]})
+
+    assert _ner_preview(features, rows, "tokens", "tags")["typesOnlyColumns"] == []
+
+
+def test_list_columns_of_numbers_without_names_are_listed():
+    """The served rows join lists into text, so the frontend is told which columns hold
+    unnamed numbers: an integer element type, an empty ClassLabel, or integers in the rows."""
+    features = _features(
+        tokens=_sequence(_string()), tags=_sequence(_integer()),
+        pos_tags=_sequence(_integer()),
+        chunk_tags=_sequence(_class_label([])),
+        raw=[_string()],  # says text, but holds numbers
+        named_pos=_sequence(_class_label(["NN", "VB"])),
+        langs=_sequence(_string()),
+        count=_integer(),
+    )
+    rows = _rows({
+        "tokens": ["Alice", "ran"], "tags": [1, 0], "pos_tags": [0, 7], "chunk_tags": [1, 2],
+        "raw": [3, 4], "named_pos": [0, 1], "langs": ["en", "en"], "count": 2,
+    })
+
+    ner = _ner_preview(features, rows, "tokens", "tags")
+
+    assert ner["unnamedNumberedColumns"] == ["pos_tags", "chunk_tags", "raw"]
+    assert _ner_preview(features, rows, "tokens", "tags", ["O", "B-PER"])["unnamedNumberedColumns"] == [
+        "pos_tags", "chunk_tags", "raw",
+    ]
+
+
+def test_a_named_preview_lists_the_tag_numbers_its_names_leave_out():
+    """`missingTags` are the non-negative numbers in the rows with no name: names
+    ["O", "B-PER"] name 0 and 1; the rows hold 0, 1, 3 and 5 (and -100 padding), so
+    3 and 5 are missing. 2 and 4 are not in the rows, so they are not listed."""
+    features, rows = _numbered([0, 1, -100], [3, 0], *([[0]] * 7), [5])
+
+    named = _ner_preview(features, rows, "tokens", "tags", ["O", "B-PER"])
+
+    # 5 is in the tenth row, past the shown eight: every first row counts.
+    assert named["missingTags"] == [3, 5]
+    assert _ner_preview(features, rows, "tokens", "tags", ["O", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC"])[
+        "missingTags"] == []
+    assert _ner_preview(features, rows, "tokens", "tags")["missingTags"] == []
+
+
+def test_named_tags_have_no_missing_tags():
+    features, rows = _wikiann()
+
+    assert _ner_preview(features, rows, "tokens", "ner_tags")["missingTags"] == []
+    assert _ner_preview(features, rows, "tokens", "ner_tags", ["O"])["missingTags"] == []
+
+
+def test_a_generic_tag_column_with_an_empty_class_label_is_proposed_as_ner():
+    features = _features(tokens=_sequence(_string()), tags=_sequence(_class_label([])))
+    rows = [{"row": {"tokens": ["Alice"], "tags": [1]}}]
+
+    assert _propose(["ner"], features, rows) == {"taskType": "ner", "textColumn": "tokens", "labelColumn": "tags"}
+
+
+def test_an_empty_class_label_is_unnamed_even_with_no_numbers_in_the_first_rows():
+    features = _features(tokens=_sequence(_string()), tags=_sequence(_class_label([])))
+    rows = _rows({"tokens": ["Alice"], "tags": None})
+
+    ner = _ner_preview(features, rows, "tokens", "tags")
+
+    assert ner["namesKnown"] is False
+
+
+def test_applying_names_keeps_the_previews_unnamed_reading(client, cache, tner, monkeypatch):
+    """The first number shows in the ninth row, past the shown eight, under a tag type that
+    does not say numbers: the base preview reads them unnamed, and so must the named one."""
+    from conftest import VIEWER
+
+    key = f"first-rows?dataset={tner}&config=default&split=train"
+    body = VIEWER[key]["body"]
+    features = [{**feature, "type": _sequence(_string())} if feature["name"] == "tags" else feature
+                for feature in body["features"]]
+    # `ner_tags` says NER by name, so the column is proposed whatever its type says.
+    features = [{**feature, "name": "ner_tags"} if feature["name"] == "tags" else feature for feature in features]
+    rows = [{"tokens": ["plain"], "ner_tags": None}] * 8 + [{"tokens": ["Mary", "Jones"], "ner_tags": [1, 2]}]
+    rows = [{"row_idx": index, "row": row, "truncated_cells": []} for index, row in enumerate(rows)]
+    monkeypatch.setitem(VIEWER, key, {"status": 200, "body": {**body, "features": features, "rows": rows}})
+
+    plain = preview(client, tner)["ner"]
+    named = preview(client, tner, tagNames=json.dumps(["O", "B-PER"]))["ner"]
+
+    assert plain["namesKnown"] is False and plain["labels"] == ["0", "1", "2"]
+    assert named["namesKnown"] is False
+    assert named["tagNames"] == ["O", "B-PER"]
+    assert named["missingTags"] == [2]
+
+
+def test_the_named_route_reads_missing_tags_from_every_first_row(client, cache, tner, monkeypatch):
+    from conftest import VIEWER
+
+    key = f"first-rows?dataset={tner}&config=default&split=train"
+    body = VIEWER[key]["body"]
+    extra = [{"tokens": ["plain"], "tags": [0]}] * 8 + [{"tokens": ["Mary", "Jones"], "tags": [7, 8]}]
+    rows = body["rows"] + [{"row_idx": 2 + index, "row": row, "truncated_cells": []} for index, row in enumerate(extra)]
+    monkeypatch.setitem(VIEWER, key, {"status": 200, "body": {**body, "rows": rows}})
+
+    named = preview(client, tner, tagNames=json.dumps(TNER_NAMES))["ner"]
+
+    assert named["missingTags"] == [7, 8]
+    assert preview(client, tner)["ner"]["missingTags"] == []
+
+
+def test_a_source_cached_without_every_rows_tags_is_rebuilt(client, cache, tner):
+    """A body cached in round 1 kept only the shown rows: it is rebuilt, so `missingTags` reads them all."""
+    preview(client, tner)
+    key = f"library:preview:{tner}::"
+    body = cache.get(key)
+    cache.set(key, {**body, "_nerSource": {k: v for k, v in body["_nerSource"].items() if k != "tags"}}, 600)
+
+    assert preview(client, tner, tagNames=json.dumps(["O", "B-PER"]))["ner"]["missingTags"] == [2, 3]
+    assert "tags" in cache.get(key)["_nerSource"]
