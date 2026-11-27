@@ -1,4 +1,6 @@
 """Turning a Hugging Face NER row into legal-ml-core's text and entity spans (#6)."""
+import pytest
+
 from dataset_library.ner import spans, tokens_to_text
 
 NAMES = ["O", "B-PER", "I-PER", "B-ORG", "I-ORG"]
@@ -282,3 +284,70 @@ def test_lowercase_prefixes_and_outside_tags_are_read():
 def test_bert_special_tokens_are_not_types():
     for tag in ("[CLS]", "[SEP]"):
         assert spans(["a"], [tag])[1] == []
+
+
+def test_an_entity_type_is_its_tag_without_the_position():
+    from dataset_library.ner import entity_type
+
+    assert [entity_type(tag) for tag in ["B-PER", "I-ORG", "E-LOC", "S-MISC", "U_DATE", "LAW"]] == [
+        "PER", "ORG", "LOC", "MISC", "DATE", "LAW",
+    ]
+    assert [entity_type(tag) for tag in ["O", "", "X", "[PAD]", 3, None]] == [None] * 6
+
+
+def test_class_label_names_are_read_from_the_label_or_its_sequence():
+    from dataset_library.ner import class_label_names
+
+    label = {"_type": "ClassLabel", "names": NAMES}
+    assert class_label_names(label) == NAMES
+    assert class_label_names({"_type": "Sequence", "feature": label}) == NAMES
+    assert class_label_names([label]) == NAMES
+    assert class_label_names({"_type": "Sequence", "feature": {"_type": "Value", "dtype": "int64"}}) is None
+
+
+def test_an_empty_class_label_reads_as_an_empty_list_of_names():
+    """Round 2 (#180): `names: []` is still a ClassLabel, so classification reads its -1 as
+    "no label"; only the NER paths treat it as numbers without names."""
+    from dataset_library.ner import class_label_names
+
+    empty = {"_type": "ClassLabel", "names": []}
+    assert class_label_names(empty) == []
+    assert class_label_names({"_type": "Sequence", "feature": empty}) == []
+
+
+@pytest.mark.parametrize("names", [
+    ["O", "S-PER"],  # only B- and I- name a position
+    ["O", "B_PER"],  # the separator is a hyphen
+    ["O", "B-"],  # a prefix without a type
+    ["O", "B- PER"],  # whitespace in the type
+    ["O", "B-\u0085"],  # Unicode whitespace is whitespace
+    ["O", "B-PER\u0085X"],
+    ["O", "E-PER"],
+    ["O", "PER"],  # a type without a position
+    ["O", "b-PER"],
+    ["O"] * 201,  # too many
+])
+def test_student_tag_names_follow_one_grammar(names):
+    from dataset_library.ner import tag_names_problem
+
+    assert tag_names_problem(names) is not None
+
+
+def test_student_tag_names_are_o_or_b_or_i_and_a_type():
+    from dataset_library.ner import student_tag_names, tag_names_problem
+
+    names = [" o", "B-PER ", "I-PER", "B-ORG.GOV", "I-Läkare", "O"]
+    assert tag_names_problem(names) is None
+    assert tag_names_problem(["O"] * 200) is None
+    assert student_tag_names(names) == ["O", "B-PER", "I-PER", "B-ORG.GOV", "I-Läkare", "O"]
+
+
+def test_complete_tags_needs_a_tag_for_every_token():
+    from dataset_library.ner import complete_tags
+
+    assert complete_tags(["a", "b"], [0, 1])
+    assert not complete_tags(["a", "b"], [0])
+    assert not complete_tags(["a", "b"], [0, None])
+    assert not complete_tags([], [])
+    assert not complete_tags("a b", [0, 1])
+    assert not complete_tags(["a"], None)

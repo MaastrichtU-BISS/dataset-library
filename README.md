@@ -428,6 +428,49 @@ Admins only (404 `not_offered` without the seam):
 - `GET /api/library/datasets/huggingface/<org>/<name>?config=&split=` → the
   card plus `configs`, `config`, `split`, `columns`, the first `rows`, `labels`
   `rowCount` (the split's size, when known) and `preview: "ok" | "unavailable"`.
+  `ner` (#180) is null unless `proposed.taskType` is `"ner"`; then it is
+  `{"textColumn", "tagColumn", "labels", "namesKnown", "entityTypes", "rows",
+  "skippedRows", "blankRows", "typesOnlyColumns", "unnamedNumberedColumns",
+  "tagNames", "missingTags"}`. `labels` are the tag names (a ClassLabel's; an
+  empty ClassLabel names nothing, so `namesKnown` is false even when the first
+  rows hold no numbers), else the tag
+  strings in the first rows with `O` first, else, for numbers without names
+  (`namesKnown: false`), every number from `"0"` to the highest non-negative tag
+  in any row the viewer's first-rows gave (up to 100, not only those shown), gaps
+  included, at most 200: position i is tag number i. Negative tags (`-100`
+  padding) are outside any entity and never labels. `entityTypes` are `{"type",
+  "count"}` in label order, counting spans across `rows`, which are the first 8
+  rows as the import writes them (`{"text", "entities": [{"text", "start", "end",
+  "type"}]}`): a row with a tag for every token is converted; a row of tokens whose
+  tags are missing, short or partly empty is shown with no entities and counted in
+  `blankRows`, since the import keeps it with a blank entities cell; a row whose
+  tokens are not a list, or whose text is empty, is left out and counted in
+  `skippedRows`. Numbers without names have no types. `typesOnlyColumns` are the
+  other list columns whose values all read `TYPE: text` (WikiANN's `spans`): types
+  without positions, which cannot be trained on; a plain text column never is one.
+  With the types known (or named) TYPE must be one of `entityTypes`; with numbers
+  without names any TYPE counts, so the column is flagged before naming.
+  `unnamedNumberedColumns` are the other list columns (not `textColumn` or
+  `tagColumn`), in feature order, holding numbers without names: the element type
+  is an integer or a ClassLabel with no names, or every non-null value in the shown
+  rows is a list of integers (one at least), and the feature names none (tner's
+  `pos_tags`). The served `rows` join list cells into text such as `"0, 7, 2"`, so
+  this says which hold numbers. `tagNames` is null unless names were applied, and
+  `missingTags` is then `[]`.
+  `?tagNames=` names numbers without names, as the import window lets a student
+  do: a JSON-encoded list where item i names tag number i, each `O` (either case,
+  kept as `O`) or `B-` or `I-` followed by a type with no whitespace (`B-PER`,
+  `I-PER`), at most 200, for example
+  `?tagNames=%5B%22O%22%2C%22B-PER%22%2C%22I-PER%22%5D` (`["O","B-PER","I-PER"]`).
+  When the tags are numbers without names, `ner` is then computed with them:
+  `rows` are converted with them, `entityTypes` are their types in their order,
+  `labels` stay the numbers (from every first row), `namesKnown` stays `false` and `tagNames` echoes
+  them, and `missingTags` lists, sorted and once each, the non-negative tag numbers
+  in any first row (up to 100, not only the 8 shown) that are `>= len(tagNames)`:
+  names `["O","B-PER"]` against rows holding 0, 1, 3 and 5 give `[3, 5]` (2 and 4
+  are in no row, so they are not listed); `[]` when every number is named.
+  Otherwise they change nothing. The cached preview is never changed by
+  them. Not a list of such names → 400 `bad_tag_names`. An offline copy takes it too.
 - `GET /api/library/options` → the task, license and source filters, the
   license table (`level` is this platform's: `allow`, `warn` or `hide`; a
   provider's terms, such as `legal-data-hunter-terms`, and their group "Provider
@@ -461,14 +504,31 @@ Admins only (404 `not_offered` without the seam):
 
 - `POST /api/library/imports` with `{"dataset", "config", "split", "textColumn",
   "labelColumn", "size", "name"?, "taskType"?, "licenseAck"?, "revision"?,
-  "balance"?}` → 202 and the import,
+  "balance"?, "tagNames"?}` → 202 and the import,
   `queued`. The size is cut to the row cap (the admin's, else `max_rows()`).
   `balance` keeps the label proportions of the whole dataset; it defaults to
   `true` when a `labelColumn` is mapped and is always `false` without one. The
   same import (dataset, revision, mapping, size, balance) while one is queued
-  or running → 200 and that one, queued once. Refused before anything is
+  or running → 200 and that one, queued once. `tagNames` (#180), for an NER
+  import with a `labelColumn` only, names tags that are numbers without names
+  (tner's datasets): a list where item i names tag number i, each `O`, `B-TYPE`
+  or `I-TYPE`, as the preview's `?tagNames=` takes them. It is kept on the
+  import's `citation` as `tagNames`, so the Dataset's provenance says the names
+  came from the student, and the worker reads the tags with it only when the
+  files name none: the dataset's own names win. `tagNames` is taken off the
+  completed import's citation unless a kept row's non-negative tag number was
+  read through them (not when the files name their tags, the tags are strings,
+  or every number was padding). Negative tags (`-100`
+  padding) need no name and are outside any entity. Without names, or when a row
+  holds a number they do not name, such an import fails `no_entity_names`, saying
+  to name the tags in the import window. Other tag names are another import, and a
+  retry keeps them, except that a retry of an import that failed
+  `no_entity_names` is refused with 409 `name_tags_again` ("Name every tag number
+  in the import window, then import it again."): the same names would fail again.
+  Refused before anything is
   queued: 400 (`bad_id`, `bad_mapping`, `bad_size`, `bad_name`, `bad_task`,
-  `bad_config`, `bad_balance`), 403
+  `bad_config`, `bad_balance`, `bad_tag_names` for names that are not such a list or
+  for a task other than NER), 403
   (`license_hidden`), 404, 409
   (`gated`, `private` when the Hub's answer says the owner keeps it private
   (an anonymous 401/404 is `not_found`), `not_importable`, `needs_ack` for a license set to warn, `changed`

@@ -8,6 +8,67 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-27
+
+### Added
+
+- The NER preview (BAIGLE #180): a Hugging Face preview whose proposal is NER now carries
+  `ner`, so the import's column step can say what the tags mean before a student picks columns:
+  `textColumn`, `tagColumn`, `labels` (a ClassLabel's names in order; for string tags the tags in
+  the first rows, `O` first, then as first seen; an empty ClassLabel names nothing, so its tags are
+  numbers without names even when the first rows hold none; for numbers
+  without names every number from `"0"` to the highest non-negative tag in any row first-rows gave,
+  up to 100 rows, gaps included and at most 200, so position i is tag number i, with negative
+  `-100` padding never a label), `namesKnown` (false only for numbers without names), `entityTypes` (`{"type",
+  "count"}` for each type in `labels` with its position prefix stripped and `O` left out, in label
+  order, counting the spans in `rows`, 0 when none shows; numbers without names have none, as
+  `ner.spans` cannot read them), `rows` (the first 8 rows as the import writes them, `{"text",
+  "entities"}`, through the same `ner.complete_tags` check), `blankRows` (rows of tokens whose
+  tags are missing, short or partly empty: shown with no entities, as the import keeps them with a
+  blank entities cell), `skippedRows` (rows left out: tokens not a list, or no text) and
+  `typesOnlyColumns` (other list columns whose every value reads `TYPE: text`, such as WikiANN's
+  `spans`: entity types without positions; never a plain text column; with the types known or
+  named, TYPE must be one of them, and with numbers without names any TYPE counts, so the column
+  is flagged before the student names the tags) and `unnamedNumberedColumns` (the other list
+  columns, in feature order, that hold numbers without names: an integer or empty-ClassLabel element
+  type, or integers in every shown row's value, such as tner's `pos_tags`; the served `rows` join
+  lists into text, so this is how a client tells them apart). `ner` is null for any other
+  proposal, on a copy opened offline as on the live preview, and on a Community card. A preview
+  cached without `ner` is rebuilt.
+- `ner.class_label_names` (moved from the import, which reads names through it as before; an
+  empty ClassLabel still gives `[]`, so classification reads its `-1` as no label, and only the NER
+  paths treat it as numbers without names),
+  `ner.complete_tags` (moved from the import) and `ner.entity_type`, so the preview and the import read tag names the same way.
+- Naming numbered tags (BAIGLE #180): an NER dataset whose tags are numbers without names, such
+  as tner's, now imports once the student names each number `O`, `B-<TYPE>` or `I-<TYPE>` (`O` in
+  either case, kept as `O`; a type is one or more characters with no whitespace).
+  `POST /api/library/imports` takes `tagNames` (a list, item i naming tag number i, at most 200,
+  NER with a `labelColumn` only; else 400 `bad_tag_names`), keeps it on the import's `citation` as
+  `tagNames`, so the provenance shows the names came from the student, and keeps it on a retry; the
+  worker reads the tags with it only when the files name none, and takes `tagNames` off the
+  completed import's citation unless a kept row's non-negative tag number was read through it
+  (not when the files name their tags, the tags are strings, or every number was padding). Negative tags (`-100` padding) need no name and are outside
+  any entity. A retry of an import that failed `no_entity_names` is refused with 409
+  `name_tags_again`, since the same names would fail again. The preview takes `?tagNames=` as a JSON-encoded
+  list and computes `ner` with it (`rows`, `entityTypes`; `labels` stay the numbers, `namesKnown`
+  false, as the preview without names read them) and echoes it as `ner.tagNames`, null otherwise.
+  `ner.missingTags` lists, sorted and once each, the non-negative tag numbers in any first row
+  (up to 100, not only the 8 shown) that the names do not reach: for names `["O", "B-PER"]` and
+  rows holding 0, 1, 3 and 5, it is `[3, 5]`; 2 and 4 are not in the rows, so they are not listed.
+  It is `[]` when the names reach every number, and `[]` when no names were applied. The cached
+  body is never changed by it: a preview of such tags keeps its shown raw rows and every first
+  row's tags in the cache, unserved, to apply names to, and one cached without them is rebuilt. `ner.tag_names_problem` checks a list of names and
+  `ner.student_tag_names` writes it as kept. An offline copy reads up to 100 rows, so its proposal
+  and its numbered labels read as many rows as the live preview; it still shows 8.
+
+### Changed
+
+- A generic tag column (`tags`, `labels`, `label`) whose ClassLabel names nothing is proposed as
+  NER, as an integer one is.
+- `no_entity_names` now says to name the tag numbers in the import window; it still fails an
+  import of numbers without names when no `tagNames` are given, or when a row holds a number they
+  do not name.
+
 ## [0.18.0] - 2026-11-25
 
 ### Added

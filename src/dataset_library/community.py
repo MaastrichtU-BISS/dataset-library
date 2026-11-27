@@ -160,6 +160,8 @@ def view(host, record_id, *, pin=None, fresh=False):
         "config": None,
         "split": None,
         "proposed": NO_PROPOSAL,
+        # Its tables have no NER proposal; the key is there as on a Hugging Face preview (#180).
+        "ner": None,
     }
     try:
         entry, cap = _checked(host, publication, pin, fresh)

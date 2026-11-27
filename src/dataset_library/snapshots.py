@@ -35,7 +35,7 @@ from .errors import NotParquet, ProviderError, ProviderRateLimited
 from .licenses import LICENSES, UNKNOWN
 from .limits import download_cap_bytes
 from .models import LibraryImport, LibraryPin, LibrarySnapshot
-from .preview import LicenseHidden, ROWS, _cell, _propose, _type
+from .preview import FIRST_ROWS, LicenseHidden, ROWS, _cell, _propose, _type, ner_part
 from .providers import huggingface
 
 logger = logging.getLogger("dataset_library")
@@ -288,13 +288,14 @@ def copy_for_offline(host, external_id, config, split):
     return copy if level == "allow" else None
 
 
-def offline_detail(host, copy, *, rows=True):
+def offline_detail(host, copy, *, rows=True, tag_names=None):
     """A dataset as the library shows it while Hugging Face cannot be asked: the card of
     the pin the copy was made for, the copy's columns with the types its Hugging Face
     features give, its first rows, and the task the live preview would propose for those
     columns. An import takes the same facts (`rows=False` skips the first rows). The
     license is the platform's level now, as preview applies it; LicenseHidden when it is
-    hidden. `rowCount` is the copy's rows, not the split's."""
+    hidden. `rowCount` is the copy's rows, not the split's. `tag_names` name numbered NER
+    tags as on the live preview (#180)."""
     pin = host.db.session.get(LibraryPin, copy.pin_id)
     if pin is None:
         # Unpinned since the copy was found: it no longer stands in for anything.
@@ -308,6 +309,9 @@ def offline_detail(host, copy, *, rows=True):
     names = [column["name"] for column in columns]
     path = file_of(host.snapshot_dir, copy) if host.snapshot_dir is not None and copy.file_path else None
     features, sample = _read_copy(path, names, rows)
+    named = [{"name": n, "type": features.get(n)} for n in names]
+    viewer_rows = [{"row": raw} for raw in sample]
+    proposed = _propose(card.get("tasks") or [], named, viewer_rows)
     return {
         "id": f"{copy.provider}:{copy.external_id}",
         "provider": copy.provider,
@@ -330,9 +334,10 @@ def offline_detail(host, copy, *, rows=True):
         "config": copy.config,
         "split": copy.split,
         "columns": [{"name": column["name"], "type": _column_type(column, features)} for column in columns],
-        "rows": [[_cell(raw.get(name), features.get(name)) for name in names] for raw in sample],
+        "rows": [[_cell(raw.get(name), features.get(name)) for name in names] for raw in sample[:ROWS]],
         "rowCount": copy.row_count,
-        "proposed": _propose(card.get("tasks") or [], [{"name": n, "type": features.get(n)} for n in names], [{"row": raw} for raw in sample]),
+        "proposed": proposed,
+        "ner": ner_part(proposed, named, viewer_rows, tag_names),
         # The copy stands in for Hugging Face: the page says so, and it can still be imported.
         "offline": True,
     }
@@ -360,7 +365,7 @@ def _readable_type(arrow_type):
 
 def _read_copy(path, names, rows):
     """The copy's Hugging Face features, from its schema metadata, and when `rows`, its
-    first rows as raw values keyed by column. Nothing when the file cannot be read: the
+    first rows (up to FIRST_ROWS; ROWS are shown) as raw values keyed by column. Nothing when the file cannot be read: the
     copy still opens, it just shows no rows (#121). A corrupt file is no file."""
     import pyarrow.parquet as pq
     from pyarrow.lib import ArrowInvalid
@@ -373,7 +378,8 @@ def _read_copy(path, names, rows):
         features = _features(parquet_file.schema_arrow.metadata)
         if not rows or not names:
             return features, []
-        batch = next(parquet_file.iter_batches(batch_size=ROWS, columns=names), None)
+        # As many rows as the viewer's first-rows gives, so the proposal and numbered NER tags read the same rows (#180).
+        batch = next(parquet_file.iter_batches(batch_size=FIRST_ROWS, columns=names), None)
     except (OSError, ValueError, KeyError, ArrowInvalid) as exc:
         logger.warning(f"library.snapshot.preview_unreadable file={os.path.basename(path)} error={exc}")
         return features, []
